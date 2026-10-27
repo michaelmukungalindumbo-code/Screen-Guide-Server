@@ -19,7 +19,7 @@ class Settings:
     # "gemini" (free tier) or "claude". Change this one setting to switch.
     AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
     # Check ai.google.dev for the current free model name and limits.
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     GEMINI_API_KEY = _required("GEMINI_API_KEY") if _provider == "gemini" else os.getenv("GEMINI_API_KEY")
     ANTHROPIC_API_KEY = _required("ANTHROPIC_API_KEY") if _provider == "claude" else os.getenv("ANTHROPIC_API_KEY")
