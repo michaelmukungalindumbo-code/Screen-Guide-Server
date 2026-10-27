@@ -108,8 +108,10 @@ async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: st
     except asyncio.TimeoutError:
         raise HTTPException(504, "That took too long. Please try again.")
     except Exception as e:
-        log.warning("AI error: %s", type(e).__name__)  # never log the question itself
+        # Log why Google refused (code and short reason). Never log the user's question.
+        log.warning("AI error: %s code=%s reason=%s", type(e).__name__, getattr(e, "code", ""), str(getattr(e, "message", e))[:160])
         raise HTTPException(503, "Sorry, the helper is busy. Please try again.")
     if not text:
         raise HTTPException(502, "Sorry, I could not answer that.")
     return {"answer": text}
+    
