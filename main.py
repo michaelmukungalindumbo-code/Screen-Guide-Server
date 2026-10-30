@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hmac
 import re
 import json
@@ -17,16 +18,19 @@ _claude_client = None
 _gemini_client = None
 
 
-async def _complete(system: str, question: str) -> str:
+async def _complete(system: str, question: str, images: list[str] | None = None) -> str:
     """Ask the chosen AI. Both providers return plain text."""
     global _claude_client, _gemini_client
     if settings.AI_PROVIDER == "claude":
         if _claude_client is None:
             from anthropic import AsyncAnthropic
             _claude_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        content = question
+        if images:
+            content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in images] + [{"type": "text", "text": question}]
         msg = await _claude_client.messages.create(
             model=settings.ANTHROPIC_MODEL, max_tokens=max(settings.MAX_OUTPUT_TOKENS, 700), system=system,
-            messages=[{"role": "user", "content": question}])
+            messages=[{"role": "user", "content": content}])
         return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     from google import genai
     from google.genai import types
@@ -34,7 +38,8 @@ async def _complete(system: str, question: str) -> str:
         _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
     # Gemini models can spend output tokens on thinking, so leave plenty of room.
     resp = await _gemini_client.aio.models.generate_content(
-        model=settings.GEMINI_MODEL, contents=question,
+        model=settings.GEMINI_MODEL,
+        contents=([types.Part.from_bytes(data=base64.b64decode(b), mime_type="image/jpeg") for b in images] + [question]) if images else question,
         config=types.GenerateContentConfig(system_instruction=system, max_output_tokens=1024))
     return resp.text or ""
 
@@ -57,6 +62,10 @@ Reply with JSON only, no other text: {{"kind": "guide" or "answer", "text": "...
 - kind "guide": anything the user can do or check on their phone by tapping. This includes doing a task (upload, send, change a setting, install), finding or choosing an app (for example which app can scan documents), and finding out why something happens on the phone (storage full, battery drains, no internet). When unsure, choose guide. text is ONE short friendly sentence in the language saying you will show them step by step.
 - needs_apps: true when the user is looking for an app or tool their phone may already have (for example which app can scan documents, edit videos, read PDFs, play music). Otherwise false.
 - kind "answer": only general knowledge that needs no tapping (for example what a SIM swap scam is, or is this message a scam). text is your normal answer following the rules above."""
+
+IMG_NOTE = """
+
+The user attached a screenshot or frames from a screen recording of their phone. Use it to understand what they need and answer about it. If it shows a PIN, password, card number or account number, never repeat it and remind them not to share such screens. If they need to tap something on their live screen, use kind guide."""
 
 _minute = defaultdict(deque)
 _day = defaultdict(deque)
@@ -86,6 +95,7 @@ def _allow(install_id: str) -> bool:
 class Ask(BaseModel):
     question: str
     lang: str = "en"
+    images: list[str] = []
 
 
 @app.get("/health")
@@ -108,10 +118,14 @@ async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: st
     if not _allow(install_id):
         raise HTTPException(429, "Too many questions. Please wait a little and try again.")
 
+    images = [i for i in body.images if isinstance(i, str) and i][:3]
+    if any(len(i) > 450_000 for i in images):
+        raise HTTPException(413, "That picture is too big. Try a smaller one.")
     lang = body.lang if body.lang in LANGS else "en"
+    system = SYSTEM.format(language=LANGS[lang]) + (IMG_NOTE if images else "")
     try:
-        text = (await asyncio.wait_for(_complete(SYSTEM.format(language=LANGS[lang]), question),
-                                       settings.REQUEST_TIMEOUT_SECONDS)).strip()
+        text = (await asyncio.wait_for(_complete(system, question, images or None),
+                                       settings.REQUEST_TIMEOUT_SECONDS + (15 if images else 0))).strip()
     except asyncio.TimeoutError:
         raise HTTPException(504, "That took too long. Please try again.")
     except Exception as e:
@@ -179,6 +193,7 @@ Rules:
 - say is ONE action only. Never use the word "then" or give two actions.
 - If the user must choose their own file, photo, video, song or contact, use label null and say: Choose what you want, then tap it.
 - say must never be empty and must never be "try again". If you are not sure, use null and say: Tell me what you want to do next.
+- If the user explains why they are stuck, answer what they said in up to two short, kind sentences in simple words, then say the next tap.
 - If you are not sure, use null and say so simply."""
 
 _s_minute = defaultdict(deque)
@@ -208,6 +223,7 @@ class Next(BaseModel):
     history: list[str] = []
     stuck: bool = False
     apps: list[str] = []
+    note: str = ""
 
 
 @app.post("/next")
@@ -231,6 +247,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     apps = [a.strip()[:40] for a in body.apps if a.strip()][:120]
     if apps:
         user += "\nApps installed on this phone (names only): " + ", ".join(apps)
+    if body.note.strip():
+        user += "\nThe user says: " + body.note.strip()[:300]
     if body.stuck:
         user += "\nThe user pressed I'm stuck: the last instruction did not work. Suggest a different way (scroll, go back, or another button)."
     try:
@@ -246,6 +264,5 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     label = data.get("label")
     lookup = {l.lower(): l for l in labels}
     label = lookup.get(str(label).strip().lower()) if label else None   # must be a real item on screen
-    say = str(data.get("say") or "").strip()[:200] or "Choose what you want, then tap it."
+    say = str(data.get("say") or "").strip()[:300] or "Choose what you want, then tap it."
     return {"label": label, "say": say, "done": bool(data.get("done"))}
-    
