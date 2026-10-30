@@ -59,7 +59,7 @@ Rules:
 - If the question is not about using a phone or staying safe with it, politely say you can only help with phone tasks.
 
 Reply with JSON only, no other text: {{"kind": "guide" or "answer", "text": "...", "needs_apps": true or false}}
-- kind "guide": anything the user can do or check on their phone by tapping. This includes doing a task (upload, send, change a setting, install), finding or choosing an app (for example which app can scan documents), and finding out why something happens on the phone (storage full, battery drains, no internet). When unsure, choose guide. text is ONE short friendly sentence in the language saying you will show them step by step.
+- kind "guide": anything the user can do or check on their phone by tapping. This includes doing a task (upload, send, change a setting, install), finding or choosing an app (for example which app can scan documents), and finding out why something happens on the phone (storage full, battery drains, no internet). When unsure, choose guide. text is 1 to 3 short sentences in the language that say simply how to do it, ending by saying you can show them on their screen.
 - needs_apps: true when the user is looking for an app or tool their phone may already have (for example which app can scan documents, edit videos, read PDFs, play music). Otherwise false.
 - kind "answer": only general knowledge that needs no tapping (for example what a SIM swap scam is, or is this message a scam). text is your normal answer following the rules above."""
 
@@ -96,6 +96,7 @@ class Ask(BaseModel):
     question: str
     lang: str = "en"
     images: list[str] = []
+    history: list[str] = []
 
 
 @app.get("/health")
@@ -119,6 +120,9 @@ async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: st
         raise HTTPException(429, "Too many questions. Please wait a little and try again.")
 
     images = [i for i in body.images if isinstance(i, str) and i][:3]
+    past = [h.strip()[:300] for h in body.history if h.strip()][-8:]
+    if past:   # the app keeps the conversation and sends the last few turns, so the helper "remembers" within a chat
+        question = "Conversation so far:\n" + "\n".join(past) + "\n\nThe user now says: " + question
     if any(len(i) > 450_000 for i in images):
         raise HTTPException(413, "That picture is too big. Try a smaller one.")
     lang = body.lang if body.lang in LANGS else "en"
@@ -266,3 +270,4 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     label = lookup.get(str(label).strip().lower()) if label else None   # must be a real item on screen
     say = str(data.get("say") or "").strip()[:300] or "Choose what you want, then tap it."
     return {"label": label, "say": say, "done": bool(data.get("done"))}
+    
