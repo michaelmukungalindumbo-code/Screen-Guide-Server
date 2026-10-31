@@ -289,7 +289,7 @@ Reply with JSON only, no other text:
 {{"kind": "guide" or "answer", "text": "...", "goal": "...", "plan": ["..."], "needs_apps": true or false}}
 - kind "guide": the user wants to DO or CHECK something on their phone by tapping: doing a task (upload, send, change a setting, install), finding or choosing an app (for example which app can scan documents), or finding out why something happens on the phone (storage full, battery drains, no internet).
   text: 1 or 2 short sentences in the language saying simply how, ending with: Tap Show me and I will point to each step.
-  goal: the task in a few plain English words, written as an action, for example "Set a reminder in the Clock app". Use the conversation to work out what "it" or "that" means.
+  goal: the task in a few plain English words, written as an action, for example "Set a reminder in the Clock app". The goal is all the on-screen helper will see, so it must stand on its own: always name the app or thing, never write "it", "this" or "that". Use the conversation to work out what they mean: after "What is YouTube?" then "I want to use it", the goal is "Open the YouTube app".
   plan: 2 to 6 very short steps, under 8 words each.
 - kind "answer": questions about you, chat, general knowledge, safety advice, or anything that needs no tapping. text: your answer. goal: "". plan: [].
 - needs_apps: true when the user is looking for an app or tool their phone may already have (for example which app can scan documents, edit videos, read PDFs, play music). Otherwise false."""
@@ -382,10 +382,4 @@ def read_code(code: str):
     c = re.sub(r"[^0-9A-Z]", "", c)
     if len(c) != 13 or not ADMIN_KEY or any(ch not in _B32 for ch in c) or c in REVOKED_CODES:
         return None
-    p, s = c[:5], c[5:]
-    if not hmac.compare_digest(_sig(p, 8), s):
-        return None
-    payload = 0
-    for ch in p:
-        payload = payload * 32 + _B32.index(ch)
-    weeks, batch, serial = (payload >> 19) & 31, (
+    p
