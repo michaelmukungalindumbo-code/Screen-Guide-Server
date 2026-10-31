@@ -52,6 +52,7 @@ LAT = defaultdict(lambda: deque(maxlen=300))     # seconds per AI call, by kind
 SPEND = {"day": "", "today": 0.0, "total": 0.0, "alerted": []}
 _samples = deque(maxlen=100)    # only when LOG_SAMPLES=1; numbers and emails removed; lost on restart
 _bad = deque(maxlen=50)         # answers people marked thumbs-down; numbers and emails removed; lost on restart
+_stuck = deque(maxlen=30)       # screens where people tapped Help during a guide; numbers and emails removed; lost on restart
 
 
 def _today() -> str:
@@ -379,7 +380,4 @@ def make_code(weeks: int, batch: int, serial: int) -> str:
 
 def read_code(code: str):
     c = code.upper().replace("O", "0").replace("I", "1").replace("L", "1")
-    c = re.sub(r"[^0-9A-Z]", "", c)
-    if len(c) != 13 or not ADMIN_KEY or any(ch not in _B32 for ch in c) or c in REVOKED_CODES:
-        return None
-    p
+    c = re.sub(r"[^0-9A-Z]", 
