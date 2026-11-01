@@ -1,301 +1,651 @@
-{
- "version": 1,
- "note": "Edit this file on GitHub to change guides on every phone without a new app. Keep the same shape. A guide with an id that the app already has replaces it. Add \"by\": \"Name\" to show Verified by Name.",
- "guides": [
-  {
-   "id": "wifi",
-   "title": {
-    "en": "Turn on Wi-Fi",
-    "ny": "Yatsani Wi-Fi",
-    "bem": "Pyungeni Wi-Fi"
-   },
-   "done": {
-    "en": "Well done! Wi-Fi is on.",
-    "ny": "Zabwino! Wi-Fi yayatsidwa.",
-    "bem": "Nawamya! Wi-Fi yapyungwa."
-   },
-   "steps": [
-    {
-     "match": [
-      "Settings",
-      "Setting"
-     ],
-     "audio": "wifi_1",
-     "say": {
-      "en": "Tap Settings.",
-      "ny": "Dinani Settings.",
-      "bem": "Kandeni Settings."
-     },
-     "skipIn": "settings"
-    },
-    {
-     "match": [
-      "Network & internet",
-      "Connections",
-      "WLAN",
-      "Wi-Fi"
-     ],
-     "audio": "wifi_2",
-     "say": {
-      "en": "Tap the glowing row.",
-      "ny": "Dinani pamene pawala.",
-      "bem": "Kandeni apabalima."
-     }
-    },
-    {
-     "match": [
-      "Internet"
-     ],
-     "audio": "wifi_3",
-     "say": {
-      "en": "Tap Internet.",
-      "ny": "Dinani Internet.",
-      "bem": "Kandeni Internet."
-     }
-    },
-    {
-     "match": [
-      "Wi-Fi",
-      "WLAN",
-      "Use Wi-Fi"
-     ],
-     "toggle": true,
-     "audio": "wifi_4",
-     "say": {
-      "en": "Tap the switch to turn Wi-Fi on.",
-      "ny": "Dinani kuti muyatse Wi-Fi.",
-      "bem": "Kandeni ukupyunga Wi-Fi."
-     }
-    }
-   ],
-   "keywords": [
-    "wifi",
-    "wi-fi",
-    "wlan",
-    "wireless",
-    "internet"
-   ],
-   "doneWhen": "wifi_on"
+[
+ {
+  "id": "torch",
+  "shade": true,
+  "doneWhen": "torch_on",
+  "title": {
+   "en": "Turn on the torch",
+   "ny": "Yatsani tochi",
+   "bem": "Pyungeni tochi"
   },
-  {
-   "id": "bluetooth",
-   "title": {
-    "en": "Turn on Bluetooth",
-    "ny": "Yatsani Bluetooth",
-    "bem": "Pyungeni Bluetooth"
-   },
-   "done": {
-    "en": "Well done! Bluetooth is on.",
-    "ny": "Zabwino! Bluetooth yayatsidwa.",
-    "bem": "Nawamya! Bluetooth yapyungwa."
-   },
-   "keywords": [
-    "bluetooth",
-    "earphone",
-    "headset",
-    "speaker",
-    "pair"
-   ],
-   "doneWhen": "bluetooth_on",
-   "steps": [
-    {
-     "match": [
-      "Settings",
-      "Setting"
-     ],
-     "skipIn": "settings",
-     "say": {
-      "en": "Tap Settings.",
-      "ny": "Dinani Settings.",
-      "bem": "Kandeni Settings."
-     },
-     "audio": "bluetooth_1"
-    },
-    {
-     "match": [
-      "Bluetooth",
-      "Connected devices",
-      "Connections"
-     ],
-     "say": {
-      "en": "Tap the glowing row.",
-      "ny": "Dinani pamene pawala.",
-      "bem": "Kandeni apabalima."
-     },
-     "audio": "bluetooth_2"
-    },
-    {
-     "match": [
-      "Bluetooth",
-      "Use Bluetooth"
-     ],
-     "toggle": true,
-     "titles": [
-      "Bluetooth",
-      "Use Bluetooth"
-     ],
-     "say": {
-      "en": "Tap the switch to turn Bluetooth on.",
-      "ny": "Dinani kuti muyatse Bluetooth.",
-      "bem": "Kandeni ukupyunga Bluetooth."
-     },
-     "audio": "bluetooth_3"
-    }
-   ]
+  "about": {
+   "en": "For when the power goes off",
+   "ny": "Magetsi akazima",
+   "bem": "Nga amalaiti yashima"
   },
-  {
-   "id": "airplane",
-   "title": {
-    "en": "Turn on Airplane mode",
-    "ny": "Yatsani Airplane mode",
-    "bem": "Pyungeni Airplane mode"
-   },
-   "done": {
-    "en": "Well done! Airplane mode is on.",
-    "ny": "Zabwino! Airplane mode yayatsidwa.",
-    "bem": "Nawamya! Airplane mode yapyungwa."
-   },
-   "keywords": [
-    "airplane",
-    "aeroplane",
-    "flightmode"
-   ],
-   "doneWhen": "airplane_on",
-   "steps": [
-    {
-     "match": [
-      "Settings",
-      "Setting"
-     ],
-     "skipIn": "settings",
-     "say": {
-      "en": "Tap Settings.",
-      "ny": "Dinani Settings.",
-      "bem": "Kandeni Settings."
-     },
-     "audio": "airplane_1"
-    },
-    {
-     "match": [
-      "Hotspot & Connections",
-      "Network & internet",
-      "Connections"
-     ],
-     "say": {
-      "en": "Tap the glowing row.",
-      "ny": "Dinani pamene pawala.",
-      "bem": "Kandeni apabalima."
-     },
-     "audio": "airplane_2"
-    },
-    {
-     "match": [
-      "Airplane mode",
-      "Flight mode",
-      "Aeroplane mode"
-     ],
-     "toggle": true,
-     "titles": [
-      "Hotspot & Connections",
-      "Network & internet",
-      "Connections",
-      "Airplane mode"
-     ],
-     "say": {
-      "en": "Tap the switch to turn Airplane mode on.",
-      "ny": "Dinani kuti muyatse Airplane mode.",
-      "bem": "Kandeni ukupyunga Airplane mode."
-     },
-     "audio": "airplane_3"
-    }
-   ]
+  "done": {
+   "en": "Well done! The torch is on. You did it yourself.",
+   "ny": "Zabwino! Tochi yayaka. Mwachita nokha.",
+   "bem": "Nawamya! Tochi yapyungwa. Mwacita nemwe bene."
   },
-  {
-   "id": "hotspot",
-   "title": {
-    "en": "Turn on Hotspot",
-    "ny": "Yatsani Hotspot",
-    "bem": "Pyungeni Hotspot"
-   },
-   "done": {
-    "en": "Well done! Hotspot is on.",
-    "ny": "Zabwino! Hotspot yayatsidwa.",
-    "bem": "Nawamya! Hotspot yapyungwa."
-   },
-   "keywords": [
-    "hotspot",
-    "tether",
-    "tethering",
-    "shareinternet",
-    "shareconnection"
-   ],
-   "doneWhen": "hotspot_on",
-   "steps": [
-    {
-     "match": [
-      "Settings",
-      "Setting"
-     ],
-     "skipIn": "settings",
-     "audio": "hotspot_1",
-     "say": {
-      "en": "Tap Settings.",
-      "ny": "Dinani Settings.",
-      "bem": "Kandeni Settings."
-     }
-    },
-    {
-     "match": [
-      "Hotspot & Connections",
-      "Network & internet",
-      "Connections"
-     ],
-     "audio": "hotspot_2",
-     "say": {
-      "en": "Tap the glowing row.",
-      "ny": "Dinani pamene pawala.",
-      "bem": "Kandeni apabalima."
-     }
-    },
-    {
-     "match": [
-      "Personal Hotspot",
-      "Hotspot & tethering",
-      "Mobile Hotspot and Tethering",
-      "Wi-Fi hotspot",
-      "Mobile Hotspot"
-     ],
-     "audio": "hotspot_3",
-     "say": {
-      "en": "Tap the glowing row.",
-      "ny": "Dinani pamene pawala.",
-      "bem": "Kandeni apabalima."
-     }
-    },
-    {
-     "match": [
-      "Personal Hotspot",
-      "Wi-Fi hotspot",
-      "Mobile Hotspot",
-      "Use Wi-Fi hotspot",
-      "Portable hotspot"
-     ],
-     "toggle": true,
-     "titles": [
-      "Personal Hotspot",
-      "Hotspot & tethering",
-      "Wi-Fi hotspot",
-      "Mobile Hotspot",
-      "Portable hotspot"
-     ],
-     "audio": "hotspot_4",
-     "say": {
-      "en": "Tap the switch to turn Hotspot on.",
-      "ny": "Dinani kuti muyatse Hotspot.",
-      "bem": "Kandeni ukupyunga Hotspot."
-     }
+  "keywords": [
+   "torch",
+   "flashlight",
+   "flash light",
+   "light",
+   "tochi",
+   "dark",
+   "power cut",
+   "load shedding",
+   "loadshedding"
+  ],
+  "steps": [
+   {
+    "match": [
+     "Flashlight",
+     "Torch",
+     "Flash light",
+     "Lantern"
+    ],
+    "say": {
+     "en": "Tap the torch.",
+     "ny": "Dinani tochi.",
+     "bem": "Kandeni pa tochi."
     }
-   ]
+   }
+  ]
+ },
+ {
+  "id": "battery_saver",
+  "doneWhen": "battery_saver_on",
+  "title": {
+   "en": "Make your battery last",
+   "ny": "Sungani mphamvu ya batire",
+   "bem": "Sungeni amaka ya batri"
+  },
+  "about": {
+   "en": "Battery saver",
+   "ny": "Battery saver",
+   "bem": "Battery saver"
+  },
+  "done": {
+   "en": "Well done! Battery saver is on. Your battery will last longer.",
+   "ny": "Zabwino! Battery saver yayatsidwa. Batire yanu ikhalitsa.",
+   "bem": "Nawamya! Battery saver yapyungwa. Batri yenu ikakokola."
+  },
+  "keywords": [
+   "battery",
+   "saver",
+   "power saving",
+   "charge",
+   "last longer",
+   "low battery",
+   "load shedding",
+   "loadshedding",
+   "batire",
+   "batri"
+  ],
+  "steps": [
+   {
+    "match": [
+     "Settings",
+     "Setting"
+    ],
+    "skipIn": "settings",
+    "say": {
+     "en": "Tap Settings.",
+     "ny": "Dinani Settings.",
+     "bem": "Kandeni Settings."
+    }
+   },
+   {
+    "match": [
+     "Battery",
+     "Battery & Power Saving",
+     "Battery and device care",
+     "Battery & performance",
+     "Battery and performance",
+     "Power management"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Battery Saver",
+     "Battery saver",
+     "Power saving mode",
+     "Power Saving Mode",
+     "Power saving",
+     "Power saver",
+     "Battery saving mode"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Use Battery Saver",
+     "Battery Saver",
+     "Battery saver",
+     "Power saving mode",
+     "Power saving",
+     "Turn on now"
+    ],
+    "toggle": true,
+    "titles": [
+     "Battery Saver",
+     "Battery saver",
+     "Power saving mode",
+     "Power Saving Mode",
+     "Power saving"
+    ],
+    "say": {
+     "en": "Tap the switch to turn it on.",
+     "ny": "Dinani kuti muyatse.",
+     "bem": "Kandeni ukupyunga."
+    }
+   }
+  ]
+ },
+ {
+  "id": "data_saver",
+  "doneWhen": "data_saver_on",
+  "title": {
+   "en": "Save your data bundle",
+   "ny": "Sungani data yanu",
+   "bem": "Sungeni data yenu"
+  },
+  "about": {
+   "en": "Data saver",
+   "ny": "Data saver",
+   "bem": "Data saver"
+  },
+  "done": {
+   "en": "Well done! Data saver is on. Apps will use less data.",
+   "ny": "Zabwino! Data saver yayatsidwa. Mapulogalamu adzagwiritsa data yochepa.",
+   "bem": "Nawamya! Data saver yapyungwa. Ama-app yakalabomfya data inono."
+  },
+  "keywords": [
+   "data",
+   "bundle",
+   "data saver",
+   "save data",
+   "megabytes",
+   "mb",
+   "airtime",
+   "data finishing"
+  ],
+  "steps": [
+   {
+    "match": [
+     "Settings",
+     "Setting"
+    ],
+    "skipIn": "settings",
+    "say": {
+     "en": "Tap Settings.",
+     "ny": "Dinani Settings.",
+     "bem": "Kandeni Settings."
+    }
+   },
+   {
+    "match": [
+     "SIM & Network Settings",
+     "Network & internet",
+     "Network & Internet",
+     "Connections",
+     "SIM cards & mobile networks",
+     "Mobile network",
+     "SIM & network",
+     "Mobile networks",
+     "Dual SIM & mobile network"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Data Saver",
+     "Data saver",
+     "Data usage",
+     "Data Usage",
+     "Data Saving",
+     "Data traffic management"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Use Data Saver",
+     "Data Saver",
+     "Data saver",
+     "Data Saving",
+     "Turn on now"
+    ],
+    "toggle": true,
+    "titles": [
+     "Data Saver",
+     "Data saver",
+     "Data Saving"
+    ],
+    "say": {
+     "en": "Tap the switch to turn it on.",
+     "ny": "Dinani kuti muyatse.",
+     "bem": "Kandeni ukupyunga."
+    }
+   }
+  ]
+ },
+ {
+  "id": "text_size",
+  "doneWhen": "text_bigger",
+  "title": {
+   "en": "Make words bigger",
+   "ny": "Kulitsani zilembo",
+   "bem": "Kusheni amalembo"
+  },
+  "about": {
+   "en": "Easier to read",
+   "ny": "Zosavuta kuwerenga",
+   "bem": "Cayanguka ukubelenga"
+  },
+  "done": {
+   "en": "Well done! The words are bigger now.",
+   "ny": "Zabwino! Zilembo zakula tsopano.",
+   "bem": "Nawamya! Amalembo yakula nomba."
+  },
+  "keywords": [
+   "font",
+   "text size",
+   "bigger words",
+   "big letters",
+   "bigger letters",
+   "small writing",
+   "read",
+   "eyes",
+   "zoom",
+   "letters"
+  ],
+  "steps": [
+   {
+    "match": [
+     "Settings",
+     "Setting"
+    ],
+    "skipIn": "settings",
+    "say": {
+     "en": "Tap Settings.",
+     "ny": "Dinani Settings.",
+     "bem": "Kandeni Settings."
+    }
+   },
+   {
+    "match": [
+     "Display",
+     "Display & Brightness",
+     "Display & brightness",
+     "Display and brightness"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Font size",
+     "Font size and style",
+     "Text size",
+     "Display size and text",
+     "Font & display size",
+     "Font size & style",
+     "Font"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "@slider"
+    ],
+    "titles": [
+     "Font size",
+     "Font size and style",
+     "Text size",
+     "Display size and text",
+     "Font & display size",
+     "Font size & style",
+     "Font"
+    ],
+    "say": {
+     "en": "Drag the dot to the right.",
+     "ny": "Kokani kadontho kumanja.",
+     "bem": "Kululeni akatoni ku kulyo."
+    }
+   }
+  ]
+ },
+ {
+  "id": "wifi",
+  "title": {
+   "en": "Turn on Wi-Fi",
+   "ny": "Yatsani Wi-Fi",
+   "bem": "Pyungeni Wi-Fi"
+  },
+  "done": {
+   "en": "Well done! Wi-Fi is on.",
+   "ny": "Zabwino! Wi-Fi yayatsidwa.",
+   "bem": "Nawamya! Wi-Fi yapyungwa."
+  },
+  "steps": [
+   {
+    "match": [
+     "Settings",
+     "Setting"
+    ],
+    "audio": "wifi_1",
+    "say": {
+     "en": "Tap Settings.",
+     "ny": "Dinani Settings.",
+     "bem": "Kandeni Settings."
+    },
+    "skipIn": "settings"
+   },
+   {
+    "match": [
+     "Network & internet",
+     "Connections",
+     "WLAN",
+     "Wi-Fi"
+    ],
+    "audio": "wifi_2",
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Internet"
+    ],
+    "audio": "wifi_3",
+    "say": {
+     "en": "Tap Internet.",
+     "ny": "Dinani Internet.",
+     "bem": "Kandeni Internet."
+    }
+   },
+   {
+    "match": [
+     "Wi-Fi",
+     "WLAN",
+     "Use Wi-Fi"
+    ],
+    "toggle": true,
+    "audio": "wifi_4",
+    "say": {
+     "en": "Tap the switch to turn Wi-Fi on.",
+     "ny": "Dinani kuti muyatse Wi-Fi.",
+     "bem": "Kandeni ukupyunga Wi-Fi."
+    }
+   }
+  ],
+  "keywords": [
+   "wifi",
+   "wi-fi",
+   "wlan",
+   "wireless",
+   "internet"
+  ],
+  "doneWhen": "wifi_on",
+  "about": {
+   "en": "Internet from a router nearby",
+   "ny": "Intaneti ya pafupi",
+   "bem": "Intaneti iya mupepi"
   }
- ]
-}
+ },
+ {
+  "id": "bluetooth",
+  "title": {
+   "en": "Turn on Bluetooth",
+   "ny": "Yatsani Bluetooth",
+   "bem": "Pyungeni Bluetooth"
+  },
+  "done": {
+   "en": "Well done! Bluetooth is on.",
+   "ny": "Zabwino! Bluetooth yayatsidwa.",
+   "bem": "Nawamya! Bluetooth yapyungwa."
+  },
+  "keywords": [
+   "bluetooth",
+   "earphone",
+   "headset",
+   "speaker",
+   "pair"
+  ],
+  "doneWhen": "bluetooth_on",
+  "steps": [
+   {
+    "match": [
+     "Settings",
+     "Setting"
+    ],
+    "skipIn": "settings",
+    "say": {
+     "en": "Tap Settings.",
+     "ny": "Dinani Settings.",
+     "bem": "Kandeni Settings."
+    },
+    "audio": "bluetooth_1"
+   },
+   {
+    "match": [
+     "Bluetooth",
+     "Connected devices",
+     "Connections"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    },
+    "audio": "bluetooth_2"
+   },
+   {
+    "match": [
+     "Bluetooth",
+     "Use Bluetooth"
+    ],
+    "toggle": true,
+    "titles": [
+     "Bluetooth",
+     "Use Bluetooth"
+    ],
+    "say": {
+     "en": "Tap the switch to turn Bluetooth on.",
+     "ny": "Dinani kuti muyatse Bluetooth.",
+     "bem": "Kandeni ukupyunga Bluetooth."
+    },
+    "audio": "bluetooth_3"
+   }
+  ],
+  "about": {
+   "en": "Earphones and speakers",
+   "ny": "Ma earphone ndi ma speaker",
+   "bem": "Ama earphone na ma speaker"
+  }
+ },
+ {
+  "id": "hotspot",
+  "title": {
+   "en": "Turn on Hotspot",
+   "ny": "Yatsani Hotspot",
+   "bem": "Pyungeni Hotspot"
+  },
+  "done": {
+   "en": "Well done! Hotspot is on.",
+   "ny": "Zabwino! Hotspot yayatsidwa.",
+   "bem": "Nawamya! Hotspot yapyungwa."
+  },
+  "keywords": [
+   "hotspot",
+   "tether",
+   "tethering",
+   "shareinternet",
+   "shareconnection"
+  ],
+  "doneWhen": "hotspot_on",
+  "steps": [
+   {
+    "match": [
+     "Settings",
+     "Setting"
+    ],
+    "skipIn": "settings",
+    "audio": "hotspot_1",
+    "say": {
+     "en": "Tap Settings.",
+     "ny": "Dinani Settings.",
+     "bem": "Kandeni Settings."
+    }
+   },
+   {
+    "match": [
+     "Hotspot & Connections",
+     "Network & internet",
+     "Connections"
+    ],
+    "audio": "hotspot_2",
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Personal Hotspot",
+     "Hotspot & tethering",
+     "Mobile Hotspot and Tethering",
+     "Wi-Fi hotspot",
+     "Mobile Hotspot"
+    ],
+    "audio": "hotspot_3",
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    }
+   },
+   {
+    "match": [
+     "Personal Hotspot",
+     "Wi-Fi hotspot",
+     "Mobile Hotspot",
+     "Use Wi-Fi hotspot",
+     "Portable hotspot"
+    ],
+    "toggle": true,
+    "titles": [
+     "Personal Hotspot",
+     "Hotspot & tethering",
+     "Wi-Fi hotspot",
+     "Mobile Hotspot",
+     "Portable hotspot"
+    ],
+    "audio": "hotspot_4",
+    "say": {
+     "en": "Tap the switch to turn Hotspot on.",
+     "ny": "Dinani kuti muyatse Hotspot.",
+     "bem": "Kandeni ukupyunga Hotspot."
+    }
+   }
+  ],
+  "about": {
+   "en": "Share your internet",
+   "ny": "Gawani intaneti yanu",
+   "bem": "Akaneni intaneti yenu"
+  }
+ },
+ {
+  "id": "airplane",
+  "title": {
+   "en": "Turn on Airplane mode",
+   "ny": "Yatsani Airplane mode",
+   "bem": "Pyungeni Airplane mode"
+  },
+  "done": {
+   "en": "Well done! Airplane mode is on.",
+   "ny": "Zabwino! Airplane mode yayatsidwa.",
+   "bem": "Nawamya! Airplane mode yapyungwa."
+  },
+  "keywords": [
+   "airplane",
+   "aeroplane",
+   "flightmode"
+  ],
+  "doneWhen": "airplane_on",
+  "steps": [
+   {
+    "match": [
+     "Settings",
+     "Setting"
+    ],
+    "skipIn": "settings",
+    "say": {
+     "en": "Tap Settings.",
+     "ny": "Dinani Settings.",
+     "bem": "Kandeni Settings."
+    },
+    "audio": "airplane_1"
+   },
+   {
+    "match": [
+     "Hotspot & Connections",
+     "Network & internet",
+     "Connections"
+    ],
+    "say": {
+     "en": "Tap the glowing row.",
+     "ny": "Dinani pamene pawala.",
+     "bem": "Kandeni apabalima."
+    },
+    "audio": "airplane_2"
+   },
+   {
+    "match": [
+     "Airplane mode",
+     "Flight mode",
+     "Aeroplane mode"
+    ],
+    "toggle": true,
+    "titles": [
+     "Hotspot & Connections",
+     "Network & internet",
+     "Connections",
+     "Airplane mode"
+    ],
+    "say": {
+     "en": "Tap the switch to turn Airplane mode on.",
+     "ny": "Dinani kuti muyatse Airplane mode.",
+     "bem": "Kandeni ukupyunga Airplane mode."
+    },
+    "audio": "airplane_3"
+   }
+  ],
+  "about": {
+   "en": "Stop calls and data",
+   "ny": "Imitsani mafoni ndi data",
+   "bem": "Lekeni amafoni na data"
+  }
+ }
+]
