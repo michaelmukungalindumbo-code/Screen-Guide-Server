@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "44"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "45"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.44"
+SERVER_VERSION = "0.45"
 
 
 @app.get("/health")
@@ -1938,6 +1938,190 @@ async def admin_shares(key: str = "", promote: str = "", by: str = "", keywords:
     return _page("Shared guides", body)
 
 
+# ---- Live help: someone the person trusts sees the words on their screen and points; they can never tap ----
+# The person starts it in the app and sends the link (WhatsApp). The helper opens it in any browser: they see the
+# screen drawn as boxes with words (never pictures, never password or money screens) and tap a box; a ring appears on
+# the person's phone with "Tap ...", spoken in their language. Sessions live in memory only, and end after 2 hours.
+LIVE: dict = {}
+_LIVE_IDLE, _LIVE_MAX = 15 * 60, 2 * 3600
+
+
+def _live_tidy(now: float) -> None:
+    for k in [k for k, s in LIVE.items() if now - s["seen"] > _LIVE_IDLE or now - s["created"] > _LIVE_MAX]:
+        LIVE.pop(k, None)
+    while len(LIVE) > 300:
+        LIVE.pop(next(iter(LIVE)))
+
+
+def _live(lid: str):
+    s = LIVE.get(re.sub(r"[^A-Za-z0-9_-]", "", lid)[:40])
+    if not s or s.get("ended"):
+        raise HTTPException(404, "This live help has ended.")
+    return s
+
+
+class LiveScreen(BaseModel):
+    key: str
+    screen: dict | None = None
+    last_point: int = 0
+
+
+class LivePoint(BaseModel):
+    x: float = -1
+    y: float = -1
+    w: float = 0
+    h: float = 0
+    label: str = ""
+    say: str = ""
+
+
+def _live_clean_screen(sc: dict) -> dict:
+    """What the helper page may show: app name, size, and up to 150 boxes of words. Long numbers are hidden."""
+    if sc.get("private"):
+        return {"private": True, "app": str(sc.get("app", ""))[:40]}
+    items = []
+    for it in (sc.get("items") or [])[:150]:
+        try:
+            x, y, w, h = (max(0.0, min(1.0, float(it.get(k, 0)))) for k in ("x", "y", "w", "h"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        t = re.sub(r"\d{4,}", "••••", re.sub(r"\s+", " ", str(it.get("t", "")))).strip()[:120]
+        k = it.get("k") if it.get("k") in ("tap", "text", "switch", "box", "on", "off") else "text"
+        if t or k in ("tap", "switch", "box"):
+            items.append({"t": t, "x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4), "k": k})
+    return {"app": str(sc.get("app", ""))[:40], "ratio": max(0.3, min(3.0, float(sc.get("ratio") or 2.0))), "items": items}
+
+
+@app.post("/live/start")
+async def live_start(x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    install_id = _check(x_app_token, x_install_id)
+    now = time.time(); _live_tidy(now)
+    if sum(1 for s in LIVE.values() if s["by"] == _hash(install_id)) >= 3:
+        raise HTTPException(429, "Please stop your other live help first.")
+    lid, key = secrets.token_urlsafe(12), secrets.token_urlsafe(18)
+    LIVE[lid] = {"key": key, "by": _hash(install_id), "created": now, "seen": now, "helper_seen": 0.0, "screen": None, "v": 0,
+                 "points": [], "pt": 0, "ended": False, "pt_times": deque()}
+    STATS["live_started"] += 1
+    return {"id": lid, "key": key, "url": PUBLIC_URL + "/live/" + lid}
+
+
+@app.post("/live/{lid}/screen")
+async def live_screen(lid: str, body: LiveScreen, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    """The person's phone: sends its screen when it changes, and gets the helper's newest point."""
+    _check(x_app_token, x_install_id)
+    s = _live(lid)
+    if not hmac.compare_digest(body.key.encode(), s["key"].encode()):
+        raise HTTPException(403, "Not allowed.")
+    now = time.time(); s["seen"] = now
+    if isinstance(body.screen, dict):
+        s["screen"] = _live_clean_screen(body.screen); s["v"] += 1
+    newer = [p for p in s["points"] if p["id"] > body.last_point]
+    return {"point": newer[-1] if newer else None, "helper": now - s["helper_seen"] < 8}
+
+
+@app.post("/live/{lid}/end")
+async def live_end(lid: str, body: LiveScreen, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    _check(x_app_token, x_install_id)
+    s = LIVE.get(lid)
+    if s and hmac.compare_digest(body.key.encode(), s["key"].encode()):
+        s["ended"] = True; s["screen"] = None
+    return {"ok": True}
+
+
+@app.get("/live/{lid}/view")
+async def live_view(lid: str, v: int = 0):
+    """The helper's page asks for the screen every second or two."""
+    s = _live(lid)
+    now = time.time(); s["helper_seen"] = now
+    return JSONResponse({"v": s["v"], "screen": s["screen"] if s["v"] != v else None, "phone_ago": int(now - s["seen"])})
+
+
+@app.post("/live/{lid}/point")
+async def live_point(lid: str, body: LivePoint):
+    s = _live(lid)
+    now = time.time(); q = s["pt_times"]; _prune(q, 60, now)
+    if len(q) >= 40:
+        raise HTTPException(429, "Slow down a little.")
+    q.append(now)
+    say = re.sub(r"\s+", " ", body.say).strip()[:160]
+    label = re.sub(r"\s+", " ", body.label).strip()[:80]
+    has_box = 0 <= body.x <= 1 and 0 <= body.y <= 1 and 0 < body.w <= 1 and 0 < body.h <= 1
+    if not has_box and not say:
+        raise HTTPException(400, "Tap a box on their screen, or type a message.")
+    s["pt"] += 1
+    p = {"id": s["pt"], "say": say, "label": label}
+    if has_box:
+        p.update(x=body.x, y=body.y, w=body.w, h=body.h)
+    s["points"] = (s["points"] + [p])[-10:]
+    STATS["live_points"] += 1
+    return {"ok": True, "id": p["id"]}
+
+
+_LIVE_PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Help on their phone (ScreenGuide)</title><style>
+body{font:16px/1.4 system-ui,sans-serif;margin:0;background:#FAF6EF;color:#1F1A14}main{max-width:520px;margin:0 auto;padding:14px 16px 30px}
+#st{font-size:14px;color:#534C45;min-height:20px}#ph{position:relative;margin:10px auto;background:#fff;border:3px solid #1F1A14;border-radius:22px;overflow:hidden;width:100%}
+.b{position:absolute;box-sizing:border-box;font-size:11px;line-height:1.15;overflow:hidden;padding:1px 3px;color:#1F1A14;border-radius:5px}
+.tap,.switch,.box{border:1px solid #145A3D;background:#E3F2EA;cursor:pointer}.switch{background:#FFF4E0;border-color:#C58A12}.box{background:#F1EADD}
+.text{color:#534C45;pointer-events:none}.sel{outline:3px solid #F0A935;background:#FFE7B3}
+.pv{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;font-weight:600;color:#8A3B05}
+form{display:flex;gap:8px;margin-top:8px}input{flex:1;font:16px system-ui;padding:12px;border:1px solid #E3D8C6;border-radius:22px}
+button{font:700 15px system-ui;padding:12px 16px;border:0;border-radius:22px;background:#145A3D;color:#fff}.m{color:#534C45;font-size:14px}
+</style></head><body><main><h2 style="margin:4px 0">Help on their phone</h2>
+<p class="m">This is their screen, drawn as boxes with words. <b>Tap the green box</b> they should tap: a ring appears on their phone and it tells them. You can never tap for them.</p>
+<div id="st">Connecting…</div><div id="ph"></div>
+<form id="f"><input id="say" maxlength="160" placeholder="Or type a short message to them"><button>Send</button></form>
+<p class="m">Their passwords and money apps are never shown. Long numbers show as ••••.</p></main>
+<script>
+const ID = "__ID__"; let v = 0, screen = null, sel = "", note = "", noteAt = 0;
+const key = it => it.t + "|" + it.x + "|" + it.y;
+const ph = document.getElementById("ph"), st = document.getElementById("st");
+function draw() {
+  ph.innerHTML = ""; if (!screen) return;
+  ph.style.height = (ph.clientWidth * (screen.ratio || 2)) + "px";
+  if (screen.private) { ph.innerHTML = '<div class="pv">They are on a private screen (' + (screen.app || "") + '). Wait for them to leave it.</div>'; return; }
+  const W = ph.clientWidth, H = ph.clientHeight;
+  [...screen.items].sort((a, b) => b.w * b.h - a.w * a.h).forEach(it => {
+    const d = document.createElement("div"); d.className = "b " + (it.k === "on" || it.k === "off" ? "switch" : it.k);
+    d.style.left = (it.x * W) + "px"; d.style.top = (it.y * H) + "px"; d.style.width = Math.max(14, it.w * W) + "px"; d.style.height = Math.max(12, it.h * H) + "px";
+    d.textContent = it.t || (it.k === "switch" || it.k === "on" || it.k === "off" ? "switch" : "");
+    if (key(it) === sel) d.classList.add("sel");
+    if (it.k !== "text") d.onclick = () => { document.querySelectorAll(".sel").forEach(e => e.classList.remove("sel")); d.classList.add("sel"); sel = key(it); point(it, ""); };
+    ph.appendChild(d);
+  });
+}
+async function point(it, say) {
+  const body = it ? {x: it.x, y: it.y, w: it.w, h: it.h, label: it.t || "", say} : {say};
+  const r = await fetch("/live/" + ID + "/point", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  note = r.ok ? (it ? "Pointed at “" + (it.t || "that") + "” on their phone." : "Message sent.") : "Could not send. Try again.";
+  noteAt = Date.now(); st.textContent = note;
+}
+document.getElementById("f").onsubmit = e => { e.preventDefault(); const s = document.getElementById("say"); if (s.value.trim()) { point(null, s.value.trim()); s.value = ""; } };
+async function tick() {
+  try {
+    const r = await fetch("/live/" + ID + "/view?v=" + v);
+    if (r.status === 404) { st.textContent = "This live help has ended. Thank you for helping."; ph.innerHTML = ""; return; }
+    const j = await r.json();
+    if (j.screen) { if (j.v !== v) sel = ""; screen = j.screen; v = j.v; draw(); }
+    st.textContent = Date.now() - noteAt < 4000 ? note : j.phone_ago > 8 ? "Their phone is not answering. Check that they are online." : (screen ? "Live: " + (screen.app || "their phone") : "Waiting for their screen…");
+  } catch (e) { st.textContent = "No connection. Trying again…"; }
+  setTimeout(tick, 1500);
+}
+window.onresize = draw; tick();
+</script></body></html>"""
+
+
+@app.get("/live/{lid}", response_class=HTMLResponse)
+async def live_page(lid: str):
+    lid = re.sub(r"[^A-Za-z0-9_-]", "", lid)[:40]
+    if lid not in LIVE or LIVE[lid].get("ended"):
+        return HTMLResponse("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                            "<title>Live help ended</title></head><body style='font:17px/1.5 system-ui;margin:0;background:#FAF6EF;color:#1F1A14'>"
+                            "<main style='max-width:520px;margin:0 auto;padding:24px 16px'><h2>This live help has ended</h2>"
+                            "<p>Ask them to start it again in ScreenGuide and send you a new link.</p></main></body></html>", status_code=404)
+    return HTMLResponse(_LIVE_PAGE.replace("__ID__", lid))
+
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     contact = html.escape(CONTACT_EMAIL) if CONTACT_EMAIL else "the developer (set CONTACT_EMAIL on the server to show an address here)"
@@ -1957,6 +2141,7 @@ async def privacy():
 <li><b>Guides you share.</b> If you teach a task and tap Share, the task name and the buttons you tapped (as shown to you before you share) are kept on our server under a 6-letter code, so anyone with the link can follow them. Password boxes, money apps, long numbers and email addresses are never recorded.</li>
 <li><b>Finished Smart guides.</b> When a Smart guide finishes, the names of the buttons you tapped (only those) are kept with the task and your phone's make and kind, so the next person with the same kind of phone gets the guide at once. A path is given to others only after two different phones did it the same way. Never in Incognito.</li>
 <li><b>Read button.</b> When you tap it, the words on that screen (long numbers removed) are sent to get an explanation in your language. Never on password, banking or mobile money screens.</li>
+<li><b>Live help.</b> Only when you start it and send the link: the person you sent it to sees the words on your screen, drawn as boxes (never pictures, never password, bank or mobile money screens, long numbers hidden), and can point where to tap. They can never tap for you. Stop it any time; it is kept in the server's memory only and ends by itself.</li>
 <li><b>Scam guard</b> and <b>error explanations</b>, if you turn them on, work on your phone only. Nothing is sent.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
 <li><b>Your questions</b> are sent to get an answer.</li>
