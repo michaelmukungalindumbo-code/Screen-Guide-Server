@@ -42,7 +42,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "22"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "34"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -116,8 +116,9 @@ NEXT_SCHEMA = {
         "done": {"type": "boolean"},
         "x": {"anyOf": [{"type": "number"}, {"type": "null"}]},
         "y": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+        "look_for": {"anyOf": [{"type": "string"}, {"type": "null"}]},
     },
-    "required": ["label", "say", "done", "x", "y"],
+    "required": ["label", "say", "done", "x", "y", "look_for"],
     "additionalProperties": False,
 }
 _feat = {}            # per model: settings the AI service accepted; one it refuses is switched off for that model
@@ -506,7 +507,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.33"
+SERVER_VERSION = "0.34"
 
 
 @app.get("/health")
@@ -751,11 +752,12 @@ def _parse_json(text: str):
 # ---- Step-by-step guiding: the app sends the words on screen, we pick the next thing to point at ----
 NEXT_SYSTEM = """You help a first-time smartphone user finish a task by pointing at ONE thing on their screen at a time.
 You get their goal, maybe a plan, what they were already told, and the words visible on their screen (a list).
-Reply with JSON only: {{"label": string or null, "say": string, "done": boolean, "x": number or null, "y": number or null}}
+Reply with JSON only: {{"label": string or null, "say": string, "done": boolean, "x": number or null, "y": number or null, "look_for": string or null}}
 - label: copy one entry from the screen list, WITHOUT its [tag]: the best thing to tap next. If nothing on screen helps (the right app is not open, or they must scroll, or go back), use null and say what to do.
 - say: ONE short instruction in {language}, very simple words, about this single tap only. Do not mention later steps. For example: Tap "Create".
 - done: true only when the goal is clearly finished.
 - x, y: null, unless a picture of the screen is attached (see below).
+- look_for: null, unless the thing to tap is not on screen yet but you are sure it is further down this same list (for example Storage or Battery in the Settings list). Then label is null, say is for example: Scroll down to find Storage. and look_for is its name as phones usually show it. The phone points at it by itself when it appears.
 Rules:
 - A plan may be given. Follow it, skip steps that are already done, and change it if the screen is different.
 - The goal can be a question, such as which app to use or why something happens. Turn it into something to do on the phone and guide that. For "which app": FIRST check the installed apps list. If an app already on the phone can do the job (for example Google Drive or Google Photos can scan documents), guide the user to open that app and use the feature. Only if no installed app can do it, open the Play Store and search (say what words to type). If the app is not visible on the screen, use label null and say: Swipe up to see all your apps. For "why is something full or slow", open Settings and look at the right page (Storage, Battery).
@@ -771,7 +773,11 @@ Rules:
 - If the user explains why they are stuck, answer what they said in up to two short, kind sentences in simple words, then say the next tap.
 - If you are not sure, use null and say so simply.
 - During a guide the person cannot talk or type to you. Never ask them to say or type something to you. If the goal is unclear, use label null and say: I am not sure what you want to do. Tap Stop, then ask me again in ScreenGuide.
-- If the goal names an app (for example YouTube) and that app's name is in <screen_words>, the label is that name."""
+- If the goal names an app (for example YouTube) and that app's name is in <screen_words>, the label is that name.
+- Typing is hard for these people. Prefer tapping and scrolling to items they can see or that are surely further down the list. Use a search box only when the item is deep inside menus.
+- On a search page whose box already has text, they are searching: point at the result that fits the goal. If no result fits yet, use label null and say: Keep typing. Never say they are in the wrong place while they search.
+- Never say they have reached a page (for example "Look at the bar on the Storage page") unless that page's own words are in <screen_words>.
+- <user_note> may say what the person just did on the phone (scrolled the list, typed in a box). Use it to understand the new screen."""
 
 SHOT_NOTE = """
 
@@ -826,6 +832,23 @@ def _label_from_say(say: str, labels: list):
         if len(n) >= 2 and re.search(r"\b(tap|press|open|choose|select|dinani|kandeni)\s+(the\s+)?[\"\u201c']?" + re.escape(n) + r"(?![\w])", say, re.I):
             return n
     return None
+
+
+_THEN = re.compile(r",?\s+(?:and\s+)?then\s+.*$", re.I)
+_WHERE = re.compile(r"\s+(?:at|in|on|near)\s+the\s+(?:very\s+)?(?:top|bottom|upper|lower|left|right)(?:[- ](?:right|left))?"
+                    r"(?:\s+(?:corner|side|edge|of the screen|of your screen))?\b", re.I)
+
+
+def _one_action(say: str, pointing: bool) -> str:
+    """With a ring there is one tap to describe: "Tap the Search box at the top, then type storage." becomes
+    "Tap the Search box." The ring shows the place, and the next screen gets its own instruction."""
+    if not pointing:
+        return say
+    s = _WHERE.sub("", say)
+    cut = _THEN.sub("", s).strip()
+    if len(cut) >= 6 and cut != s.strip():
+        s = cut if cut.endswith((".", "!", "?")) else cut + "."
+    return s.strip() or say
 
 
 RISKY = re.compile(r"\b(pay|payment|transfer|withdraw|send money|buy|purchase|checkout|pin|password|passcode|erase|"
@@ -899,6 +922,16 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         label = _label_from_say(say, labels)   # the AI named the button in its words but did not mark it
         if label:
             STATS["label_from_words"] += 1
+    say = _one_action(say, bool(label))
+    look = None
+    if not label and data.get("look_for") and not (image and data.get("x") is not None):
+        lf = _plain(str(data.get("look_for")))[:40]
+        inside = _match_label(lf, labels)
+        if inside:
+            label = inside   # it is already on screen: point at it
+        elif 2 <= len(lf) and not RISKY.search(lf):
+            look = lf
+            STATS["look_for"] += 1
     if label and RISKY.search(label):
         STATS["risky_label_blocked"] += 1
         label, say = None, "Read this screen carefully. If you are sure, do this step yourself. I will not point at it."
@@ -915,7 +948,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if LOG_SAMPLES:
         _samples.append({"t": time.strftime("%H:%M", time.gmtime(time.time() + 7200)), "kind": "step", "v": PROMPT_VERSION,
                          "ms": int((time.time() - t0) * 1000), "q": _scrub(goal), "a": _scrub("%s -> %s" % (label or "-", say))})
-    return {"label": label, "say": say, "done": bool(data.get("done")), "x": x, "y": y}
+    return {"label": label, "say": say, "done": bool(data.get("done")), "x": x, "y": y, "look_for": None if (label or x is not None) else look}
 
 
 # ---- Self-test: real questions from field testing, run through the same code. Open in a browser. ----
