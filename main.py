@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.48"
+SERVER_VERSION = "0.49"
 
 
 @app.get("/health")
@@ -2273,7 +2273,7 @@ def _fix_issue(rec: dict) -> tuple:
     return title, body
 
 
-async def _github(method: str, path: str, payload: dict) -> dict:
+async def _github(method: str, path: str, payload):
     import httpx
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.request(method, "https://api.github.com" + path, json=payload,
@@ -2284,11 +2284,29 @@ async def _github(method: str, path: str, payload: dict) -> dict:
     return r.json()
 
 
+def _fix_marker(cid: str) -> str:
+    return "<!-- crash-id: %s -->" % cid
+
+
 async def _ask_ai_fix(cid: str, rec: dict):
-    """Open the issue, then add the label in a second step, which is what starts the AI fixer. Never breaks /crash."""
+    """Open the issue, then add the label in a second step, which is what starts the AI fixer. Never breaks /crash.
+    GitHub is the memory: without a database the server forgets everything when it restarts, so before opening an issue
+    it checks GitHub for one already opened for this crash, and counts today's crash issues there for the daily limit."""
     try:
+        recent = await _github("GET", "/repos/%s/issues?labels=%s&state=all&sort=created&direction=desc&per_page=50"
+                               % (AI_FIX_REPO, AI_FIX_LABEL), None)
+        mine = [i for i in recent if "<!-- crash-id: " in (i.get("body") or "")]
+        same = next((i for i in mine if _fix_marker(cid) in (i.get("body") or "")), None)
+        today = sum(1 for i in mine if str(i.get("created_at", "")).startswith(time.strftime("%Y-%m-%d", time.gmtime())))
+        if same or today >= AI_FIX_PER_DAY:
+            if same:
+                latest = await _gdb(_store.kv_get, "crash", cid) or rec
+                latest["issue"] = same["number"]
+                await _gdb(_store.kv_put, "crash", cid, latest)
+            STATS["ai_fix_skipped"] += 1
+            return
         title, body = _fix_issue(rec)
-        issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": body})
+        issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": body + "\n" + _fix_marker(cid)})
         await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
         latest = await _gdb(_store.kv_get, "crash", cid) or rec   # more reports may have come in meanwhile
         latest["issue"] = issue["number"]
