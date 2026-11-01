@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "46"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "47"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.46"
+SERVER_VERSION = "0.47"
 
 
 @app.get("/health")
@@ -2173,6 +2173,59 @@ async def voice_get(name: str, x_app_token: str = Header(default="")):
         raise HTTPException(404, "No such recording.")
     return {"audio": d["b64"], "at": d.get("at", 0)}
 
+
+# ---- Crash reports from phones: only where in the code it went wrong, never screen words or personal details ----
+# The same crash from many phones is one row (counted), so the owner report shows what to fix first.
+class CrashIn(BaseModel):
+    trace: str
+    version: str = ""
+    device: str = ""
+    where: str = ""
+
+
+_FRAME = re.compile(r"^\s*at [\w.$<>\-]+\([\w.\-? ]*(:-?\d+)?\)\s*$")
+
+
+def _crash_lines(trace: str) -> list:
+    """The exception line and 'Caused by' lines (numbers and emails removed), and the code places (at ...)."""
+    out = []
+    for i, line in enumerate(str(trace).splitlines()[:80]):
+        if _FRAME.match(line):
+            out.append("    " + line.strip()[:200])
+        elif i == 0 or line.startswith("Caused by:"):
+            out.append(_scrub(line.strip(), 200))
+    return out[:45]
+
+
+@app.post("/crash")
+async def crash_report(body: CrashIn, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    install_id = _check(x_app_token, x_install_id)
+    q = _event_minute[install_id]
+    _prune(q, 60, time.time())
+    if len(q) >= 30:
+        return {"ok": False}
+    q.append(time.time())
+    lines = _crash_lines(body.trace)
+    if not lines:
+        return {"ok": False}
+    kind = lines[0].split(":")[0].strip()[:120]
+    ours = next((l.strip() for l in lines if "zm.screenguide" in l), next((l.strip() for l in lines[1:]), ""))
+    cid = _hash(kind + "|" + re.sub(r":-?\d+\)", ")", ours), 16)   # the same crash, even after lines move a little
+    now = int(time.time())
+    try:
+        rec = await _gdb(_store.kv_get, "crash", cid) or {"kind": kind, "first": now, "count": 0, "versions": [], "devices": [], "phones": []}
+        rec["count"] += 1; rec["last"] = now; rec["trace"] = "\n".join(lines)
+        rec["where"] = re.sub(r"[^\w .-]", "", body.where)[:40]
+        for k, v, n in (("versions", re.sub(r"[^\w.]", "", body.version)[:12], 8), ("devices", _device(body.device), 8), ("phones", _hash("crash:" + install_id, 10), 50)):
+            if v and v not in rec[k]:
+                rec[k] = (rec[k] + [v])[-n:]
+        await _gdb(_store.kv_put, "crash", cid, rec)
+    except HTTPException:
+        pass
+    STATS["crashes"] += 1
+    log.warning("CRASH %s (%s)", kind, body.version[:12])
+    return {"ok": True}
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     contact = html.escape(CONTACT_EMAIL) if CONTACT_EMAIL else "the developer (set CONTACT_EMAIL on the server to show an address here)"
@@ -2193,6 +2246,7 @@ async def privacy():
 <li><b>Finished Smart guides.</b> When a Smart guide finishes, the names of the buttons you tapped (only those) are kept with the task and your phone's make and kind, so the next person with the same kind of phone gets the guide at once. A path is given to others only after two different phones did it the same way. Never in Incognito.</li>
 <li><b>Read button.</b> When you tap it, the words on that screen (long numbers removed) are sent to get an explanation in your language. Never on password, banking or mobile money screens.</li>
 <li><b>Live help.</b> Only when you start it and send the link: the person you sent it to sees the words on your screen, drawn as boxes (never pictures, never password, bank or mobile money screens, long numbers hidden), and can point where to tap. They can never tap for you. Stop it any time; it is kept in the server's memory only and ends by itself.</li>
+<li><b>Crash reports.</b> If the app crashes, it sends where in its own code it went wrong, the app version and your phone's make and kind. Never what was on your screen, and numbers and email addresses are removed.</li>
 <li><b>Voice recordings</b> you make for the steps stay on your phone. Only the ScreenGuide owner can share recordings with everyone, and phones then download those.</li>
 <li><b>Scam guard</b> and <b>error explanations</b>, if you turn them on, work on your phone only. Nothing is sent.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
@@ -2308,6 +2362,17 @@ async def admin_report(key: str = ""):
         quality += ("<h3>Recent questions (numbers removed)</h3><table><tr><th>Time</th><th>Kind</th><th>Took</th><th>Question / goal</th><th>Answer</th></tr>%s</table>"
                     % "".join("<tr><td>%s</td><td>%s</td><td>%.1f s</td><td>%s</td><td>%s</td></tr>"
                               % (x["t"], x["kind"], x["ms"] / 1000, html.escape(x["q"]), html.escape(x["a"])) for x in reversed(_samples)))
+    try:   # crash reports are kept in the database, so they survive restarts
+        crashes = sorted((d for _, d in await asyncio.to_thread(_store.kv_list, "crash", 30)), key=lambda d: d.get("last", 0), reverse=True)
+    except Exception:
+        crashes = []
+    if crashes:
+        quality += ("<h3>App crashes</h3><p class='m'>Newest first. Each row is one kind of crash, however many times it happened.</p>"
+                    "<table><tr><th>Last</th><th>Times</th><th>Phones</th><th>Versions</th><th>Phone kinds</th><th>Where in the code</th></tr>%s</table>"
+                    % "".join("<tr><td>%s</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td><td><pre style='white-space:pre-wrap;margin:0;font-size:12px'>%s</pre></td></tr>"
+                              % (time.strftime("%m-%d %H:%M", time.gmtime(d.get("last", 0) + 7200)), d.get("count", 0), len(d.get("phones", [])),
+                                 html.escape(", ".join(d.get("versions", []))), html.escape(", ".join(d.get("devices", []))),
+                                 html.escape("\n".join(d.get("trace", "").splitlines()[:14]))) for d in crashes[:20]))
     head = ("<h2>ScreenGuide report</h2><p class='m'>Since the server last started: %.1f hours ago. "
             "The free server restarts when idle, so these numbers reset. Screenshot this page each day.</p>" % hours)
     body = health + head + spend + quality + (
