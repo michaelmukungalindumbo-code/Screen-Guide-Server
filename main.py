@@ -7,6 +7,7 @@ import os
 import json
 import logging
 import re
+import secrets
 import time
 from collections import defaultdict, deque
 
@@ -42,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "42"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "43"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -511,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.42"
+SERVER_VERSION = "0.43"
 
 
 @app.get("/health")
@@ -1282,6 +1283,12 @@ async def guides(x_app_token: str = Header(default="")):
             pass
         except Exception as e:
             log.warning("guides.json could not be read: %s", e)
+        try:   # official guides (from organisations) come after the built-in ones
+            official = [g for _, g in await asyncio.to_thread(_store.kv_list, "official", 200) if isinstance(g, dict) and g.get("steps")]
+            if official:
+                data = {**data, "guides": data["guides"] + official}
+        except Exception as e:
+            log.warning("official guides could not be read: %s", e)
         _guides_cache.update(at=time.time(), data=data)
     return JSONResponse(_guides_cache["data"])
 
@@ -1348,25 +1355,63 @@ class _Store:
 
     def __init__(self, url: str):
         self.url, self.mem, self._ready, self._sqlite = url, {}, False, None
+        self.kv, self._kv_ready = {}, False
 
     @property
     def kind(self) -> str:
         return "database" if self.url else "memory"
 
-    def _run(self, sql: str, args=(), fetch: bool = False):
+    def _run(self, sql: str, args=(), fetch=False):
+        """fetch: False (nothing), True (one row) or "all" (every row)."""
         if self.url.startswith("sqlite:"):
             import sqlite3
             if self._sqlite is None:
                 self._sqlite = sqlite3.connect(self.url[7:] or ":memory:", check_same_thread=False)
             cur = self._sqlite.cursor()
             cur.execute(sql.replace("%s", "?"), args)
-            row = cur.fetchone() if fetch else None
+            row = (cur.fetchall() if fetch == "all" else cur.fetchone()) if fetch else None
             self._sqlite.commit()
             return row
         import psycopg   # in requirements.txt as psycopg[binary]
         with psycopg.connect(self.url, autocommit=True, connect_timeout=15) as c:
             cur = c.execute(sql, args)
-            return cur.fetchone() if fetch else None
+            return (cur.fetchall() if fetch == "all" else cur.fetchone()) if fetch else None
+
+    # Shared guides, guides learned by many phones, and official guides: a small table of JSON documents.
+    def _kv_setup(self):
+        if not self._kv_ready:
+            self._run("create table if not exists sg_kv (kind text, id text, data text, updated bigint, primary key (kind, id))")
+            self._kv_ready = True
+
+    def kv_get(self, kind: str, kid: str):
+        if not self.url:
+            return self.kv.get((kind, kid))
+        self._kv_setup()
+        r = self._run("select data from sg_kv where kind = %s and id = %s", (kind, kid), fetch=True)
+        return json.loads(r[0]) if r and r[0] else None
+
+    def kv_put(self, kind: str, kid: str, data: dict):
+        if not self.url:
+            self.kv.pop((kind, kid), None); self.kv[(kind, kid)] = data   # newest last
+            return
+        self._kv_setup()
+        self._run("insert into sg_kv (kind, id, data, updated) values (%s, %s, %s, %s) on conflict (kind, id) do update set "
+                  "data = excluded.data, updated = excluded.updated", (kind, kid, json.dumps(data), int(time.time())))
+
+    def kv_delete(self, kind: str, kid: str):
+        if not self.url:
+            self.kv.pop((kind, kid), None)
+            return
+        self._kv_setup()
+        self._run("delete from sg_kv where kind = %s and id = %s", (kind, kid))
+
+    def kv_list(self, kind: str, limit: int = 100) -> list:
+        """(id, data) pairs, newest first."""
+        if not self.url:
+            return [(k[1], v) for k, v in self.kv.items() if k[0] == kind][::-1][:limit]
+        self._kv_setup()
+        rows = self._run("select id, data from sg_kv where kind = %s order by updated desc limit %s", (kind, limit), fetch="all") or []
+        return [(r[0], json.loads(r[1])) for r in rows]
 
     def _setup(self):
         if not self._ready:
@@ -1603,6 +1648,253 @@ async def account_delete_page():
 
 
 # ---- Privacy policy (Google Play needs a link to one) ----
+# ---- Guides people make and share ----
+# Teach: someone who knows a task does it once while ScreenGuide records the buttons they tap, then shares a link.
+# The other person's phone replays it with the ring on their own screen: no AI, no cost.
+# Learned: when a Smart guide finishes, the buttons tapped are kept for that task and phone maker. After two different
+# phones finish it the same way, the next phone of that kind gets it at once, without the AI.
+# Official: the owner can mark a shared guide as official for an organisation (ZRA, HELSB...); it then comes with the
+# guides list on every phone, marked "Verified by ...".
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://screen-guide-server.onrender.com").rstrip("/")
+LEARNED_MIN_PHONES = max(1, int(os.getenv("LEARNED_MIN_PHONES", "2")))
+_CODE_ABC = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"    # no 0/O, 1/I/L: easy to read out and type
+_PERSONAL = re.compile(r"\d{4,}|@|\+\d")
+_SAY_DEFAULT = {"en": "Tap “%s”.", "ny": "Dinani “%s”.", "bem": "Kandeni “%s”."}
+_share_day = defaultdict(deque)
+_learn_day = defaultdict(deque)
+_share_global = deque()
+
+
+class ShareIn(BaseModel):
+    title: str
+    steps: list = []
+    sw: bool = False
+    shade: bool = False
+    lang: str = "en"
+    device: str = ""
+
+
+class LearnedIn(BaseModel):
+    goal: str
+    steps: list = []
+    sw: bool = False
+    device: str = ""
+
+
+def _clean_steps(steps, strict: bool):
+    """Steps as the app saves them: [{"m": [words to find], "s": {"en": say, ...}}]. Words that look personal (long
+    numbers, emails) or risky (payments, passwords) are never kept: strict (a shared guide) refuses the whole guide,
+    otherwise (a learned guide) nothing is kept. Returns the clean list, or None."""
+    if not isinstance(steps, list) or not steps:
+        return None
+    out = []
+    for st in steps[:25]:
+        if not isinstance(st, dict):
+            return None
+        words = [re.sub(r"\s+", " ", str(w)).strip()[:60] for w in (st.get("m") or [])[:4] if str(w).strip()]
+        if not words:
+            continue
+        if any(_PERSONAL.search(w) or RISKY.search(w) or MONEY.search(w) for w in words):
+            return None
+        say = st.get("s") if isinstance(st.get("s"), dict) else {}
+        clean = {}
+        for lang in ("en", "ny", "bem"):
+            t = re.sub(r"\s+", " ", str(say.get(lang) or "")).strip()[:160]
+            if not t or _PERSONAL.search(t) or RISKY.search(t):
+                t = _SAY_DEFAULT[lang] % words[0]
+            clean[lang] = t
+        if out and out[-1]["m"] == words:
+            continue   # the same tap twice in a row
+        out.append({"m": words, "s": clean})
+    return out or None
+
+
+async def _gdb(fn, *a):
+    try:
+        return await asyncio.to_thread(fn, *a)
+    except Exception as e:
+        log.warning("Guide store error: %s", str(e)[:160])
+        raise HTTPException(503, "Shared guides could not be reached. Please try again in a minute.")
+
+
+def _hash(s: str, n: int = 12) -> str:
+    return hashlib.sha256(("sg:" + s).encode()).hexdigest()[:n]
+
+
+def _norm_code(code: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(code).upper())[:8]
+
+
+@app.post("/share")
+async def share_guide(body: ShareIn, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    install_id = _check(x_app_token, x_install_id)
+    title = re.sub(r"\s+", " ", body.title).strip()[:60]
+    if len(title) < 3:
+        raise HTTPException(400, "Please give the task a name, for example: Check ECZ results.")
+    if re.search(r"\d{6,}|@", title):
+        raise HTTPException(400, "Please leave numbers and email addresses out of the name.")
+    steps = _clean_steps(body.steps, strict=True)
+    if not steps:
+        raise HTTPException(400, "This guide has a step about payments, passwords or personal numbers, so it cannot be shared. "
+                                 "Remove that step and try again.")
+    if _take(deque(), _share_day[install_id], _share_global, 10**6, 20, 5000):
+        raise HTTPException(429, "You have shared many guides today. Please try again tomorrow.")
+    for _ in range(8):
+        code = "".join(secrets.choice(_CODE_ABC) for _ in range(6))
+        if not await _gdb(_store.kv_get, "share", code):
+            break
+    data = {"title": title, "steps": steps, "sw": bool(body.sw), "shade": bool(body.shade), "lang": body.lang if body.lang in LANGS else "en",
+            "device": _device_key(body.device), "by": _hash(install_id), "created": int(time.time()), "uses": 0, "official": ""}
+    await _gdb(_store.kv_put, "share", code, data)
+    STATS["guides_shared"] += 1
+    return {"code": code, "url": PUBLIC_URL + "/g/" + code}
+
+
+@app.get("/share/{code}")
+async def get_shared(code: str, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    _check(x_app_token, x_install_id)
+    code = _norm_code(code)
+    data = await _gdb(_store.kv_get, "share", code) if len(code) == 6 else None
+    if not data:
+        raise HTTPException(404, "No guide has that code. Check the letters and try again.")
+    data["uses"] = int(data.get("uses", 0)) + 1
+    try:
+        await _gdb(_store.kv_put, "share", code, data)
+    except Exception:
+        pass
+    STATS["shared_opened"] += 1
+    return {"code": code, "title": data["title"], "steps": data["steps"], "sw": data.get("sw", False), "shade": data.get("shade", False),
+            "official": data.get("official", "")}
+
+
+_GPAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>How to: __T__ (ScreenGuide)</title><meta property="og:title" content="How to: __T__">
+<meta property="og:description" content="Follow it on your own phone with ScreenGuide: it shows you where to tap, one step at a time.">
+<style>body{font:17px/1.5 system-ui,sans-serif;margin:0;background:#FAF6EF;color:#1F1A14}main{max-width:560px;margin:0 auto;padding:20px 16px 40px}
+a.b{display:block;text-align:center;padding:16px;background:#145A3D;color:#fff;border-radius:28px;text-decoration:none;font-weight:700;margin:18px 0}
+.m{color:#534C45}.c{font:700 22px monospace;letter-spacing:3px}li{margin:6px 0}</style></head><body><main>
+<p class="m">ScreenGuide</p><h1 style="margin:0 0 6px">How to: __T__</h1>__OFF__
+<a class="b" href="screenguide://g/__C__">Open in ScreenGuide</a>
+<p class="m">ScreenGuide shows each step on your own screen. If the button does nothing, open ScreenGuide, tap the menu, then
+<b>Open a shared guide</b>, and type this code:</p><p class="c">__C__</p><h3>The steps</h3><ol>__S__</ol></main></body></html>"""
+
+
+@app.get("/g/{code}", response_class=HTMLResponse)
+async def shared_page(code: str):
+    """What opens when someone taps the link on WhatsApp: the steps, and a button that opens them in ScreenGuide."""
+    code = _norm_code(code)
+    data = await _gdb(_store.kv_get, "share", code) if len(code) == 6 else None
+    if not data:
+        return HTMLResponse(_GPAGE.replace("How to: __T__", "Guide not found").replace("__OFF__", "<p>Check the link, or ask the person who sent it.</p>")
+                            .replace("__C__", code).replace("__S__", ""), status_code=404)
+    off = ("<p>\u2714 Official guide from <b>%s</b></p>" % html.escape(data["official"])) if data.get("official") else ""
+    return HTMLResponse(_GPAGE.replace("__T__", html.escape(data["title"])).replace("__OFF__", off).replace("__C__", code)
+                        .replace("__S__", "".join("<li>%s</li>" % html.escape(st["s"].get("en", "")) for st in data["steps"])))
+
+
+@app.post("/learned")
+async def learned_add(body: LearnedIn, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    install_id = _check(x_app_token, x_install_id)
+    goal = body.goal.split("(about:")[0].strip()
+    gkey, dkey = _qkey(goal), _device_key(body.device)
+    steps = _clean_steps(body.steps, strict=False)
+    if not gkey or not dkey or not steps or len(steps) < 2:
+        return {"ok": False}
+    if _take(deque(), _learn_day[install_id], deque(), 10**6, 40, 10**9):
+        return {"ok": False}
+    rid = _hash(dkey + "|" + gkey, 24)
+    rec = await _gdb(_store.kv_get, "learned", rid) or {"goal": gkey, "title": goal[:80], "device": dkey, "variants": {}}
+    v_id = _hash(json.dumps([s["m"] for s in steps]))
+    v = rec["variants"].get(v_id) or {"steps": steps, "sw": bool(body.sw), "phones": []}
+    phone = _hash("phone:" + install_id, 10)
+    if phone not in v["phones"]:
+        v["phones"] = (v["phones"] + [phone])[-20:]
+    v["at"] = int(time.time())
+    rec["variants"][v_id] = v
+    if len(rec["variants"]) > 6:   # keep the paths most phones agree on
+        keep = sorted(rec["variants"].items(), key=lambda kv: (len(kv[1]["phones"]), kv[1].get("at", 0)), reverse=True)[:6]
+        rec["variants"] = dict(keep)
+    await _gdb(_store.kv_put, "learned", rid, rec)
+    STATS["learned_saved"] += 1
+    return {"ok": True}
+
+
+class LearnedFind(BaseModel):
+    goal: str
+    device: str = ""
+
+
+@app.post("/learned/find")
+async def learned_find(body: LearnedFind, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    _check(x_app_token, x_install_id)
+    gkey, dkey = _qkey(body.goal.split("(about:")[0]), _device_key(body.device)
+    if not gkey or not dkey:
+        return {"found": False}
+    rec = await _gdb(_store.kv_get, "learned", _hash(dkey + "|" + gkey, 24))
+    if not rec:
+        return {"found": False}
+    best = max(rec["variants"].values(), key=lambda v: (len(v["phones"]), v.get("at", 0)), default=None)
+    if not best or len(best["phones"]) < LEARNED_MIN_PHONES:
+        return {"found": False}
+    STATS["learned_served"] += 1
+    return {"found": True, "title": rec.get("title", ""), "steps": best["steps"], "sw": best.get("sw", False), "phones": len(best["phones"])}
+
+
+def _official_guide(code: str, data: dict, by: str, keywords: list) -> dict:
+    steps = [{"match": s["m"], "say": s["s"]} for s in data["steps"]]
+    if data.get("sw") and steps:
+        steps[-1]["toggle"] = True
+    g = {"id": "official_" + code.lower(), "title": {"en": data["title"]}, "by": by, "steps": steps,
+         "done": {"en": "Well done!", "ny": "Zabwino!", "bem": "Nawamya!"},
+         "keywords": keywords or [data["title"].lower()], "shade": bool(data.get("shade"))}
+    if not data.get("sw"):
+        g["doneWhen"] = "last_tap"
+    return g
+
+
+@app.get("/admin/shares", response_class=HTMLResponse)
+async def admin_shares(key: str = "", promote: str = "", by: str = "", keywords: str = "", demote: str = ""):
+    """Shared guides, newest first. Mark one as official for an organisation, or take the mark away."""
+    _admin(key)
+    msg = ""
+    if promote:
+        code = _norm_code(promote)
+        data = await _gdb(_store.kv_get, "share", code)
+        org = re.sub(r"\s+", " ", by).strip()[:40]
+        if not data or not org:
+            msg = "Give a code that exists and the organisation's name."
+        else:
+            kws = [k.strip().lower()[:40] for k in keywords.split(",") if k.strip()][:12]
+            data["official"] = org
+            await _gdb(_store.kv_put, "share", code, data)
+            await _gdb(_store.kv_put, "official", code, _official_guide(code, data, org, kws))
+            _guides_cache["at"] = 0.0
+            msg = "%s is now an official guide from %s. Phones get it within a few minutes." % (code, html.escape(org))
+    if demote:
+        code = _norm_code(demote)
+        data = await _gdb(_store.kv_get, "share", code)
+        if data:
+            data["official"] = ""
+            await _gdb(_store.kv_put, "share", code, data)
+        await _gdb(_store.kv_delete, "official", code)
+        _guides_cache["at"] = 0.0
+        msg = "%s is no longer official." % code
+    rows = "".join("<tr><td style='font:16px monospace'><a href='/g/%s'>%s</a></td><td>%s</td><td>%d</td><td>%d</td><td>%s</td></tr>"
+                   % (c, c, html.escape(d.get("title", "")), len(d.get("steps", [])), int(d.get("uses", 0)),
+                      ("✔ " + html.escape(d["official"])) if d.get("official") else "")
+                   for c, d in await _gdb(_store.kv_list, "share", 100))
+    k = html.escape(key, quote=True)
+    body = ("<h2>Shared guides</h2>%s<p class='m'>Newest first. Guides are kept in %s.</p>"
+            "<form><input type='hidden' name='key' value='%s'><p>Mark as official: code <input name='promote' size='7'> "
+            "organisation <input name='by' size='12' placeholder='ZRA'> words people use <input name='keywords' size='24' "
+            "placeholder='tpin, zra tpin'> <button>Mark official</button></p></form>"
+            "<form><input type='hidden' name='key' value='%s'><p>Take the mark away: code <input name='demote' size='7'> <button>Remove</button></p></form>"
+            "<table><tr><th>Code</th><th>Task</th><th>Steps</th><th>Opened</th><th>Official</th></tr>%s</table>"
+            % (("<p><b>%s</b></p>" % msg) if msg else "", "the database" if DATABASE_URL else "memory only (lost on restart: set DATABASE_URL)",
+               k, k, rows))
+    return _page("Shared guides", body)
+
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     contact = html.escape(CONTACT_EMAIL) if CONTACT_EMAIL else "the developer (set CONTACT_EMAIL on the server to show an address here)"
@@ -1619,6 +1911,9 @@ async def privacy():
 <ul>
 <li><b>Smart guide.</b> If you turn it on, the words on your screen are sent to our server and an AI service while you follow a guide, so it can choose the next button. When you ask how to do something, or which app can do it, the names of your apps are also sent, so the helper can choose an app you already have or name one to install (never banking or money apps).</li>
 <li><b>Screen pictures.</b> Only if you agree: when you tap Help during a guide, or when the screen has buttons without words (an app that draws its own buttons, or an icon like +), a picture of your screen is sent the same way. Never on bank, money or password screens. You can turn this off in Settings.</li>
+<li><b>Guides you share.</b> If you teach a task and tap Share, the task name and the buttons you tapped (as shown to you before you share) are kept on our server under a 6-letter code, so anyone with the link can follow them. Password boxes, money apps, long numbers and email addresses are never recorded.</li>
+<li><b>Finished Smart guides.</b> When a Smart guide finishes, the names of the buttons you tapped (only those) are kept with the task and your phone's make and kind, so the next person with the same kind of phone gets the guide at once. A path is given to others only after two different phones did it the same way. Never in Incognito.</li>
+<li><b>Scam guard</b>, if you turn it on, works on your phone only. Nothing is sent.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
 <li><b>Your questions</b> are sent to get an answer.</li>
 <li>The make of your phone (for example Samsung), whether it is a phone or a tablet, and its Android version, so the steps use your phone's own menu names.</li>
@@ -1628,7 +1923,7 @@ async def privacy():
 <h2>What is kept</h2>
 <ul>
 <li><b>Chats</b> are saved on your phone only. Incognito chats are not saved. You can delete saved chats in the app (menu, Past chats, Clear all) or by removing the app.</li>
-<li><b>Our server</b> does not save your questions, screen words or pictures on disk. It keeps counts (for example how many guides finished) in memory, and short answers to common questions for up to a week, so they do not cost money twice and still work when the AI service is down.</li>
+<li><b>Our server</b> does not save your questions, screen words or pictures on disk, apart from the shared and finished guides described above. It keeps counts (for example how many guides finished) in memory, and short answers to common questions for up to a week, so they do not cost money twice and still work when the AI service is down.</li>
 <li><b>Your account (optional).</b> If you sign in with Google, we keep your Google account number, name and email, your ScreenGuide settings, the tasks your phone has learned, and any Plus plan, so they come back on a new phone. Your chats are never sent to your account. Delete it any time in the app (menu, Your account, Delete my account) or use <a href="/account/delete">the account deletion page</a>.</li>
 <li><b>Help during a guide.</b> When you tap Help (?) during a guide, the words on that screen are kept in the server's memory, with numbers and email addresses removed, so we can fix the guide. They are deleted when the server restarts.</li>
 <li><b>Thumbs-down.</b> If you mark an answer as bad, that question and answer are kept in the server's memory, with numbers and email addresses removed, so we can improve the helper. They are deleted when the server restarts.</li>__SAMPLES__
