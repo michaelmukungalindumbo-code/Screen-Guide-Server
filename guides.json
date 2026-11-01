@@ -317,7 +317,12 @@
    "small writing",
    "words are small",
    "letters are small",
-   "increase font"
+   "increase font",
+   "words bigger",
+   "letters bigger",
+   "text bigger",
+   "font bigger",
+   "make the words bigger"
   ],
   "steps": [
    {
@@ -454,7 +459,7 @@
    "wi-fi",
    "wlan",
    "wireless",
-   "internet"
+   "wifi internet"
   ],
   "doneWhen": "wifi_on",
   "about": {
