@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "45"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "46"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.45"
+SERVER_VERSION = "0.46"
 
 
 @app.get("/health")
@@ -2122,6 +2122,57 @@ async def live_page(lid: str):
     return HTMLResponse(_LIVE_PAGE.replace("__ID__", lid))
 
 
+
+# ---- Real voices: the owner records the fixed instructions ("Kandeni", "Well done!") once, in a Zambian voice, and
+# every phone plays them instead of the robot voice. Kept with the shared guides (sg_kv), a few KB each.
+_VOICE_KEY = re.compile(r"^[a-z_]{2,24}$")
+
+
+class VoiceIn(BaseModel):
+    lang: str
+    key: str
+    audio: str      # base64 of a short .m4a recording
+
+
+@app.post("/voices/upload")
+async def voice_upload(body: VoiceIn, x_admin_key: str = Header(default="")):
+    _admin(x_admin_key)
+    if body.lang not in LANGS or not _VOICE_KEY.match(body.key):
+        raise HTTPException(400, "Unknown recording.")
+    try:
+        raw = base64.b64decode(body.audio, validate=True)
+    except Exception:
+        raise HTTPException(400, "That recording could not be read.")
+    if not 200 <= len(raw) <= 200_000:
+        raise HTTPException(413, "That recording is too short or too long.")
+    await _gdb(_store.kv_put, "voice", body.lang + "_" + body.key, {"b64": body.audio, "at": int(time.time())})
+    _voice_list["at"] = 0.0
+    return {"ok": True}
+
+
+_voice_list = {"at": 0.0, "data": {}}
+
+
+@app.get("/voices")
+async def voices(x_app_token: str = Header(default="")):
+    """Which recordings exist, and when each was made, so phones fetch only new ones."""
+    if not hmac.compare_digest(x_app_token.encode(), settings.APP_TOKEN.encode()):
+        raise HTTPException(401, "Not allowed.")
+    if time.time() - _voice_list["at"] > 300:
+        rows = await _gdb(_store.kv_list, "voice", 200)
+        _voice_list.update(at=time.time(), data={k: int(v.get("at", 0)) for k, v in rows})
+    return {"clips": _voice_list["data"]}
+
+
+@app.get("/voices/{name}")
+async def voice_get(name: str, x_app_token: str = Header(default="")):
+    if not hmac.compare_digest(x_app_token.encode(), settings.APP_TOKEN.encode()):
+        raise HTTPException(401, "Not allowed.")
+    d = await _gdb(_store.kv_get, "voice", re.sub(r"[^a-z_]", "", name)[:30])
+    if not d:
+        raise HTTPException(404, "No such recording.")
+    return {"audio": d["b64"], "at": d.get("at", 0)}
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     contact = html.escape(CONTACT_EMAIL) if CONTACT_EMAIL else "the developer (set CONTACT_EMAIL on the server to show an address here)"
@@ -2142,6 +2193,7 @@ async def privacy():
 <li><b>Finished Smart guides.</b> When a Smart guide finishes, the names of the buttons you tapped (only those) are kept with the task and your phone's make and kind, so the next person with the same kind of phone gets the guide at once. A path is given to others only after two different phones did it the same way. Never in Incognito.</li>
 <li><b>Read button.</b> When you tap it, the words on that screen (long numbers removed) are sent to get an explanation in your language. Never on password, banking or mobile money screens.</li>
 <li><b>Live help.</b> Only when you start it and send the link: the person you sent it to sees the words on your screen, drawn as boxes (never pictures, never password, bank or mobile money screens, long numbers hidden), and can point where to tap. They can never tap for you. Stop it any time; it is kept in the server's memory only and ends by itself.</li>
+<li><b>Voice recordings</b> you make for the steps stay on your phone. Only the ScreenGuide owner can share recordings with everyone, and phones then download those.</li>
 <li><b>Scam guard</b> and <b>error explanations</b>, if you turn them on, work on your phone only. Nothing is sent.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
 <li><b>Your questions</b> are sent to get an answer.</li>
