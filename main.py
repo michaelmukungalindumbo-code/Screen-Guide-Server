@@ -42,7 +42,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "39"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "40"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -507,7 +507,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.39"
+SERVER_VERSION = "0.40"
 
 
 @app.get("/health")
@@ -855,6 +855,19 @@ _CHECK_GOAL = re.compile(r"^\W*(check|see|find out|look|know|confirm|verify|is|a
 _EXITISH = re.compile(r"^(exit\b.*|close|cancel|back|navigate up|discard|go back|x)$", re.I)
 _FORWARD = re.compile(r"^(next|done|upload|post|publish|share|save|continue|send|create)$", re.I)
 _MAKING = re.compile(r"\b(upload|post|publish|send|share|create|make|record|save)\b", re.I)
+# "+" buttons usually have a name: Drive's is "Create new", Gmail's "Compose", WhatsApp's "New chat". Seen: the AI said
+# "Tap the + button" with no label, asked for a picture, then pointed at the camera icon beside it.
+_PLUS_SAY = re.compile(r"(?:^|[\s\"\u201c(])\+(?=$|[\s\"\u201d).,])|\bplus\b", re.I)
+_PLUS_NAME = re.compile(r"^(create|create new|new|add|add new|compose|new chat|new post|create post|new message|start chat|plus|\+)$", re.I)
+# A list of files to choose from (Android's file picker): "Recent", "Images", "Documents", "Show roots"...
+_FILE_PICKER = ("recent", "images", "audio", "videos", "documents", "downloads", "show roots", "files in other apps", "large files", "this week")
+_FILE_WORDS = re.compile(r"\b(files?|documents?|photos?|pictures?|videos?|folders?|recent|images|downloads|audio)\b", re.I)
+_PICK_FILE = {"en": "Tap the file you want to upload.", "ny": "Dinani fayilo imene mukufuna.", "bem": "Kandeni pa fayilo mulefwaya."}
+# The screen says the task is finished ("1 upload complete"): seen, the AI went on to "Tap Create new" again.
+_FINISHED = [(re.compile(r"\bupload"), re.compile(r"\b(\d+ )?uploads? (complete|completed|finished|done)\b|\b(file|video|photo|\d+ files?) uploaded\b|\buploaded successfully\b|\bsuccessfully uploaded\b|\bupload successful\b")),
+             (re.compile(r"\b(post|publish)"), re.compile(r"\b(posted|published|your post is live|post shared)\b")),
+             (re.compile(r"\binstall"), re.compile(r"^uninstall$"))]
+_DONE_SAY = {"en": "Done! It worked. You did it yourself.", "ny": "Zabwino! Zatheka. Mwachita nokha.", "bem": "Nawamya! Capwa. Mwacita nemwe bene."}
 _TAP_WORD = {"en": "Tap \u201c%s\u201d.", "ny": "Dinani \u201c%s\u201d.", "bem": "Kandeni \u201c%s\u201d."}
 
 
@@ -1036,6 +1049,26 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     say = _one_action(say, bool(label))
     label, say = _gallery_fix(goal, labels, label, say, lang)
     done = bool(data.get("done"))
+    plain_all = [_plain(l) for l in labels]
+    low_words = [p.lower() for p in plain_all]
+    # The screen says it is finished: done, whatever the AI planned next.
+    for goal_rx, done_rx in _FINISHED:
+        if goal_rx.search(goal.lower()) and any(done_rx.search(w) for w in low_words) and not (done_rx.pattern == "^uninstall$" and "open" not in low_words):
+            STATS["finished_seen"] += 1
+            done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
+            break
+    # "Tap the + button" with no label: use the + button's own name when it is on screen.
+    if not done and not label and _PLUS_SAY.search(say) and not (image and data.get("x") is not None):
+        plus = next((p for p, l in zip(plain_all, labels) if _PLUS_NAME.match(p) and not l.rstrip().lower().endswith("[text]")), None)
+        if plus:
+            STATS["plus_named"] += 1
+            label = plus
+            say = _one_action(say, True)
+    # Android's file list: the person picks their own file. Old steps ("Tap the + button, then Upload") do not apply.
+    if not done and sum(1 for w in low_words if w in _FILE_PICKER) >= 3 and re.search(r"\b(upload|attach|send|share)\b", goal, re.I):
+        if not _FILE_WORDS.search(say) and not (label and label.lower() in _FILE_PICKER):
+            STATS["file_picker_fixed"] += 1
+            label, say = None, _PICK_FILE.get(lang, _PICK_FILE["en"])
     if label and _EXITISH.match(label) and _MAKING.search(goal):
         fwd = next((_plain(l) for l in labels if _FORWARD.match(_plain(l)) and not l.rstrip().lower().endswith("[text]")), None)
         if fwd:
