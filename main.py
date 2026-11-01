@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.47"
+SERVER_VERSION = "0.48"
 
 
 @app.get("/health")
@@ -2220,11 +2220,84 @@ async def crash_report(body: CrashIn, x_app_token: str = Header(default=""), x_i
             if v and v not in rec[k]:
                 rec[k] = (rec[k] + [v])[-n:]
         await _gdb(_store.kv_put, "crash", cid, rec)
+        if await _should_ask_fix(cid, rec):
+            asyncio.create_task(_ask_ai_fix(cid, rec))
     except HTTPException:
         pass
     STATS["crashes"] += 1
     log.warning("CRASH %s (%s)", kind, body.version[:12])
     return {"ok": True}
+
+
+# ---- AI fixer: a new kind of crash becomes a GitHub issue on the app repository, labelled "ai-fix". ----
+# The AI on GitHub (.github/workflows/ai-fix.yml in the app repository) then reproduces it with a failing test, fixes it,
+# and pushes the fix to its own branch. Nothing reaches phones until the owner opens the pull request and merges it.
+# Off unless GITHUB_TOKEN is set: a fine-grained token with only "Issues: read and write" on the app repository.
+# The app repository is public, so the issue holds only what the owner report shows: code places, versions, phone kinds.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+AI_FIX_REPO = os.getenv("AI_FIX_REPO", "michaelmukungalindumbo-code/Screen-Guide").strip()
+AI_FIX_LABEL = os.getenv("AI_FIX_LABEL", "ai-fix").strip()
+AI_FIX_PER_DAY = int(os.getenv("AI_FIX_PER_DAY", "3"))            # each fix costs AI money, so at most this many a day
+AI_FIX_MIN_PHONES = max(1, int(os.getenv("AI_FIX_MIN_PHONES", "1")))  # wait until this many phones have had the crash
+_fix_asked = set()
+
+
+async def _should_ask_fix(cid: str, rec: dict) -> bool:
+    """Ask once per kind of crash, only for crashes in our own code, and never more than AI_FIX_PER_DAY a day."""
+    if not GITHUB_TOKEN or AI_FIX_PER_DAY <= 0 or cid in _fix_asked or rec.get("asked"):
+        return False
+    if "zm.screenguide" not in rec.get("trace", "") or len(rec.get("phones", [])) < AI_FIX_MIN_PHONES:
+        return False
+    day = await _gdb(_store.kv_get, "aifix", _today()) or {"n": 0}
+    if day["n"] >= AI_FIX_PER_DAY:
+        return False
+    _fix_asked.add(cid)
+    day["n"] += 1
+    rec["asked"] = int(time.time())
+    await _gdb(_store.kv_put, "aifix", _today(), day)
+    await _gdb(_store.kv_put, "crash", cid, rec)
+    return True
+
+
+def _fix_issue(rec: dict) -> tuple:
+    """The issue the AI fixer works from: the crash, and how to work on this repository (CLAUDE.md has the rest)."""
+    title = "App crash: %s" % rec.get("kind", "unknown")[:90]
+    body = ("A phone running ScreenGuide crashed. The server opened this issue so the AI fixer can work on it.\n\n"
+            "**Where in the code** (numbers and emails removed, no screen words):\n```\n%s\n```\n"
+            "- App versions: %s\n- Phone kinds: %s\n- Times so far: %d, on %d phone(s)\n- Screen when it crashed: %s\n\n"
+            "**AI fixer:** follow CLAUDE.md. Reproduce this with a failing unit test first, then make the smallest fix, "
+            "then run the tests and Android's bug finder. If you cannot reproduce it, say so here and stop: do not guess.\n"
+            % (rec.get("trace", "")[:3000], ", ".join(rec.get("versions", [])) or "unknown",
+               ", ".join(rec.get("devices", [])) or "unknown", rec.get("count", 1), len(rec.get("phones", [])),
+               rec.get("where") or "unknown"))
+    return title, body
+
+
+async def _github(method: str, path: str, payload: dict) -> dict:
+    import httpx
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.request(method, "https://api.github.com" + path, json=payload,
+                            headers={"Authorization": "Bearer " + GITHUB_TOKEN, "Accept": "application/vnd.github+json",
+                                     "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "screenguide-server"})
+    if r.status_code >= 300:
+        raise RuntimeError("GitHub said %d: %s" % (r.status_code, r.text[:160]))
+    return r.json()
+
+
+async def _ask_ai_fix(cid: str, rec: dict):
+    """Open the issue, then add the label in a second step, which is what starts the AI fixer. Never breaks /crash."""
+    try:
+        title, body = _fix_issue(rec)
+        issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": body})
+        await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
+        latest = await _gdb(_store.kv_get, "crash", cid) or rec   # more reports may have come in meanwhile
+        latest["issue"] = issue["number"]
+        await _gdb(_store.kv_put, "crash", cid, latest)
+        STATS["ai_fix_issues"] += 1
+        log.warning("AI FIX asked: issue #%s for %s", issue["number"], rec.get("kind", "")[:80])
+    except Exception as e:
+        STATS["ai_fix_errors"] += 1
+        log.warning("AI fixer issue not opened: %s", str(e)[:200])
 
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
@@ -2368,10 +2441,12 @@ async def admin_report(key: str = ""):
         crashes = []
     if crashes:
         quality += ("<h3>App crashes</h3><p class='m'>Newest first. Each row is one kind of crash, however many times it happened.</p>"
-                    "<table><tr><th>Last</th><th>Times</th><th>Phones</th><th>Versions</th><th>Phone kinds</th><th>Where in the code</th></tr>%s</table>"
-                    % "".join("<tr><td>%s</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td><td><pre style='white-space:pre-wrap;margin:0;font-size:12px'>%s</pre></td></tr>"
+                    "<table><tr><th>Last</th><th>Times</th><th>Phones</th><th>Versions</th><th>Phone kinds</th><th>AI fix</th><th>Where in the code</th></tr>%s</table>"
+                    % "".join("<tr><td>%s</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td><pre style='white-space:pre-wrap;margin:0;font-size:12px'>%s</pre></td></tr>"
                               % (time.strftime("%m-%d %H:%M", time.gmtime(d.get("last", 0) + 7200)), d.get("count", 0), len(d.get("phones", [])),
                                  html.escape(", ".join(d.get("versions", []))), html.escape(", ".join(d.get("devices", []))),
+                                 ("<a href='https://github.com/%s/issues/%d'>#%d</a>" % (html.escape(AI_FIX_REPO), int(d["issue"]), int(d["issue"]))
+                                  if d.get("issue") else ("asked" if d.get("asked") else "-")),
                                  html.escape("\n".join(d.get("trace", "").splitlines()[:14]))) for d in crashes[:20]))
     head = ("<h2>ScreenGuide report</h2><p class='m'>Since the server last started: %.1f hours ago. "
             "The free server restarts when idle, so these numbers reset. Screenshot this page each day.</p>" % hours)
