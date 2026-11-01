@@ -22,9 +22,7 @@
    "torch",
    "flashlight",
    "flash light",
-   "light",
    "tochi",
-   "dark",
    "power cut",
    "load shedding",
    "loadshedding"
@@ -41,6 +39,52 @@
      "en": "Tap the torch.",
      "ny": "Dinani tochi.",
      "bem": "Kandeni pa tochi."
+    }
+   }
+  ]
+ },
+ {
+  "id": "screenshot",
+  "shade": true,
+  "doneWhen": "last_tap",
+  "title": {
+   "en": "Take a screenshot",
+   "ny": "Jambulani sikilini",
+   "bem": "Kopeni sikilini"
+  },
+  "about": {
+   "en": "Keep a picture of your screen",
+   "ny": "Sungani chithunzi cha sikilini",
+   "bem": "Sungeni icikope ca sikilini"
+  },
+  "done": {
+   "en": "Well done! You took a screenshot. It is in your Gallery.",
+   "ny": "Zabwino! Mwajambula sikilini. Ili mu Gallery yanu.",
+   "bem": "Nawamya! Mwakopa sikilini. Ilemoneka mu Gallery yenu."
+  },
+  "keywords": [
+   "screenshot",
+   "screenshots",
+   "screen shot",
+   "screen capture",
+   "capture the screen",
+   "capture my screen",
+   "picture of my screen",
+   "picture of the screen",
+   "photo of my screen"
+  ],
+  "steps": [
+   {
+    "match": [
+     "Screenshot",
+     "Screen capture",
+     "Take screenshot",
+     "Capture"
+    ],
+    "say": {
+     "en": "Tap Screenshot.",
+     "ny": "Dinani Screenshot.",
+     "bem": "Kandeni Screenshot."
     }
    }
   ]
@@ -64,14 +108,16 @@
    "bem": "Nawamya! Battery saver yapyungwa. Batri yenu ikakokola."
   },
   "keywords": [
-   "battery",
-   "saver",
+   "battery saver",
    "power saving",
-   "charge",
-   "last longer",
-   "low battery",
-   "load shedding",
-   "loadshedding",
+   "power saver",
+   "save battery",
+   "save my battery",
+   "battery last",
+   "battery last longer",
+   "make battery last",
+   "battery finishing",
+   "battery runs out",
    "batire",
    "batri"
   ],
@@ -163,14 +209,15 @@
    "bem": "Nawamya! Data saver yapyungwa. Ama-app yakalabomfya data inono."
   },
   "keywords": [
-   "data",
-   "bundle",
    "data saver",
    "save data",
-   "megabytes",
-   "mb",
-   "airtime",
-   "data finishing"
+   "save my data",
+   "saving data",
+   "use less data",
+   "data finishing",
+   "bundle finishing",
+   "data is finishing",
+   "bundle is finishing"
   ],
   "steps": [
    {
@@ -259,16 +306,18 @@
    "bem": "Nawamya! Amalembo yakula nomba."
   },
   "keywords": [
-   "font",
+   "font size",
    "text size",
    "bigger words",
-   "big letters",
    "bigger letters",
+   "big letters",
+   "bigger text",
+   "bigger font",
+   "make words bigger",
    "small writing",
-   "read",
-   "eyes",
-   "zoom",
-   "letters"
+   "words are small",
+   "letters are small",
+   "increase font"
   ],
   "steps": [
    {
@@ -401,6 +450,7 @@
   ],
   "keywords": [
    "wifi",
+   "wi fi",
    "wi-fi",
    "wlan",
    "wireless",
@@ -428,8 +478,9 @@
   "keywords": [
    "bluetooth",
    "earphone",
+   "earphones",
    "headset",
-   "speaker",
+   "headphones",
    "pair"
   ],
   "doneWhen": "bluetooth_on",
@@ -500,8 +551,10 @@
    "hotspot",
    "tether",
    "tethering",
-   "shareinternet",
-   "shareconnection"
+   "share internet",
+   "share my internet",
+   "share data",
+   "share connection"
   ],
   "doneWhen": "hotspot_on",
   "steps": [
@@ -591,7 +644,8 @@
   "keywords": [
    "airplane",
    "aeroplane",
-   "flightmode"
+   "airplane mode",
+   "flight mode"
   ],
   "doneWhen": "airplane_on",
   "steps": [
