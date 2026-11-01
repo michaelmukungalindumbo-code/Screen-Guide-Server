@@ -42,7 +42,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "35"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "36"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -507,7 +507,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.35"
+SERVER_VERSION = "0.36"
 
 
 @app.get("/health")
@@ -777,7 +777,7 @@ Rules:
 - Typing is hard for these people. Prefer tapping and scrolling to items they can see or that are surely further down the list. Use a search box only when the item is deep inside menus.
 - On a search page whose box already has text, they are searching: point at the result that fits the goal. If no result fits yet, use label null and say: Keep typing. Never say they are in the wrong place while they search.
 - Never say they have reached a page (for example "Look at the bar on the Storage page") unless that page's own words are in <screen_words>.
-- On a gallery of the person's own photos or videos (words like Upload from gallery, All albums, Recents, or video lengths like 0:14), they choose their own. If only one video shows, its length is the label and say: Tap your video. Otherwise use label null and say: Tap the video you want to upload. Never point at an album menu (Videos, All albums, Recents).
+- On a gallery of the person's own photos or videos (words like Upload from gallery, All albums, Recents, or video lengths like 0:14), they choose their own. If only one video shows, its length is the label and say: Tap your video. Otherwise use label null and say: Tap the video you want to upload. Never point at an album menu (Videos, All albums, Recents). A + tile, often named Select more media, adds videos the app cannot see yet: mention it, for example: Tap your video, or tap + if it is not here.
 - <user_note> may say what the person just did on the phone (scrolled the list, typed in a box). Use it to understand the new screen."""
 
 SHOT_NOTE = """
@@ -856,38 +856,57 @@ _DUR = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
 # album menus have plural names ("Videos"); "Video" alone is usually the mode tab (Video | Short | Live)
 _ALBUM = re.compile(r"^(?:all\s+)?(?:videos|photos|pictures|albums?|media|recents?|recent|camera|screenshots|downloads|gallery)$", re.I)
 _GALLERY_WORDS = ("select more media", "all albums", "upload from gallery", "recents", "gallery")
+_MORE = re.compile(r"\b(?:select|add|choose)\s+more\b|\bmore\s+(?:media|photos|videos)\b", re.I)
+# one: a single video shows. many: several. +more: the app only sees some of the phone's videos, and its "+" tile
+# ("Select more media") adds the rest. only: no video shows, just the "+".
 _PICK = {
-    "video": {"en": ("Tap your video.", "Tap the video you want to upload."),
-              "ny": ("Dinani vidiyo yanu.", "Dinani vidiyo imene mukufuna."),
-              "bem": ("Kandeni pa vidiyo yenu.", "Kandeni pa vidiyo mulefwaya.")},
-    "photo": {"en": ("Tap your photo.", "Tap the photo you want."),
-              "ny": ("Dinani chithunzi chanu.", "Dinani chithunzi chimene mukufuna."),
-              "bem": ("Kandeni pa cikope cenu.", "Kandeni pa cikope mulefwaya.")},
+    "video": {
+        "en": {"one": "Tap your video.", "many": "Tap the video you want to upload.",
+               "one_more": "Tap your video, or tap + if it is not here.",
+               "many_more": "Tap the video you want, or tap + if it is not here.", "only": "Tap + to choose your video."},
+        "ny": {"one": "Dinani vidiyo yanu.", "many": "Dinani vidiyo imene mukufuna.",
+               "one_more": "Dinani vidiyo yanu, kapena dinani + ngati palibe.",
+               "many_more": "Dinani vidiyo imene mukufuna, kapena dinani + ngati palibe.", "only": "Dinani + kuti musankhe vidiyo yanu."},
+        "bem": {"one": "Kandeni pa vidiyo yenu.", "many": "Kandeni pa vidiyo mulefwaya.",
+                "one_more": "Kandeni pa vidiyo yenu, nangu kandeni pa + nga tamwaimona.",
+                "many_more": "Kandeni pa vidiyo mulefwaya, nangu kandeni pa + nga tamwaimona.", "only": "Kandeni pa + pa kusala vidiyo yenu."}},
+    "photo": {
+        "en": {"one": "Tap your photo.", "many": "Tap the photo you want.",
+               "one_more": "Tap your photo, or tap + if it is not here.",
+               "many_more": "Tap the photo you want, or tap + if it is not here.", "only": "Tap + to choose your photo."},
+        "ny": {"one": "Dinani chithunzi chanu.", "many": "Dinani chithunzi chimene mukufuna.",
+               "one_more": "Dinani chithunzi chanu, kapena dinani + ngati palibe.",
+               "many_more": "Dinani chithunzi chimene mukufuna, kapena dinani + ngati palibe.", "only": "Dinani + kuti musankhe chithunzi chanu."},
+        "bem": {"one": "Kandeni pa cikope cenu.", "many": "Kandeni pa cikope mulefwaya.",
+                "one_more": "Kandeni pa cikope cenu, nangu kandeni pa + nga tamwacimona.",
+                "many_more": "Kandeni pa cikope mulefwaya, nangu kandeni pa + nga tamwacimona.", "only": "Kandeni pa + pa kusala cikope cenu."}},
 }
+_CHOOSING = re.compile(r"\b(?:tap|choose|select|pick|dinani|kandeni)\b", re.I)
+_MEDIA_WORDS = re.compile(r"\b(?:videos?|photos?|pictures?|albums?|recents|what you want)\b", re.I)
 
 
 def _gallery_fix(goal: str, labels: list, label, say: str, lang: str):
-    """On a gallery of the person's own videos or photos, they choose. Seen on a phone: the AI pointed at the
-    "Videos" album menu twice, then at "0:14". One video: point at it. Several: no ring, ask them to choose."""
+    """On a gallery of the person's own videos or photos, they choose; the AI only says how. Seen on a phone: it
+    pointed at the "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds videos YouTube
+    cannot see yet. One video: ring it. No video: ring the "+". Several: no ring. The "+" is always mentioned."""
     plain = [_plain(l) for l in labels]
     durs = [p for p in plain if _DUR.match(p)]
     low = " | ".join(p.lower() for p in plain)
     if not (durs or any(w in low for w in _GALLERY_WORDS)):
         return label, say
+    if label and not (_ALBUM.match(label) or _DUR.match(label)):
+        return label, say   # Next, Done, the "+" itself...: the AI is past choosing
+    if not label and not (_CHOOSING.search(say) and _MEDIA_WORDS.search(say)):
+        return label, say
+    more = next((p for p, l in zip(plain, labels) if _MORE.search(p) and not l.rstrip().lower().endswith("[text]")), None)
     kind = "photo" if re.search(r"photo|picture|image|selfie", goal, re.I) and not re.search(r"video", goal, re.I) else "video"
-    one, many = _PICK[kind].get(lang, _PICK[kind]["en"])
-    if label and _ALBUM.match(label):
-        STATS["gallery_fixed"] += 1
-        return (durs[0], one) if len(durs) == 1 else (None, many)
-    if label and _DUR.match(label):
-        if len(durs) == 1:
-            return label, one
-        STATS["gallery_fixed"] += 1
-        return None, many
-    if not label and re.search(r"\b(?:tap|choose|select|open|dinani|kandeni)\b[^.]*\b(?:all albums|albums|recents|videos|photos)\b", say, re.I):
-        STATS["gallery_fixed"] += 1   # no ring, but the words still send them to the album menu
-        return None, many
-    return label, say
+    t = _PICK[kind].get(lang, _PICK[kind]["en"])
+    STATS["gallery_fixed"] += 1
+    if kind == "video" and len(durs) == 1:
+        return durs[0], t["one_more" if more else "one"]
+    if kind == "video" and not durs and more:
+        return more, t["only"]
+    return None, t["many_more" if more else "many"]
 
 
 RISKY = re.compile(r"\b(pay|payment|transfer|withdraw|send money|buy|purchase|checkout|pin|password|passcode|erase|"
