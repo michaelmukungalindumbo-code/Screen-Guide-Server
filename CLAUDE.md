@@ -21,7 +21,7 @@ In the AI fixer's run, this repository is checked out in `server/`, next to the 
    see it fail. Use the screen words exactly as the issue gives them; "…" stands for words that were removed.
 2. Fix the cause, for every screen like this one, not just this screen. Keep the change small.
 3. Run `bash tests/run.sh`. Every test must pass.
-4. Bump `SERVER_VERSION` in `main.py` (0.54 becomes 0.55). If you change a prompt, bump `PROMPT_VERSION` too.
+4. Bump `SERVER_VERSION` in `main.py` (0.55 becomes 0.56). If you change a prompt, bump `PROMPT_VERSION` too.
 5. Do not commit or push anything in `server/` yourself. A later step in the run sends your server changes as a pull
    request. Write its title on the first line of `media/server-fix.md`, then a short plain-English description.
 

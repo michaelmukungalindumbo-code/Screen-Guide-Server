@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.54"
+SERVER_VERSION = "0.55"
 
 
 @app.get("/health")
@@ -1205,8 +1205,9 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
                         need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image)
+    wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
-            "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch}
+            "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
 
 
 # ---- Self-test: real questions from field testing, run through the same code. Open in a browser. ----
@@ -2679,6 +2680,64 @@ def _watch_issue(s: dict, c: dict) -> tuple:
 
 class WatchSend(BaseModel):
     ids: list[str] = []
+    shots: list[dict] = []   # developer phones: a small picture of the screen at each step, {"n": step, "jpg": base64}
+
+
+# Step pictures, kept only in memory and only for the AI fixer: never put on GitHub (the repository is public and the
+# pictures show the developer's real phone). They are gone after 48 hours, or when the free server restarts.
+_shots = {}
+_B64 = re.compile(r"^[A-Za-z0-9+/=]+$")
+_gh_ok = {}
+
+
+def _keep_shots(sid: str, shots: list) -> int:
+    now = time.time()
+    for k in [k for k, v in _shots.items() if now - v["t"] > 48 * 3600]:
+        _shots.pop(k, None)
+    good = []
+    for x in shots[:30]:
+        n, jpg = x.get("n") if isinstance(x, dict) else None, x.get("jpg") if isinstance(x, dict) else None
+        if isinstance(n, int) and 0 < n <= 60 and isinstance(jpg, str) and 100 < len(jpg) <= 400_000 and _B64.match(jpg[:2000]):
+            good.append({"n": n, "jpg": jpg})
+    if good:
+        while len(_shots) >= 50:
+            _shots.pop(min(_shots, key=lambda k: _shots[k]["t"]), None)
+        _shots[sid] = {"t": now, "shots": sorted(good, key=lambda x: x["n"])}
+    return len(good)
+
+
+async def _is_fixer(authorization: str) -> bool:
+    """Only a GitHub Actions run of the app repository (the AI fixer) may download step pictures. Its token is checked
+    with GitHub: the repositories it can reach must include AI_FIX_REPO. Remembered for 10 minutes."""
+    tok = str(authorization or "").removeprefix("Bearer ").removeprefix("bearer ").strip()
+    if not tok or len(tok) > 400:
+        return False
+    k = _hash("gh:" + tok, 16)
+    if _gh_ok.get(k, 0) > time.time():
+        return True
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://api.github.com/installation/repositories",
+                            headers={"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json", "User-Agent": "screenguide-server"})
+        ok = r.status_code == 200 and any(str(x.get("full_name", "")).lower() == AI_FIX_REPO.lower() for x in r.json().get("repositories", []))
+    except Exception:
+        ok = False
+    if ok:
+        _gh_ok[k] = time.time() + 600
+    return ok
+
+
+@app.get("/watch/shots/{sid}")
+async def watch_shots(sid: str, authorization: str = Header(default="")):
+    if not await _is_fixer(authorization):
+        STATS["shots_refused"] += 1
+        raise HTTPException(401, "Not allowed.")
+    d = _shots.get(re.sub(r"[^0-9a-f]", "", str(sid))[:16])
+    if not d:
+        raise HTTPException(404, "No pictures: they are kept for 48 hours, and lost when the server restarts.")
+    STATS["shots_given"] += 1
+    return {"shots": d["shots"]}
 
 
 @app.post("/watch/review")
@@ -2719,6 +2778,11 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
         return {"sent": 0, "skipped": len(chosen), "error": "GitHub could not be reached. Try again later."}
     mine = [i for i in recent if "<!-- watch-id: " in (i.get("body") or "")]
     today = sum(1 for i in mine if str(i.get("created_at", "")).startswith(time.strftime("%Y-%m-%d", time.gmtime())))
+    sid = _hash("shots:%s:%s" % (install_id, s["t"]), 16)
+    nshots = _keep_shots(sid, body.shots) if chosen else 0
+    pics = ("\n**Screen pictures:** %d of this guide, one per step, showing what the person saw (ScreenGuide's ring and card "
+            "included). They are kept privately on the server for 48 hours and never put on GitHub; the AI fixer downloads "
+            "them.\n<!-- shots: %s -->" % (nshots, sid)) if nshots else ""
     for c in chosen:
         shown = next((st for st in s["steps"] if st["n"] == c["step"]), None)
         wid = _hash("%s|%s|%s" % (c["kind"], _key(s["goal"]), _hash("|".join(sorted({_key(x) for x in (shown or {}).get("screen", [])})), 10)), 16)
@@ -2728,7 +2792,7 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
             continue
         try:
             title, text = _watch_issue(s, c)
-            issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": text + "\n" + marker})
+            issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": text + pics + "\n" + marker})
             await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
             c["sent"] = issue["number"]; sent += 1; today += 1
             mine.append({"body": marker})
@@ -2760,7 +2824,7 @@ async def privacy():
 <li><b>Read button.</b> When you tap it, the words on that screen (long numbers removed) are sent to get an explanation in your language. Never on password, banking or mobile money screens.</li>
 <li><b>Live help.</b> Only when you start it and send the link: the person you sent it to sees the words on your screen, drawn as boxes (never pictures, never password, bank or mobile money screens, long numbers hidden), and can point where to tap. They can never tap for you. Stop it any time; it is kept in the server's memory only and ends by itself.</li>
 <li><b>Crash reports.</b> If the app crashes, it sends where in its own code it went wrong, the app version and your phone's make and kind. Never what was on your screen, and numbers and email addresses are removed.</li>
-<li><b>Test phones only: guide problems.</b> On test phones (or when "Show what ScreenGuide sees" is on), every guide is checked for problems. After the guide, a pop-up lists them, and they are sent to be fixed only if you tap Allow. What is sent: the names of the buttons on the screen, what ScreenGuide said, and the kind of phone. Names, messages, numbers and any other words are removed first.</li>
+<li><b>Test phones only: guide problems.</b> On test phones (or when "Show what ScreenGuide sees" is on), every guide is checked for problems, and a small picture of the screen is kept on the phone at each step. After the guide, a pop-up lists the problems, and they are sent to be fixed only if you tap Allow. What is sent: the names of the buttons on the screen, what ScreenGuide said, the kind of phone, and those pictures. Names, messages, numbers and any other words are removed from the text; the pictures are kept privately on the server for 48 hours, only for the AI fixer, and never published.</li>
 <li><b>Voice recordings</b> you make for the steps stay on your phone. Only the ScreenGuide owner can share recordings with everyone, and phones then download those.</li>
 <li><b>Scam guard</b> and <b>error explanations</b>, if you turn them on, work on your phone only. Nothing is sent.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
