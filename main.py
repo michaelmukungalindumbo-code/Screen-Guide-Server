@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.49"
+SERVER_VERSION = "0.50"
 
 
 @app.get("/health")
@@ -804,6 +804,7 @@ Rules:
 - If the user must choose their own file, photo, video, song or contact, use label null and say: Choose what you want, then tap it.
 - say must never be empty and must never be "try again". If you are not sure, use null and say: Tell me what you want to do next.
 - If the user explains why they are stuck, answer what they said in up to two short, kind sentences in simple words, then say the next tap.
+- If <user_note> says they do not understand or cannot find it, never repeat the words in <already_told>. Say it a different, simpler way: what the thing looks like and where it is on the screen, then the tap. Up to three short sentences.
 - If you are not sure, use null and say so simply.
 - During a guide the person cannot talk or type to you. Never ask them to say or type something to you. If the goal is unclear, use label null and say: I am not sure what you want to do. Tap Stop, then ask me again in ScreenGuide.
 - If the goal names an app (for example YouTube) and that app's name is in <screen_words>, the label is that name.
@@ -976,18 +977,55 @@ def _gallery(labels: list):
     return bool(videos or photos) or any(w in low for w in _GALLERY_WORDS), videos, photos, more
 
 
-def _gallery_fix(goal: str, labels: list, label, say: str, lang: str):
+# When the person says in Help that they do not understand, the same sentence again does not help (seen on a phone:
+# "I don't understand" got back "Tap the video you want, or tap + if it is not here." word for word).
+_EXPLAIN = {
+    "video": {"en": "Your videos are the small pictures on this screen. Each one shows how long it is, like {eg}. Tap the one you want.",
+              "only": "This app cannot see your videos yet. Tap {plus} to choose one from your phone."},
+    "photo": {"en": "Your photos are the small pictures on this screen. Tap the one you want.",
+              "only": "This app cannot see your photos yet. Tap {plus} to choose one from your phone."},
+}
+_EXPLAIN_MORE = {"en": " If yours is not here, tap {plus}."}
+_ALBUM_SAY = re.compile(r"\b(?:all albums|albums|recents)\b|\btap\s+[\"“]?videos\b", re.I)
+
+
+def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = ""):
     """On a picker of the person's own videos or photos, in any app, they choose; the AI only says how. Seen on a
     phone: it pointed at YouTube's "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds
-    videos YouTube cannot see yet. One shows: ring it. No video shows: ring the "+". Several: no ring."""
+    videos YouTube cannot see yet. One shows: ring it. No video shows: ring the "+". Several: no ring.
+    explain: the person asked for help (I don't understand, I can't find it). The ring rules stay, but they get an
+    explanation instead of the sentence they already heard: the AI's own words when safe, else a plain one."""
+    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang)
+    if tmpl is None:
+        return label, say
+    if not explain:
+        return lbl, tmpl
+    leaving = bool(not label and _LEAVE_SAY.search(say)) or bool(label and _LEAVE.match(label))
+    heard = {_key(tmpl), _key(told)}
+    explains = len(re.split(r"(?<=[.!?])\s+", say.strip())) >= 2   # an explanation, then the tap: not one short order
+    if say and explains and _key(say) not in heard and not leaving and not _ALBUM_SAY.search(say) and len(say) <= 300:
+        STATS["gallery_explained_ai"] += 1
+        return lbl, say
+    if lang != "en":
+        return lbl, tmpl   # no checked Nyanja or Bemba wording for this yet: the usual sentence
+    ex = _EXPLAIN[kind]
+    STATS["gallery_explained"] += 1
+    if not items and plus:
+        return lbl, ex["only"].format(plus=plus)
+    eg = items[0] if kind == "video" and items and _DUR.match(items[0]) else "0:14"
+    return lbl, ex["en"].format(eg=eg) + (_EXPLAIN_MORE["en"].format(plus=plus) if plus else "")
+
+
+def _gallery_pick(goal: str, labels: list, label, say: str, lang: str):
+    """(label, sentence, kind, plus, items), or a None sentence when this is not a choosing moment in a gallery."""
     is_gallery, videos, photos, more = _gallery(labels)
     if not is_gallery:
-        return label, say
+        return label, None, "", "", []
     leaving = bool(label and _LEAVE.match(label)) or bool(not label and _LEAVE_SAY.search(say))
     if label and not leaving and not (_ALBUM.match(label) or _VIDEO_ITEM.match(label) or _PHOTO_ITEM.match(label)):
-        return label, say   # Next, Done, Gallery, the "+" itself...: the AI is past choosing
+        return label, None, "", "", []   # Next, Done, Gallery, the "+" itself...: the AI is past choosing
     if not label and not leaving and not (_CHOOSING.search(say) and _MEDIA_WORDS.search(say)):
-        return label, say
+        return label, None, "", "", []
     if re.search(r"video|vidiyo", goal, re.I):
         kind = "video"
     elif re.search(r"photo|picture|image|selfie|chithunzi|cikope", goal, re.I):
@@ -999,10 +1037,10 @@ def _gallery_fix(goal: str, labels: list, label, say: str, lang: str):
     plus = "+" if more and (re.search(r"more media", more, re.I) or more.strip() == "+") else "“%s”" % more if more else ""
     STATS["gallery_fixed"] += 1
     if len(items) == 1:
-        return items[0], t["one_more" if more else "one"].format(plus=plus)
+        return items[0], t["one_more" if more else "one"].format(plus=plus), kind, plus, items
     if kind == "video" and not videos and more:
-        return more, t["only"].format(plus=plus)   # photos often have no names, so this is only safe for videos
-    return None, t["many_more" if more else "many"].format(plus=plus)
+        return more, t["only"].format(plus=plus), kind, plus, items   # photos often have no names: only safe for videos
+    return None, t["many_more" if more else "many"].format(plus=plus), kind, plus, items
 
 
 # The AI names an icon it cannot point at from words alone ("Tap the + button", "Tap the three dots"): a picture helps.
@@ -1073,7 +1111,9 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         user += "\nThis person is confident: keep the instruction very short."
     if body.note.strip():
         user += "\n<user_note>" + _safe(body.note, 300) + "</user_note>"
-    if body.stuck:
+    if body.stuck and body.note.strip():
+        user += "\nThe user asked for help: their words are in <user_note>. Answer what they said, then give the next tap. If they say nothing happened, suggest a different way (scroll, go back, or another button)."
+    elif body.stuck:
         user += "\nThe user pressed I'm stuck: the last instruction did not work. Suggest a different way (scroll, go back, or another button)."
     system = NEXT_SYSTEM.format(language=LANGS[lang]) + (SHOT_NOTE if image else "")
     t0 = time.time()
@@ -1085,8 +1125,10 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         label = _label_from_say(say, labels)   # the AI named the button in its words but did not mark it
         if label:
             STATS["label_from_words"] += 1
-    say = _one_action(say, bool(label))
-    label, say = _gallery_fix(goal, labels, label, say, lang)
+    asked = body.stuck and bool(body.note.strip())   # they told us in Help why they are stuck: explain, do not repeat
+    if not asked:
+        say = _one_action(say, bool(label))
+    label, say = _gallery_fix(goal, labels, label, say, lang, explain=asked, told=history[-1] if history else "")
     done = bool(data.get("done"))
     plain_all = [_plain(l) for l in labels]
     low_words = [p.lower() for p in plain_all]
