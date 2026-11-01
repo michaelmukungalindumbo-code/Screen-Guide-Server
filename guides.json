@@ -548,9 +548,9 @@
    "bem": "Pyungeni Hotspot"
   },
   "done": {
-   "en": "Well done! Hotspot is on.",
-   "ny": "Zabwino! Hotspot yayatsidwa.",
-   "bem": "Nawamya! Hotspot yapyungwa."
+   "en": "Well done! Hotspot is on. To turn it off later, tap the same switch.",
+   "ny": "Zabwino! Hotspot yayatsidwa. Kuti muzimitse, dinani switch yomweyo.",
+   "bem": "Nawamya! Hotspot yapyungwa. Pa kuzimya, kandeni pa switch imo ine."
   },
   "keywords": [
    "hotspot",
