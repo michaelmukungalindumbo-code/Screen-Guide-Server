@@ -21,9 +21,17 @@ In the AI fixer's run, this repository is checked out in `server/`, next to the 
    see it fail. Use the screen words exactly as the issue gives them; "…" stands for words that were removed.
 2. Fix the cause, for every screen like this one, not just this screen. Keep the change small.
 3. Run `bash tests/run.sh`. Every test must pass.
-4. Bump `SERVER_VERSION` in `main.py` (0.55 becomes 0.56). If you change a prompt, bump `PROMPT_VERSION` too.
+4. Bump `SERVER_VERSION` in `main.py` (0.56 becomes 0.57). If you change a prompt, bump `PROMPT_VERSION` too.
 5. Do not commit or push anything in `server/` yourself. A later step in the run sends your server changes as a pull
    request. Write its title on the first line of `media/server-fix.md`, then a short plain-English description.
+
+## Change requests and ideas
+
+Issues titled "Change request: …" or "Idea: …" are not bugs: the developer asked for something to be added, removed or
+changed. Changing what ScreenGuide does is allowed for these. Small and clear (wording, a size, a colour, one rule):
+make it, with a test where the logic can be tested. Big (more than one screen, a new feature, or a change to what
+ScreenGuide does for its users) or unclear: reply on the issue with a short plan in plain English and stop. The owner
+answers with @claude.
 
 ## Rules
 
