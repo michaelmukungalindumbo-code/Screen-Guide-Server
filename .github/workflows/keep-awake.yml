@@ -11,4 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - run: curl -sS -o /dev/null -w "health %{http_code} in %{time_total}s\n" --max-time 120 https://screen-guide-server.onrender.com/health || true
+      - run: |
+          curl -sS -o v.json -w "version %{http_code} in %{time_total}s\n" --max-time 120 https://screen-guide-server.onrender.com/version || true
+          python3 -c "import json; d = json.load(open('v.json')); print('server', d.get('server'), 'prompts', d.get('prompts'))" || true
