@@ -42,7 +42,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "36"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "37"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -507,7 +507,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.36"
+SERVER_VERSION = "0.37"
 
 
 @app.get("/health")
@@ -757,7 +757,7 @@ Reply with JSON only: {{"label": string or null, "say": string, "done": boolean,
 - say: ONE short instruction in {language}, very simple words, about this single tap only. Do not mention later steps. For example: Tap "Create".
 - done: true only when the goal is clearly finished.
 - x, y: null, unless a picture of the screen is attached (see below).
-- look_for: null, unless the thing to tap is not on screen yet but you are sure it is further down this same list (for example Storage or Battery in the Settings list). Then label is null, say is for example: Scroll down to find Storage. and look_for is its name as phones usually show it. The phone points at it by itself when it appears.
+- look_for: null, unless the thing to tap is not on screen yet but you are sure it is further down this same list (for example Storage or Battery in the Settings list). If <user_note> says they scrolled and it is not in the list, it is somewhere else on this phone (Samsung keeps Storage under Battery and device care): guide that way instead. Then label is null, say is for example: Scroll down to find Storage. and look_for is its name as phones usually show it. The phone points at it by itself when it appears.
 Rules:
 - A plan may be given. Follow it, skip steps that are already done, and change it if the screen is different.
 - The goal can be a question, such as which app to use or why something happens. Turn it into something to do on the phone and guide that. For "which app": FIRST check the installed apps list. If an app already on the phone can do the job (for example Google Drive or Google Photos can scan documents), guide the user to open that app and use the feature. Only if no installed app can do it, open the Play Store and search (say what words to type). If the app is not visible on the screen, use label null and say: Swipe up to see all your apps. For "why is something full or slow", open Settings and look at the right page (Storage, Battery).
@@ -778,6 +778,11 @@ Rules:
 - On a search page whose box already has text, they are searching: point at the result that fits the goal. If no result fits yet, use label null and say: Keep typing. Never say they are in the wrong place while they search.
 - Never say they have reached a page (for example "Look at the bar on the Storage page") unless that page's own words are in <screen_words>.
 - On a gallery of the person's own photos or videos (words like Upload from gallery, All albums, Recents, or video lengths like 0:14), they choose their own. If only one video shows, its length is the label and say: Tap your video. Otherwise use label null and say: Tap the video you want to upload. Never point at an album menu (Videos, All albums, Recents). A + tile, often named Select more media, adds videos the app cannot see yet: mention it, for example: Tap your video, or tap + if it is not here.
+- If the thing to tap is an icon with no word in the list (a +, a pencil, three dots, a paperclip, a microphone), use label null and name the icon simply, for example: Tap the + button. The phone may then send a picture of the screen so you can point at it.
+- Android sometimes asks for permission (Allow, While using the app, Only this time, Allow all, Select photos and videos, Don't allow). If the goal needs it, point at the answer that lets it work: Allow, While using the app, or Allow all for photos and videos (with Select photos the app sees only some of them later). Say why in a few words, for example: Tap "Allow all" so YouTube can see your videos. If the goal does not need it, point at Don't allow.
+- Some actions need a long press: forwarding, deleting, copying or replying to one message, recording a voice note, or moving an app icon. Then say: Press and hold "...", with that word as label.
+- Never point at ads or sponsored items (near the words Ad, Ads, Sponsored, Promoted). On a store page, Install must belong to the app they want: its name must be in <screen_words>.
+- If a pop-up that is not about the goal covers the screen (rate us, update, new features, an ad), point at the button that closes it: Not now, Later, No thanks, Skip, Close or X.
 - <user_note> may say what the person just did on the phone (scrolled the list, typed in a box). Use it to understand the new screen."""
 
 SHOT_NOTE = """
@@ -853,60 +858,85 @@ def _one_action(say: str, pointing: bool) -> str:
 
 
 _DUR = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
-# album menus have plural names ("Videos"); "Video" alone is usually the mode tab (Video | Short | Live)
-_ALBUM = re.compile(r"^(?:all\s+)?(?:videos|photos|pictures|albums?|media|recents?|recent|camera|screenshots|downloads|gallery)$", re.I)
-_GALLERY_WORDS = ("select more media", "all albums", "upload from gallery", "recents", "gallery")
-_MORE = re.compile(r"\b(?:select|add|choose)\s+more\b|\bmore\s+(?:media|photos|videos)\b", re.I)
-# one: a single video shows. many: several. +more: the app only sees some of the phone's videos, and its "+" tile
-# ("Select more media") adds the rest. only: no video shows, just the "+".
+# One of the person's own videos or photos: "0:14" on a thumbnail, or Android's picker names such as
+# "Video, 0:14, taken on 31 Oct" and "Photo taken on 31 Oct 2026".
+_VIDEO_ITEM = re.compile(r"^(?:\d{1,2}:\d{2}(?::\d{2})?$|video\b.*(?:\d|taken))", re.I)
+_PHOTO_ITEM = re.compile(r"^(?:photo|image|picture)\b.*(?:\d|taken)", re.I)
+# Album menus have plural names ("Videos", "Recents"); "Video" alone is usually a mode tab (Video | Short | Live).
+# "Gallery" and "Camera" are left out on purpose: in WhatsApp's attach menu they are exactly the right tap.
+_ALBUM = re.compile(r"^(?:all\s+)?(?:videos|photos|pictures|albums?|media|recents?|camera roll|screenshots|downloads|photos and videos)$", re.I)
+# Words found only on a picker of one's own photos and videos (YouTube, WhatsApp, Facebook, Instagram, TikTok, Android)
+_GALLERY_WORDS = ("select more", "all albums", "upload from gallery", "recents", "camera roll", "photos and videos", "allow access to all")
+# The way to add photos and videos the app cannot see yet: YouTube's "+" ("Select more media"), WhatsApp's "Manage", ...
+_MORE = re.compile(r"\b(?:select|add|choose)\s+more\b|\bmore\s+(?:media|photos|videos)\b|^manage$|\ballow access to all\b", re.I)
+# one: a single one shows. many: several. _more: the "+" adds what the app cannot see yet. only: no video shows, just the "+".
 _PICK = {
     "video": {
-        "en": {"one": "Tap your video.", "many": "Tap the video you want to upload.",
-               "one_more": "Tap your video, or tap + if it is not here.",
-               "many_more": "Tap the video you want, or tap + if it is not here.", "only": "Tap + to choose your video."},
+        "en": {"one": "Tap your video.", "many": "Tap the video you want.",
+               "one_more": "Tap your video, or tap {plus} if it is not here.",
+               "many_more": "Tap the video you want, or tap {plus} if it is not here.", "only": "Tap {plus} to choose your video."},
         "ny": {"one": "Dinani vidiyo yanu.", "many": "Dinani vidiyo imene mukufuna.",
-               "one_more": "Dinani vidiyo yanu, kapena dinani + ngati palibe.",
-               "many_more": "Dinani vidiyo imene mukufuna, kapena dinani + ngati palibe.", "only": "Dinani + kuti musankhe vidiyo yanu."},
+               "one_more": "Dinani vidiyo yanu, kapena dinani {plus} ngati palibe.",
+               "many_more": "Dinani vidiyo imene mukufuna, kapena dinani {plus} ngati palibe.", "only": "Dinani {plus} kuti musankhe vidiyo yanu."},
         "bem": {"one": "Kandeni pa vidiyo yenu.", "many": "Kandeni pa vidiyo mulefwaya.",
-                "one_more": "Kandeni pa vidiyo yenu, nangu kandeni pa + nga tamwaimona.",
-                "many_more": "Kandeni pa vidiyo mulefwaya, nangu kandeni pa + nga tamwaimona.", "only": "Kandeni pa + pa kusala vidiyo yenu."}},
+                "one_more": "Kandeni pa vidiyo yenu, nangu kandeni pa {plus} nga tamwaimona.",
+                "many_more": "Kandeni pa vidiyo mulefwaya, nangu kandeni pa {plus} nga tamwaimona.", "only": "Kandeni pa {plus} pa kusala vidiyo yenu."}},
     "photo": {
         "en": {"one": "Tap your photo.", "many": "Tap the photo you want.",
-               "one_more": "Tap your photo, or tap + if it is not here.",
-               "many_more": "Tap the photo you want, or tap + if it is not here.", "only": "Tap + to choose your photo."},
+               "one_more": "Tap your photo, or tap {plus} if it is not here.",
+               "many_more": "Tap the photo you want, or tap {plus} if it is not here.", "only": "Tap {plus} to choose your photo."},
         "ny": {"one": "Dinani chithunzi chanu.", "many": "Dinani chithunzi chimene mukufuna.",
-               "one_more": "Dinani chithunzi chanu, kapena dinani + ngati palibe.",
-               "many_more": "Dinani chithunzi chimene mukufuna, kapena dinani + ngati palibe.", "only": "Dinani + kuti musankhe chithunzi chanu."},
+               "one_more": "Dinani chithunzi chanu, kapena dinani {plus} ngati palibe.",
+               "many_more": "Dinani chithunzi chimene mukufuna, kapena dinani {plus} ngati palibe.", "only": "Dinani {plus} kuti musankhe chithunzi chanu."},
         "bem": {"one": "Kandeni pa cikope cenu.", "many": "Kandeni pa cikope mulefwaya.",
-                "one_more": "Kandeni pa cikope cenu, nangu kandeni pa + nga tamwacimona.",
-                "many_more": "Kandeni pa cikope mulefwaya, nangu kandeni pa + nga tamwacimona.", "only": "Kandeni pa + pa kusala cikope cenu."}},
+                "one_more": "Kandeni pa cikope cenu, nangu kandeni pa {plus} nga tamwacimona.",
+                "many_more": "Kandeni pa cikope mulefwaya, nangu kandeni pa {plus} nga tamwacimona.", "only": "Kandeni pa {plus} pa kusala cikope cenu."}},
 }
 _CHOOSING = re.compile(r"\b(?:tap|choose|select|pick|dinani|kandeni)\b", re.I)
 _MEDIA_WORDS = re.compile(r"\b(?:videos?|photos?|pictures?|albums?|recents|what you want)\b", re.I)
 
 
-def _gallery_fix(goal: str, labels: list, label, say: str, lang: str):
-    """On a gallery of the person's own videos or photos, they choose; the AI only says how. Seen on a phone: it
-    pointed at the "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds videos YouTube
-    cannot see yet. One video: ring it. No video: ring the "+". Several: no ring. The "+" is always mentioned."""
+def _gallery(labels: list):
+    """(is a picker of the person's own photos/videos, video items, photo items, the "+"/Manage label or None)"""
     plain = [_plain(l) for l in labels]
-    durs = [p for p in plain if _DUR.match(p)]
+    videos = [p for p in plain if _VIDEO_ITEM.match(p)]
+    photos = [p for p in plain if _PHOTO_ITEM.match(p)]
     low = " | ".join(p.lower() for p in plain)
-    if not (durs or any(w in low for w in _GALLERY_WORDS)):
+    more = next((p for p, l in zip(plain, labels) if _MORE.search(p) and not l.rstrip().lower().endswith("[text]")), None)
+    return bool(videos or photos) or any(w in low for w in _GALLERY_WORDS), videos, photos, more
+
+
+def _gallery_fix(goal: str, labels: list, label, say: str, lang: str):
+    """On a picker of the person's own videos or photos, in any app, they choose; the AI only says how. Seen on a
+    phone: it pointed at YouTube's "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds
+    videos YouTube cannot see yet. One shows: ring it. No video shows: ring the "+". Several: no ring."""
+    is_gallery, videos, photos, more = _gallery(labels)
+    if not is_gallery:
         return label, say
-    if label and not (_ALBUM.match(label) or _DUR.match(label)):
-        return label, say   # Next, Done, the "+" itself...: the AI is past choosing
+    if label and not (_ALBUM.match(label) or _VIDEO_ITEM.match(label) or _PHOTO_ITEM.match(label)):
+        return label, say   # Next, Done, Gallery, the "+" itself...: the AI is past choosing
     if not label and not (_CHOOSING.search(say) and _MEDIA_WORDS.search(say)):
         return label, say
-    more = next((p for p, l in zip(plain, labels) if _MORE.search(p) and not l.rstrip().lower().endswith("[text]")), None)
-    kind = "photo" if re.search(r"photo|picture|image|selfie", goal, re.I) and not re.search(r"video", goal, re.I) else "video"
+    if re.search(r"video|vidiyo", goal, re.I):
+        kind = "video"
+    elif re.search(r"photo|picture|image|selfie|chithunzi|cikope", goal, re.I):
+        kind = "photo"
+    else:
+        kind = "video" if videos else "photo"
+    items = videos if kind == "video" else photos
     t = _PICK[kind].get(lang, _PICK[kind]["en"])
+    plus = "+" if more and (re.search(r"more media", more, re.I) or more.strip() == "+") else "“%s”" % more if more else ""
     STATS["gallery_fixed"] += 1
-    if kind == "video" and len(durs) == 1:
-        return durs[0], t["one_more" if more else "one"]
-    if kind == "video" and not durs and more:
-        return more, t["only"]
-    return None, t["many_more" if more else "many"]
+    if len(items) == 1:
+        return items[0], t["one_more" if more else "one"].format(plus=plus)
+    if kind == "video" and not videos and more:
+        return more, t["only"].format(plus=plus)   # photos often have no names, so this is only safe for videos
+    return None, t["many_more" if more else "many"].format(plus=plus)
+
+
+# The AI names an icon it cannot point at from words alone ("Tap the + button", "Tap the three dots"): a picture helps.
+_ICON = re.compile(r"(?:^|[\s\"“(])(?:\+|⋮|…)(?=$|[\s\"”).,])|\b(?:icon|plus|pencil|three dots|3 dots|paper ?clip|microphone|mic|"
+                   r"camera button|round button|circle|back arrow|arrow|magnifying glass|gear|cog|bell|hamburger)\b", re.I)
 
 
 RISKY = re.compile(r"\b(pay|payment|transfer|withdraw|send money|buy|purchase|checkout|pin|password|passcode|erase|"
@@ -982,14 +1012,15 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             STATS["label_from_words"] += 1
     say = _one_action(say, bool(label))
     label, say = _gallery_fix(goal, labels, label, say, lang)
+    is_gallery = _gallery(labels)[0]
     look = None
     if not label and data.get("look_for") and not (image and data.get("x") is not None):
         lf = _plain(str(data.get("look_for")))[:40]
         inside = _match_label(lf, labels)
         if inside:
             label = inside   # it is already on screen: point at it
-        elif 2 <= len(lf) and not RISKY.search(lf):
-            look = lf
+        elif 2 <= len(lf) and not RISKY.search(lf) and not (_key(lf) in _key(body.note) and "not in" in body.note.lower()):
+            look = lf   # (never the word the phone just said is missing from this list)
             STATS["look_for"] += 1
     if label and RISKY.search(label):
         STATS["risky_label_blocked"] += 1
@@ -1007,7 +1038,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if LOG_SAMPLES:
         _samples.append({"t": time.strftime("%H:%M", time.gmtime(time.time() + 7200)), "kind": "step", "v": PROMPT_VERSION,
                          "ms": int((time.time() - t0) * 1000), "q": _scrub(goal), "a": _scrub("%s -> %s" % (label or "-", say))})
-    return {"label": label, "say": say, "done": bool(data.get("done")), "x": x, "y": y, "look_for": None if (label or x is not None) else look}
+    # An icon with no name: ask the phone for a picture so the next answer can point at it (only if the person agreed).
+    need_picture = bool(not label and x is None and not image and not look and not is_gallery and not data.get("done") and _ICON.search(say))
+    if need_picture:
+        STATS["picture_wanted"] += 1
+    return {"label": label, "say": say, "done": bool(data.get("done")), "x": x, "y": y,
+            "look_for": None if (label or x is not None) else look, "need_picture": need_picture}
 
 
 # ---- Self-test: real questions from field testing, run through the same code. Open in a browser. ----
@@ -1476,7 +1512,7 @@ async def privacy():
 <h2>What is sent off your phone, and only when you agree</h2>
 <ul>
 <li><b>Smart guide.</b> If you turn it on, the words on your screen are sent to our server and an AI service while you follow a guide, so it can choose the next button. For "which app can..." questions, the names of your apps are also sent (never banking or money apps).</li>
-<li><b>Screen pictures.</b> Only if you agree, and only when you tap the ? button during a guide, a picture of your screen is sent the same way.</li>
+<li><b>Screen pictures.</b> Only if you agree: when you tap Help during a guide, or when the screen has buttons without words (an app that draws its own buttons, or an icon like +), a picture of your screen is sent the same way. Never on bank, money or password screens. You can turn this off in Settings.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
 <li><b>Your questions</b> are sent to get an answer.</li>
 <li>A random number for your copy of the app (not your name or phone number), used to share out daily limits fairly, and the names of guides you start or finish.</li>
