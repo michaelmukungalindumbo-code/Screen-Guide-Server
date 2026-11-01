@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.53"
+SERVER_VERSION = "0.54"
 
 
 @app.get("/health")
@@ -2407,7 +2407,28 @@ _UI_WORDS = {
     "audience", "add sound", "filters", "trim", "music", "+", "⋮", "image", "picture", "pictures", "manage", "camera button",
     "allow access to all", "show roots", "files in other apps", "large files", "this week", "large", "pdf", "drive scan",
     "go back", "x", "tell me", "i can't find it", "nothing happened", "it looks different", "i don't understand",
+    "scan document", "scan documents", "create new", "new", "discard scans", "discard", "upload to drive", "file name",
+    "format", "location", "my drive", "auto capture", "manual", "enhance", "filter", "crop & rotate", "crop and rotate",
+    "crop", "rotate", "retake", "keep scan", "add page", "rename", "computers", "shared", "starred", "search in drive",
+    "more actions", "ask gemini", "date modified", "google docs", "google sheets", "google slides", "docs", "sheets",
+    "slides", "folder", "shutter", "take photo", "take picture", "capture", "flash", "jpeg", "jpg", "png", "delete file name",
+    "google play store", "apps & notifications", "network & internet", "connected devices", "display & brightness",
 }
+# Words that are on the screens of WATCH_SHARED_PHONES different phones are button names, not anyone's personal words.
+# (In memory: learned again after a restart.)
+WATCH_SHARED_PHONES = max(2, int(os.getenv("WATCH_SHARED_PHONES", "3")))
+_word_phones = {}
+
+
+def _learn_words(install_id: str, labels: list):
+    ph = _hash("words:" + install_id, 8)
+    for l in labels[:60]:
+        p = _plain(l)
+        if not 2 <= len(p) <= 40 or re.search(r"\d{3}|@", p) or len(_word_phones) >= 20000 and p.lower() not in _word_phones:
+            continue
+        seen = _word_phones.setdefault(p.lower(), set())
+        if len(seen) < WATCH_SHARED_PHONES:
+            seen.add(ph)
 
 
 def _ui_vocab() -> set:
@@ -2428,7 +2449,9 @@ _ui_vocab.cache = set()
 
 def _clean_word(w: str) -> str:
     p = _plain(w)
-    return p if (p.lower() in _ui_vocab() or _DUR.match(p)) else "…"
+    low = p.lower()
+    known = low in _ui_vocab() or _DUR.match(p) or len(_word_phones.get(low, ())) >= WATCH_SHARED_PHONES
+    return p if known else "…"
 
 
 def _clean_label(l: str) -> str:
@@ -2437,10 +2460,16 @@ def _clean_label(l: str) -> str:
     return _clean_word(l) + (" [%s]" % tag.group(1).lower() if tag else "")
 
 
-def _clean_text(t: str, n: int = 200) -> str:
-    """Our own sentences and the person's goal or note: numbers and emails go, quoted or capitalised words that are not
-    known button or app names become "…" (a name like Mary, a contact, a group)."""
-    t = _scrub(t, n)
+def _scrub_long(t: str, n: int = 300) -> str:
+    """Emails, and numbers of 3 or more digits (phone numbers, amounts, codes). Step numbers and "0:09" stay."""
+    t = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "[email]", str(t))
+    return re.sub(r"\+?\d[\d\s-]{2,}\d", "#", t)[:n]
+
+
+def _clean_text(t: str, n: int = 200, ours: bool = False) -> str:
+    """Our own sentences (ours) and the person's goal or note: emails and numbers go (in our own sentences only long
+    numbers), quoted or capitalised words that are not known button or app names become "…" (a name like Mary)."""
+    t = _scrub_long(t, n) if ours else _scrub(t, n)
     t = re.sub(r"[“\"]([^”\"]{1,40})[”\"]", lambda m: "“%s”" % _clean_word(m.group(1)), t)
     def cap(m):
         w = m.group(0)
@@ -2513,16 +2542,22 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     n = len(s["steps"]) + 1
     asked = stuck and bool(note.strip())
     told = _last_told(history)
-    step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(told, 140),
+    _learn_words(install_id, labels)
+    step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(told, 140, ours=True),
             "note": _clean_text(note, 100), "stuck": bool(stuck), "label": _clean_word(label) if label else None,
-            "say": _clean_text(say, 220), "picture": bool(image), "secs": round(secs, 1)}
+            "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1)}
     s["steps"].append(step)
+    # Help is pressed on the instruction the person already had: the step before this answer. Seen 1 Nov: Help on
+    # "Tap Scan Document" was filed against the next answer, "Tap Create new", and the AI fixer chased the wrong step.
+    on = n - 1 if stuck and n > 1 else n
+    if stuck and n > 1:
+        s["steps"][n - 2]["help_after"] = step["note"] or "pressed Help"
     if asked and told and _key(say) == _key(told):
         _add_problem(s, "help_repeated", n, note=step["note"])
     elif asked:
-        _add_problem(s, "help", n, note=step["note"])
+        _add_problem(s, "help", on, note=step["note"])
     elif stuck:
-        _add_problem(s, "not_working", n)
+        _add_problem(s, "not_working", on)
     if not done and not label and x is None and not look and not is_gallery and not need_picture and not ai_empty and _ACTION.search(say):
         _add_problem(s, "no_point", n)
     if secs > 10:
@@ -2561,7 +2596,10 @@ Return JSON: {"problems": [{"step", "kind", "title", "what", "fix"}]}.
 - Include every problem the rules noticed, with the same step and kind, and explain it.
 - Add any other real problem you can see, with kind "review": an instruction that does not fit the screen, pointing at the wrong thing, words too hard for a first-time user, a step that goes backwards, finishing too early, the wrong language.
 - title: under 8 words. what: one or two plain sentences on what went wrong for the person. fix: one or two plain sentences on what the developer should change.
-- At most 6 problems. If the guide went well and the rules noticed nothing, return {"problems": []}."""
+- At most 6 problems. If the guide went well and the rules noticed nothing, return {"problems": []}.
+- Only describe what the steps show. Never guess what happened on the phone between steps (for example that a menu did not open, or that a button was a Close button).
+- "help_after" on a step means the person pressed Help while that step was shown; the next step ("stuck": true) is ScreenGuide's answer to that Help.
+- A screen picture can come back black (some apps block pictures). If a step's screen words show buttons, that screen was not black."""
 
 
 def _valid_review(d) -> bool:
@@ -2589,7 +2627,7 @@ async def _watch_review_cards(s: dict) -> list:
     for g in got:
         if not isinstance(g, dict) or not str(g.get("title", "")).strip():
             continue
-        g = {k: _clean_text(str(g.get(k, "")), 300 if k != "title" else 80) for k in ("title", "what", "fix")} | \
+        g = {k: _clean_text(str(g.get(k, "")), 300 if k != "title" else 80, ours=True) for k in ("title", "what", "fix")} | \
             {"step": int(g.get("step") or 0) if str(g.get("step", "")).isdigit() else 0, "kind": str(g.get("kind", "review"))[:20]}
         same = next((c for c in cards if c["kind"] == g["kind"] and c["step"] == g["step"]), None)
         if same:
@@ -2602,24 +2640,41 @@ async def _watch_review_cards(s: dict) -> list:
     return cards[:6]
 
 
+def _short_screen(screen: list) -> str:
+    """["… [tap]", "… [tap]", "Upload [tap]"] -> '… [tap] ×2, Upload [tap]': the shape of the screen, short."""
+    out = []
+    for w in screen:
+        if out and out[-1][0] == w:
+            out[-1][1] += 1
+        else:
+            out.append([w, 1])
+    return ", ".join(w + (" ×%d" % k if k > 1 else "") for w, k in out) or "(no words)"
+
+
 def _watch_issue(s: dict, c: dict) -> tuple:
     title = "Guide problem: %s (%s)" % (c["title"][:70], s["goal"][:50] or "a guide")
-    steps = "\n".join("%s%d. said: %s | pointed at: %s%s%s" % ("**→** " if st["n"] == c["step"] else "", st["n"], st["say"],
-                      st["label"] or "nothing", (" | Help: “%s”" % st["note"]) if st["note"] else (" | pressed Help" if st["stuck"] else ""),
-                      " | %ss" % st["secs"]) for st in s["steps"])
+    lines = []
+    for st in s["steps"]:
+        lines.append("%s%d. said: %s | pointed at: %s%s | %ss%s%s" % (
+            "**→** " if st["n"] == c["step"] else "", st["n"], st["say"], st["label"] or "nothing",
+            " | (answer after Help)" if st["stuck"] else "", st["secs"], " | with a screen picture" if st["picture"] else "",
+            (" | **then the person pressed Help: “%s”**" % st["help_after"]) if st.get("help_after") else ""))
+        lines.append("   screen: " + _short_screen(st["screen"]))
     shown = next((st for st in s["steps"] if st["n"] == c["step"]), s["steps"][-1] if s["steps"] else None)
     body = ("Noticed by the watcher on a developer's test phone; the developer tapped **Allow** to send it.\n\n"
             "**What went wrong:** %s\n\n**Suggested fix:** %s\n\n- Goal: %s\n- Phone: %s, language: %s\n\n"
-            "**The whole guide** (the problem step is marked →):\n%s\n\n"
-            "**The screen at step %s** (the words ScreenGuide read, in order; only known button names are kept, other words are …):\n"
-            "```json\n%s\n```\n**Already told before that step:** %s\n\n"
+            "**The whole guide**, one line per answer from ScreenGuide (these numbers are not the app's \"Step N of 5\"; "
+            "the problem step is marked →). Under each: the words ScreenGuide read on the screen. Only known button names "
+            "are kept, other words are …\n%s\n\n"
+            "**The screen at step %s**, in order:\n```json\n%s\n```\n**Already told before that step:** %s\n\n"
             "**AI fixer:** follow CLAUDE.md. Find where the cause really is: usually the server (server/ in your run; read "
             "server/CLAUDE.md), sometimes the app. Replay this screen in a test first and show the problem, then fix the "
             "cause for every screen like it. If the fix needs the owner's decision, ask on this issue and stop.\n"
-            % (c["what"], c["fix"], s["goal"] or "…", s.get("device") or "unknown", s.get("lang", "en"), steps or "(no steps)",
-               c["step"], json.dumps(shown["screen"] if shown else [], ensure_ascii=False, indent=0)[:3000],
+            % (c["what"], c["fix"], s["goal"] or "…", s.get("device") or "unknown", s.get("lang", "en"),
+               "\n".join(lines) or "(no steps)", c["step"],
+               json.dumps(shown["screen"] if shown else [], ensure_ascii=False, indent=0)[:3000],
                (shown or {}).get("told_before") or "(nothing)"))
-    return title, body
+    return title, body[:60000]
 
 
 class WatchSend(BaseModel):
