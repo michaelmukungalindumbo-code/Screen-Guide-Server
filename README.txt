@@ -11,3 +11,6 @@ problems (Help, a step that did not work, nothing to point at, slow, going round
 the AI at the end. The phone flashes red when a problem is seen and shows them in a pop-up after the guide. Only
 "Allow" sends them to the AI fixer as "ai-fix" issues (cleaned: known button names only). Uses the same GITHUB_TOKEN.
 At most AI_WATCH_PER_DAY (default 3) a day.
+
+Test an app (developer phones): problems found while testing another app go to that app's GitHub repository. Allow
+each repository with AI_FIX_REPOS (comma-separated, "owner/name"), and add it to the GITHUB_TOKEN's repositories.

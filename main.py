@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.56"
+SERVER_VERSION = "0.57"
 
 
 @app.get("/health")
@@ -2297,6 +2297,13 @@ async def crash_report(body: CrashIn, x_app_token: str = Header(default=""), x_i
 # The app repository is public, so the issue holds only what the owner report shows: code places, versions, phone kinds.
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 AI_FIX_REPO = os.getenv("AI_FIX_REPO", "michaelmukungalindumbo-code/Screen-Guide").strip()
+# "Test an app": problems in another app go to that app's repository. Only these (and AI_FIX_REPO) are allowed, and the
+# GitHub token must be able to open issues there. Comma-separated, e.g. "me/zexam-app,me/school-vacancies".
+AI_FIX_REPOS = {r.strip().lower() for r in os.getenv("AI_FIX_REPOS", "").split(",") if re.match(r"^[\w.-]+/[\w.-]+$", r.strip())}
+
+
+def _repo_ok(repo: str) -> bool:
+    return repo.lower() == AI_FIX_REPO.lower() or repo.lower() in AI_FIX_REPOS
 AI_FIX_LABEL = os.getenv("AI_FIX_LABEL", "ai-fix").strip()
 AI_FIX_PER_DAY = int(os.getenv("AI_FIX_PER_DAY", "3"))            # each fix costs AI money, so at most this many a day
 AI_FIX_MIN_PHONES = max(1, int(os.getenv("AI_FIX_MIN_PHONES", "1")))  # wait until this many phones have had the crash
@@ -2414,6 +2421,7 @@ _UI_WORDS = {
     "more actions", "ask gemini", "date modified", "google docs", "google sheets", "google slides", "docs", "sheets",
     "slides", "folder", "shutter", "take photo", "take picture", "capture", "flash", "jpeg", "jpg", "png", "delete file name",
     "google play store", "apps & notifications", "network & internet", "connected devices", "display & brightness",
+    "ask anything", "speak", "about", "send", "chats", "new chat", "incognito", "sign in with google", "show me",
 }
 # Words that are on the screens of WATCH_SHARED_PHONES different phones are button names, not anyone's personal words.
 # (In memory: learned again after a restart.)
@@ -2505,11 +2513,30 @@ _RULE_TEXT = {
                 "Look at step {n}: the instruction may not have fitted the screen."),
     "idle": ("Left untouched at step {n}", "Nothing happened for 4 minutes on step {n}, so the guide stopped itself.",
              "Look at step {n}: the person may not have known what to do."),
+    # "Test an app": spotted on the phone, in any app, with or without a guide
+    "crash": ("The app crashed on screen {n}", "Android said: “{detail}”.",
+              "Find what this screen does when it opens, or what the last button tapped does. A crash catcher in the app would give the exact line."),
+    "freeze": ("The app froze on screen {n}", "Android said: “{detail}”.",
+               "Look for slow work on the main thread on this screen (network, files, big lists) and move it off."),
+    "error_text": ("Error message on screen {n}", "The screen showed: “{detail}”.",
+                   "Find where this message is shown and why. If it is expected, make it say in plain words what to do next."),
+    "dead_tap": ("A tap did nothing on screen {n}", "“{detail}” was tapped 3 times in a few seconds and the screen did not change.",
+                 "Check what this button does when tapped, or make it look disabled when it cannot be used."),
+    "loading": ("Long loading on screen {n}", "A loading sign stayed for {detail} seconds.",
+                "Show progress, load less at once, or keep what was loaded before. On weak networks people give up."),
+    "unlabeled": ("Buttons with no name on screen {n}", "{detail} buttons have no text or description, so screen readers and ScreenGuide cannot name them.",
+                  "Give each icon button a description (contentDescription on Android, semanticsLabel in Flutter, aria-label on the web)."),
+    "small_target": ("Small buttons on screen {n}", "{detail} buttons are smaller than 32 dp, hard to tap on small phones.",
+                     "Make every tap area at least 48 dp, even when the icon is smaller."),
 }
+_TEST_KINDS = {"crash", "freeze", "error_text", "dead_tap", "loading", "unlabeled", "small_target"}
 
 
 def _watch_start(install_id: str, guide: str):
     now = time.time()
+    old = _sessions.get(install_id)
+    if old and old.get("kind") == "test" and not old["end"] and now - old["t"] < 3600 and guide != "test":
+        return   # "Test an app" with a goal: the guide belongs to the test that started it
     for k in [k for k, v in _sessions.items() if now - v["t"] > 3600][:200]:
         _sessions.pop(k, None)
     if len(_sessions) < 2000:
@@ -2540,7 +2567,7 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     if len(s["steps"]) >= 30:
         return len(s["problems"])
     s["goal"] = s["goal"] or _clean_text(goal, 120)
-    s["lang"], s["device"] = lang, dev
+    s["lang"], s["device"] = lang, dev or s.get("device", "")
     n = len(s["steps"]) + 1
     asked = stuck and bool(note.strip())
     told = _last_told(history)
@@ -2577,7 +2604,7 @@ def _watch_end(install_id: str, ev: str, guide: str):
         return
     s["end"] = ev
     n = len(s["steps"])
-    if ev == "stop" and n:
+    if ev == "stop" and n and s.get("kind") != "test":
         _add_problem(s, "idle" if guide.startswith("idle") else "stopped", n)
 
 
@@ -2611,16 +2638,25 @@ def _valid_review(d) -> bool:
 
 def _rule_card(p: dict) -> dict:
     t, w, f = _RULE_TEXT[p["kind"]]
-    v = dict(n=p["step"], note=p.get("note") or "…", secs=p.get("secs", ""), n0=p.get("n0", ""))
+    v = dict(n=p["step"], note=p.get("note") or "…", secs=p.get("secs", ""), n0=p.get("n0", ""), detail=p.get("detail") or "…")
     return {"step": p["step"], "kind": p["kind"], "title": t.format(**v), "what": w.format(**v), "fix": f.format(**v)}
 
 
 async def _watch_review_cards(s: dict) -> list:
     """The rules' problems, explained, plus what the AI review finds. Without the AI, the rules' own words."""
     cards = [_rule_card(p) for p in s["problems"]]
-    user = "<goal>%s</goal>\n<steps>\n%s\n</steps>\n<rules_noticed>\n%s\n</rules_noticed>" % (
+    if s.get("kind") == "test":
+        user = "<test app=\"%s\">%s</test>\n" % (_safe(s.get("app", ""), 40), "A developer used this app while ScreenGuide watched each "
+               "screen%s. Steps are screens; \"say\" is ScreenGuide's instruction only when it was guiding." %
+               (" and guided them through the goal" if s["goal"] else ""))
+    else:
+        user = ""
+    user += "<goal>%s</goal>\n<steps>\n%s\n</steps>\n<rules_noticed>\n%s\n</rules_noticed>" % (
         _safe(s["goal"], 200), _safe(json.dumps(s["steps"], ensure_ascii=False), 9000),
         _safe(json.dumps([{"step": c["step"], "kind": c["kind"], "title": c["title"]} for c in cards], ensure_ascii=False), 2000))
+    if s.get("kind") == "test":
+        user += ("\nFor this test, also look for problems in the app itself: confusing words, a screen with no way forward, "
+                 "English only where users may not read English, text too long for a small phone.")
     try:
         _, data = await _ai_json(REVIEW_SYSTEM, user, None, "review", REVIEW_SCHEMA, _valid_review)
         got = data.get("problems", []) if isinstance(data, dict) else []
@@ -2658,6 +2694,8 @@ def _short_screen(screen: list) -> str:
 
 
 def _watch_issue(s: dict, c: dict) -> tuple:
+    if s.get("kind") == "test":
+        return _test_issue(s, c)
     title = "Guide problem: %s (%s)" % (c["title"][:70], s["goal"][:50] or "a guide")
     lines = []
     for st in s["steps"]:
@@ -2680,6 +2718,85 @@ def _watch_issue(s: dict, c: dict) -> tuple:
                "\n".join(lines) or "(no steps)", c["step"],
                json.dumps(shown["screen"] if shown else [], ensure_ascii=False, indent=0)[:3000],
                (shown or {}).get("told_before") or "(nothing)"))
+    return title, body[:60000]
+
+
+class WatchTest(BaseModel):
+    pkg: str = ""      # the app under test, e.g. "zm.screenguide"
+    app: str = ""      # its name on the phone
+    repo: str = ""     # its GitHub repository, "owner/name"
+    goal: str = ""     # optional: ScreenGuide guides the tester through it
+    device: str = ""   # "Infinix phone, Android 14"
+
+
+class WatchScreen(BaseModel):
+    labels: list[str] = []
+    found: list[dict] = []   # problems the phone spotted: {"kind": "error_text", "detail": "..."}
+    new: bool = True         # a new screen (not the same one again)
+
+
+@app.post("/watch/test/start")
+async def watch_test_start(body: WatchTest, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""),
+                           x_tester: str = Header(default="")):
+    """Developer phones: "Test an app". Every screen of that app is watched until the test stops."""
+    install_id = _check(x_app_token, x_install_id)
+    repo = str(body.repo).strip().strip("/")
+    if x_tester != "1" or not re.match(r"^[\w.-]+/[\w.-]+$", repo) or not str(body.pkg).strip():
+        return {"ok": False, "error": "Choose an app and its GitHub repository (owner/name)."}
+    _sessions.pop(install_id, None)
+    _watch_start(install_id, "test")
+    s = _sessions.get(install_id)
+    if not s:
+        return {"ok": False}
+    s.update(kind="test", pkg=re.sub(r"[^\w.]", "", body.pkg)[:100], app=re.sub(r"[^\w .&+'-]", "", body.app)[:40] or "the app",
+             repo=repo, goal=_clean_text(body.goal, 120), device=_device(body.device))
+    STATS["watch:test"] += 1
+    return {"ok": True, "repo_ok": _repo_ok(repo)}
+
+
+@app.post("/watch/screen")
+async def watch_screen(body: WatchScreen, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""),
+                       x_tester: str = Header(default="")):
+    """One screen of the app under test (cleaned), with the problems the phone spotted on it. Returns how many problems so
+    far (the phone flashes red when it goes up) and the screen's number (for its picture)."""
+    install_id = _check(x_app_token, x_install_id)
+    s = _sessions.get(install_id)
+    if x_tester != "1" or not s or s.get("kind") != "test" or s["end"]:
+        return {"watch": 0, "watch_step": 0}
+    n = len(s["steps"])
+    if (body.new or not n) and n < 40:
+        _learn_words(install_id, body.labels)
+        s["steps"].append({"n": n + 1, "screen": [_clean_label(l) for l in body.labels[:60]], "told_before": "", "note": "",
+                           "stuck": False, "label": None, "say": "", "picture": False, "secs": 0})
+        n += 1
+        s["review"] = None
+    for f in body.found[:10]:
+        kind = str((f or {}).get("kind", "")) if isinstance(f, dict) else ""
+        if kind in _TEST_KINDS and n:
+            _add_problem(s, kind, n, detail=_clean_text(str(f.get("detail", "")), 90, ours=kind in ("loading", "unlabeled", "small_target")))
+            s["review"] = None
+    return {"watch": len(s["problems"]), "watch_step": n if body.new else 0}
+
+
+def _test_issue(s: dict, c: dict) -> tuple:
+    title = "App problem: %s (%s)" % (c["title"][:70], s.get("app", "the app"))
+    lines = []
+    for st in s["steps"]:
+        found = [p["kind"] for p in s["problems"] if p["step"] == st["n"]]
+        lines.append("%s%d. %s%s" % ("**→** " if st["n"] == c["step"] else "", st["n"],
+                     ("ScreenGuide said: %s | " % st["say"]) if st["say"] else "", ("spotted: " + ", ".join(found)) if found else "no problem spotted"))
+        lines.append("   screen: " + _short_screen(st["screen"]))
+    shown = next((st for st in s["steps"] if st["n"] == c["step"]), None)
+    body = ("Noticed while testing **%s** (`%s`) on a developer's phone with ScreenGuide's \"Test an app\"%s; the developer "
+            "tapped **Allow** to send it.\n\n**What went wrong:** %s\n\n**Suggested fix:** %s\n\n- Phone: %s, language: %s\n\n"
+            "**The screens in order** (the problem screen is marked →). Under each: the words on it. Only known button names are "
+            "kept, other words are …\n%s\n\n**The screen at %s**, in order:\n```json\n%s\n```\n"
+            "**AI fixer:** this is a problem in the app under test, and its code is this repository. Follow CLAUDE.md. Find the "
+            "screen in the code by its words, prove the problem with a test where you can, and fix the cause. If the fix needs "
+            "the owner's decision, ask on this issue and stop.\n"
+            % (s.get("app", "the app"), s.get("pkg", ""), (" with the goal “%s”" % s["goal"]) if s["goal"] else "",
+               c["what"], c["fix"], s.get("device") or "unknown", s.get("lang", "en"), "\n".join(lines) or "(no screens)",
+               ("screen %s" % c["step"]) if shown else "the end", json.dumps(shown["screen"] if shown else [], ensure_ascii=False, indent=0)[:3000]))
     return title, body[:60000]
 
 
@@ -2725,7 +2842,7 @@ async def _is_fixer(authorization: str) -> bool:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get("https://api.github.com/installation/repositories",
                             headers={"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json", "User-Agent": "screenguide-server"})
-        ok = r.status_code == 200 and any(str(x.get("full_name", "")).lower() == AI_FIX_REPO.lower() for x in r.json().get("repositories", []))
+        ok = r.status_code == 200 and any(_repo_ok(str(x.get("full_name", ""))) for x in r.json().get("repositories", []))
     except Exception:
         ok = False
     if ok:
@@ -2797,8 +2914,10 @@ def _change_issue(s: dict, c: dict, have: set = frozenset()) -> tuple:
     screen = ch.get("screen") or (shown or {}).get("screen", [])
     if c["kind"] == "change":
         title = "Change request: %s" % ch.get("text", c["title"])[:90]
-        what = ("**The change the developer asked for:** “%s”\n\n- When: %s of the guide “%s”%s\n"
-                % (ch.get("text", ""), ("during step %d" % c["step"]) if c["step"] else "at the start", s["goal"] or "…",
+        when = (("on screen %d while testing %s" % (c["step"], s.get("app", "the app"))) if s.get("kind") == "test"
+                else ("%s of the guide “%s”" % (("during step %d" % c["step"]) if c["step"] else "at the start", s["goal"] or "…")))
+        what = ("**The change the developer asked for:** “%s”\n\n- When: %s%s\n"
+                % (ch.get("text", ""), when,
                    ("\n- Where: they pointed at the red circle in the picture (%.0f%% across, %.0f%% down the screen)"
                     % (ch["x"] * 100, ch["y"] * 100)) if ch.get("x") is not None else "\n- Where: they did not point at a spot"))
         pic = ("\n**Picture:** `media/step%d.jpg` is the screen when they asked%s.\n"
@@ -2852,11 +2971,14 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
         return {"sent": 0, "skipped": 0}
     if not GITHUB_TOKEN:
         return {"sent": 0, "skipped": len(body.ids), "error": "The fixer is not set up on the server (GITHUB_TOKEN)."}
+    repo = s.get("repo") or AI_FIX_REPO   # "Test an app": that app's repository
+    if not _repo_ok(repo):
+        return {"sent": 0, "skipped": len(body.ids), "error": "Add %s to AI_FIX_REPOS on Render, and to the GitHub token, first." % repo}
     chosen = [c for c in s["review"] if c["id"] in set(body.ids[:16]) and not c.get("sent")]
     sent, skipped = 0, 0
     try:
         recent = await _github("GET", "/repos/%s/issues?labels=%s&state=all&sort=created&direction=desc&per_page=50"
-                               % (AI_FIX_REPO, AI_FIX_LABEL), None)
+                               % (repo, AI_FIX_LABEL), None)
     except Exception as e:
         log.warning("Watcher could not read GitHub: %s", str(e)[:160])
         return {"sent": 0, "skipped": len(chosen), "error": "GitHub could not be reached. Try again later."}
@@ -2878,8 +3000,8 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
                 continue
             try:
                 title, text = _change_issue(s, c, {x["n"] for x in _shots.get(sid, {}).get("shots", [])})
-                issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": text + pics + "\n" + marker})
-                await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
+                issue = await _github("POST", "/repos/%s/issues" % repo, {"title": title, "body": text + pics + "\n" + marker})
+                await _github("POST", "/repos/%s/issues/%d/labels" % (repo, issue["number"]), {"labels": [AI_FIX_LABEL]})
                 c["sent"] = issue["number"]; sent += 1; asked_today += 1
                 asks.append({"body": marker})
                 STATS["change_issues"] += 1
@@ -2895,8 +3017,8 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
             continue
         try:
             title, text = _watch_issue(s, c)
-            issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": text + pics + "\n" + marker})
-            await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
+            issue = await _github("POST", "/repos/%s/issues" % repo, {"title": title, "body": text + pics + "\n" + marker})
+            await _github("POST", "/repos/%s/issues/%d/labels" % (repo, issue["number"]), {"labels": [AI_FIX_LABEL]})
             c["sent"] = issue["number"]; sent += 1; today += 1
             mine.append({"body": marker})
             STATS["watch_issues"] += 1
