@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.50"
+SERVER_VERSION = "0.51"
 
 
 @app.get("/health")
@@ -1075,7 +1075,8 @@ class Next(BaseModel):
 
 
 @app.post("/next")
-async def next_step(body: Next, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_pass: str = Header(default="")):
+async def next_step(body: Next, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_pass: str = Header(default=""),
+                    x_tester: str = Header(default="")):
     install_id = _check(x_app_token, x_install_id)
     tier, _ = plan_of(x_pass, install_id)
     goal = body.goal.strip()[: settings.MAX_INPUT_LENGTH]
@@ -1179,6 +1180,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     y = _fraction(data.get("y")) if image and not label else None
     if x is None or y is None:
         x = y = None
+    _watch_step(install_id, x_tester == "1", asked, goal, labels, history, body.note, label, say, dev, lang, image)
     if body.stuck:
         # Where people get stuck is what most needs fixing. Kept in memory only, numbers and emails removed.
         _stuck.append({"t": time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 7200)), "goal": _scrub(goal, 100),
@@ -1377,6 +1379,8 @@ async def event(body: Event, x_app_token: str = Header(default=""), x_install_id
         return {"ok": False}
     q.append(time.time())
     ev = body.event if body.event in ("start", "done", "stop", "setup", "extra") else "other"
+    if ev == "stop":
+        _watch_stop(install_id)
     guide = re.sub(r"[^a-z0-9_-]", "", (body.guide or "").lower())[:30] or "unknown"
     STATS["%s:%s" % (ev, guide)] += 1
     log.info("EVENT %s %s", ev, guide)
@@ -2359,6 +2363,185 @@ async def _ask_ai_fix(cid: str, rec: dict):
         STATS["ai_fix_errors"] += 1
         log.warning("AI fixer issue not opened: %s", str(e)[:200])
 
+# ---- The watcher (tester phones only): notice when a guide goes wrong, and ask the AI fixer, without anyone reporting it ----
+# Seen 1 Nov: in Help, "I don't understand" got back the same sentence word for word. No crash, so nothing reported it;
+# only a screen recording showed it. The watcher notices such moments itself. Only phones that send X-Tester (TEST builds,
+# or "Show what ScreenGuide sees" switched on) are watched. What leaves the server is cleaned: words on the screen are kept
+# only when they are known button names ("Upload from gallery", "Videos", "0:09"); every other word (names, messages,
+# numbers) becomes "…". Issues go to the public app repository, so nothing personal may reach them.
+AI_WATCH_PER_DAY = int(os.getenv("AI_WATCH_PER_DAY", "2"))   # guide problems sent to the AI fixer per day
+_help_seen = {}   # install id -> the last Help moment (in memory, a few minutes)
+_UI_WORDS = {
+    "settings", "search", "next", "done", "ok", "okay", "cancel", "back", "close", "menu", "more", "more options", "share",
+    "send", "save", "edit", "delete", "remove", "open", "install", "uninstall", "update", "upload", "post", "publish", "create",
+    "new", "add", "allow", "don't allow", "deny", "while using the app", "only this time", "allow all", "select photos and videos",
+    "select photos", "select more media", "upload from gallery", "gallery", "camera", "photos", "photo", "videos", "video",
+    "albums", "all albums", "recents", "recent", "camera roll", "downloads", "documents", "images", "audio", "files",
+    "file manager", "home", "library", "profile", "you", "subscriptions", "shorts", "short", "live", "explore",
+    "notifications", "inbox", "chats", "status", "calls", "updates", "communities", "contacts", "messages", "phone", "dialer",
+    "keypad", "wi-fi", "wifi", "bluetooth", "mobile data", "mobile network", "airplane mode", "flight mode", "hotspot",
+    "battery", "storage", "display", "brightness", "sound", "volume", "apps", "applications", "about phone", "system",
+    "security", "privacy", "accounts", "google", "play store", "yes", "no", "not now", "later", "skip", "no thanks",
+    "continue", "agree", "accept", "i agree", "sign in", "log in", "sign up", "turn on", "turn off", "on", "off", "scan",
+    "create new", "new folder", "attach", "document", "flashlight", "torch", "flash light", "lantern", "alarm", "clock",
+    "timer", "calculator", "calendar", "weather", "maps", "chrome", "youtube", "whatsapp", "facebook", "messenger",
+    "instagram", "tiktok", "telegram", "gmail", "drive", "google drive", "google photos", "play", "pause", "stop", "help",
+    "repeat", "type a message", "message", "emoji", "microphone", "mic", "select", "select all", "copy", "paste", "forward",
+    "reply", "star", "archive", "mute", "block", "report", "view", "details", "info", "edit profile", "retry", "try again",
+    "refresh", "exit", "navigate up", "discard", "title", "description", "visibility", "public", "private", "unlisted",
+    "audience", "add sound", "filters", "trim", "music", "+", "⋮", "image", "picture", "pictures", "manage", "camera button",
+    "allow access to all", "show roots", "files in other apps", "large files", "this week", "large", "pdf", "drive scan",
+    "go back", "x", "tell me", "i can't find it", "nothing happened", "it looks different", "i don't understand",
+}
+
+
+def _ui_vocab() -> set:
+    if not _ui_vocab.cache:
+        words = set(_UI_WORDS)
+        try:   # every word the built-in guides look for on screen is a button name
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "guides.json"), encoding="utf-8") as f:
+                raw = json.load(f)
+            for g in (raw.get("guides", []) if isinstance(raw, dict) else raw):
+                for st in g.get("steps", []) if isinstance(g, dict) else []:
+                    words.update(str(m).strip().lower() for m in st.get("match", []) if isinstance(m, str))
+        except Exception:
+            pass
+        _ui_vocab.cache = words
+    return _ui_vocab.cache
+_ui_vocab.cache = set()
+
+
+def _clean_word(w: str) -> str:
+    p = _plain(w)
+    return p if (p.lower() in _ui_vocab() or _DUR.match(p)) else "…"
+
+
+def _clean_label(l: str) -> str:
+    """"Videos [tap]" stays; "Mum [tap]" becomes "… [tap]": the shape of the screen is kept, never its personal words."""
+    tag = _TAG.search(str(l))
+    return _clean_word(l) + (" [%s]" % tag.group(1).lower() if tag else "")
+
+
+def _clean_text(t: str, n: int = 200) -> str:
+    """Our own sentences and the person's goal or note: numbers and emails go, quoted or capitalised words that are not
+    known button or app names become "…" (a name like Mary, a contact, a group)."""
+    t = _scrub(t, n)
+    t = re.sub(r"[“\"]([^”\"]{1,40})[”\"]", lambda m: "“%s”" % _clean_word(m.group(1)), t)
+    def cap(m):
+        w = m.group(0)
+        return w if w == "I" or w.lower() in _ui_vocab() else "…"
+    return re.sub(r"(?<=[a-z,;:] )[A-Z][\w'’-]*", cap, t)
+
+
+def _screen_print(labels: list) -> str:
+    return _hash("|".join(sorted({_key(_clean_label(l)) for l in labels})), 10)
+
+
+def _watch_evidence(goal, labels, history, note, label, say, dev, lang, image) -> dict:
+    return {"goal": _clean_text(goal, 120), "told": [_clean_text(h, 140) for h in history[-3:]], "note": _clean_text(note, 100),
+            "screen": [_clean_label(l) for l in labels[:60]], "label": _clean_word(label) if label else None,
+            "say": _clean_text(say, 220), "device": dev, "lang": lang, "picture": bool(image)}
+
+
+_WATCH_WHAT = {
+    "help_repeated": "In Help the person said “{note}”, and the answer was the same sentence they had already heard.",
+    "still_stuck": "The person asked for Help twice on the same screen: the first answer did not get them past it.",
+    "gave_up": "The person stopped the guide less than 3 minutes after asking for Help.",
+}
+
+
+def _watch_note(install_id, kind, ev):
+    """One row per kind of problem on one kind of screen, counted. The first time: ask the AI fixer (a few a day)."""
+    wid = _hash(kind + "|" + _key(ev["goal"]) + "|" + _hash("|".join(sorted({_key(x) for x in ev["screen"]})), 10), 16)
+    STATS["watch:" + kind] += 1
+    async def go():
+        try:
+            rec = await _gdb(_store.kv_get, "watch", wid) or {"kind": kind, "first": int(time.time()), "count": 0, "phones": []}
+            rec["count"] += 1; rec["last"] = int(time.time()); rec["ev"] = ev
+            ph = _hash("watch:" + install_id, 10)
+            if ph not in rec["phones"]:
+                rec["phones"] = (rec["phones"] + [ph])[-50:]
+            need = 1 if kind == "help_repeated" else 2   # a repeat is surely a bug; being stuck once may just be a hard moment
+            ask = GITHUB_TOKEN and AI_WATCH_PER_DAY > 0 and rec["count"] >= need and not rec.get("asked") and wid not in _fix_asked
+            if ask:
+                _fix_asked.add(wid); rec["asked"] = int(time.time())
+            await _gdb(_store.kv_put, "watch", wid, rec)
+            if ask:
+                await _ask_watch_fix(wid, rec)
+        except Exception as e:
+            log.warning("Watcher note not kept: %s", str(e)[:160])
+    asyncio.create_task(go())
+
+
+def _watch_issue(rec: dict) -> tuple:
+    ev = rec["ev"]
+    what = _WATCH_WHAT[rec["kind"]].format(note=ev.get("note") or "…")
+    title = "Guide problem: %s (%s)" % ({"help_repeated": "Help repeated the same sentence", "still_stuck": "still stuck after Help",
+                                          "gave_up": "gave up after Help"}[rec["kind"]], ev["goal"][:60] or "a guide")
+    told = "\n".join("%d. %s" % (i + 1, t) for i, t in enumerate(ev["told"])) or "(nothing yet)"
+    body = ("The watcher saw this on a tester's phone. Nobody had to report it.\n\n**What went wrong:** %s\n\n"
+            "- Goal: %s\n- Phone: %s, language: %s\n- Times seen: %d, on %d phone(s)\n\n"
+            "**What they had been told:**\n%s\n\n**What they said in Help:** %s\n\n"
+            "**The screen** (the words ScreenGuide read, in order; only known button names are kept, other words are …):\n"
+            "```json\n%s\n```\n**The answer the server gave:** label %s, say: %s\n\n"
+            "**AI fixer:** follow CLAUDE.md. This is probably in the server (server/ in your run; read server/CLAUDE.md). "
+            "Replay this screen in a server test first (POST /next with these screen words, the goal, already told, stuck and "
+            "the note above) and show the bad answer. Then fix the cause, not just this one screen. If the fix needs the "
+            "owner's decision, ask on this issue and stop.\n"
+            % (what, ev["goal"] or "…", ev["device"] or "unknown", ev["lang"], rec["count"], len(rec["phones"]), told,
+               ev.get("note") or "(nothing)", json.dumps(ev["screen"], ensure_ascii=False, indent=0)[:3000],
+               ("“%s”" % ev["label"]) if ev.get("label") else "none", ev["say"]))
+    return title, body
+
+
+async def _ask_watch_fix(wid: str, rec: dict):
+    """Like crash issues: GitHub is the memory (no duplicates after a restart), and a daily limit counted there."""
+    marker = "<!-- watch-id: %s -->" % wid
+    try:
+        recent = await _github("GET", "/repos/%s/issues?labels=%s&state=all&sort=created&direction=desc&per_page=50"
+                               % (AI_FIX_REPO, AI_FIX_LABEL), None)
+        mine = [i for i in recent if "<!-- watch-id: " in (i.get("body") or "")]
+        today = sum(1 for i in mine if str(i.get("created_at", "")).startswith(time.strftime("%Y-%m-%d", time.gmtime())))
+        if any(marker in (i.get("body") or "") for i in mine) or today >= AI_WATCH_PER_DAY:
+            STATS["watch_skipped"] += 1
+            return
+        title, body = _watch_issue(rec)
+        issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": body + "\n" + marker})
+        await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
+        STATS["watch_issues"] += 1
+        log.warning("WATCH asked: issue #%s (%s)", issue["number"], rec["kind"])
+    except Exception as e:
+        STATS["ai_fix_errors"] += 1
+        log.warning("Watcher issue not opened: %s", str(e)[:200])
+
+
+def _watch_step(install_id, tester, asked, goal, labels, history, note, label, say, dev, lang, image):
+    """Called after each guide step. Tester phones only."""
+    if not tester:
+        return
+    now = time.time()
+    for k in [k for k, v in _help_seen.items() if now - v["t"] > 600][:200]:
+        _help_seen.pop(k, None)
+    if not asked:
+        return
+    ev = _watch_evidence(goal, labels, history, note, label, say, dev, lang, image)
+    fp = _screen_print(labels)
+    before = _help_seen.get(install_id)
+    if history and _key(say) == _key(history[-1]):
+        _watch_note(install_id, "help_repeated", ev)
+    elif before and before["fp"] == fp and now - before["t"] < 600:
+        _watch_note(install_id, "still_stuck", ev)
+    if len(_help_seen) < 2000:
+        _help_seen[install_id] = {"t": now, "fp": fp, "ev": ev}
+
+
+def _watch_stop(install_id):
+    """The guide was stopped. Right after Help, that is a person giving up."""
+    h = _help_seen.pop(install_id, None)
+    if h and time.time() - h["t"] < 180:
+        _watch_note(install_id, "gave_up", h["ev"])
+
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     contact = html.escape(CONTACT_EMAIL) if CONTACT_EMAIL else "the developer (set CONTACT_EMAIL on the server to show an address here)"
@@ -2380,6 +2563,7 @@ async def privacy():
 <li><b>Read button.</b> When you tap it, the words on that screen (long numbers removed) are sent to get an explanation in your language. Never on password, banking or mobile money screens.</li>
 <li><b>Live help.</b> Only when you start it and send the link: the person you sent it to sees the words on your screen, drawn as boxes (never pictures, never password, bank or mobile money screens, long numbers hidden), and can point where to tap. They can never tap for you. Stop it any time; it is kept in the server's memory only and ends by itself.</li>
 <li><b>Crash reports.</b> If the app crashes, it sends where in its own code it went wrong, the app version and your phone's make and kind. Never what was on your screen, and numbers and email addresses are removed.</li>
+<li><b>Testers only: guide problems.</b> On test phones (or when "Show what ScreenGuide sees" is on), if a guide goes wrong after you ask for Help, the server keeps a note of that screen so the problem can be fixed: the names of the buttons it showed, what ScreenGuide had said, and the kind of phone. Names, messages, numbers and any other words are removed first.</li>
 <li><b>Voice recordings</b> you make for the steps stay on your phone. Only the ScreenGuide owner can share recordings with everyone, and phones then download those.</li>
 <li><b>Scam guard</b> and <b>error explanations</b>, if you turn them on, work on your phone only. Nothing is sent.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
