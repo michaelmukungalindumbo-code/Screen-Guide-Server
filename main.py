@@ -42,7 +42,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "37"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "38"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -507,7 +507,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.37"
+SERVER_VERSION = "0.38"
 
 
 @app.get("/health")
@@ -782,7 +782,7 @@ Rules:
 - Android sometimes asks for permission (Allow, While using the app, Only this time, Allow all, Select photos and videos, Don't allow). If the goal needs it, point at the answer that lets it work: Allow, While using the app, or Allow all for photos and videos (with Select photos the app sees only some of them later). Say why in a few words, for example: Tap "Allow all" so YouTube can see your videos. If the goal does not need it, point at Don't allow.
 - Some actions need a long press: forwarding, deleting, copying or replying to one message, recording a voice note, or moving an app icon. Then say: Press and hold "...", with that word as label.
 - Never point at ads or sponsored items (near the words Ad, Ads, Sponsored, Promoted). On a store page, Install must belong to the app they want: its name must be in <screen_words>.
-- If a pop-up that is not about the goal covers the screen (rate us, update, new features, an ad), point at the button that closes it: Not now, Later, No thanks, Skip, Close or X.
+- If a pop-up that is clearly not part of the task covers the screen (asking to rate the app, to update it, showing new features, or an ad), point at the button that closes it: Not now, Later, No thanks, Skip, Close or X. A screen for choosing photos or videos, a sign-in step or a permission question is part of the task: never close it.
 - <user_note> may say what the person just did on the phone (scrolled the list, typed in a box). Use it to understand the new screen."""
 
 SHOT_NOTE = """
@@ -892,6 +892,10 @@ _PICK = {
                 "one_more": "Kandeni pa cikope cenu, nangu kandeni pa {plus} nga tamwacimona.",
                 "many_more": "Kandeni pa cikope mulefwaya, nangu kandeni pa {plus} nga tamwacimona.", "only": "Kandeni pa {plus} pa kusala cikope cenu."}},
 }
+# Closing or leaving the picker is never the way forward (seen: "Tap Close to close this pop-up" on YouTube's gallery,
+# which sent the person round in a loop: Create, gallery, Close, Create...).
+_LEAVE = re.compile(r"^(?:close|x|cancel|back|navigate up|dismiss|not now|go back)$", re.I)
+_LEAVE_SAY = re.compile(r"\b(?:close (?:this|the) (?:pop-?up|window|page|screen|gallery)|go back|press back)\b", re.I)
 _CHOOSING = re.compile(r"\b(?:tap|choose|select|pick|dinani|kandeni)\b", re.I)
 _MEDIA_WORDS = re.compile(r"\b(?:videos?|photos?|pictures?|albums?|recents|what you want)\b", re.I)
 
@@ -913,9 +917,10 @@ def _gallery_fix(goal: str, labels: list, label, say: str, lang: str):
     is_gallery, videos, photos, more = _gallery(labels)
     if not is_gallery:
         return label, say
-    if label and not (_ALBUM.match(label) or _VIDEO_ITEM.match(label) or _PHOTO_ITEM.match(label)):
+    leaving = bool(label and _LEAVE.match(label)) or bool(not label and _LEAVE_SAY.search(say))
+    if label and not leaving and not (_ALBUM.match(label) or _VIDEO_ITEM.match(label) or _PHOTO_ITEM.match(label)):
         return label, say   # Next, Done, Gallery, the "+" itself...: the AI is past choosing
-    if not label and not (_CHOOSING.search(say) and _MEDIA_WORDS.search(say)):
+    if not label and not leaving and not (_CHOOSING.search(say) and _MEDIA_WORDS.search(say)):
         return label, say
     if re.search(r"video|vidiyo", goal, re.I):
         kind = "video"
