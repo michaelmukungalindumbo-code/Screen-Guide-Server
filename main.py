@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.51"
+SERVER_VERSION = "0.52"
 
 
 @app.get("/health")
@@ -1119,6 +1119,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     system = NEXT_SYSTEM.format(language=LANGS[lang]) + (SHOT_NOTE if image else "")
     t0 = time.time()
     text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
+    ai_empty = not isinstance(data, dict) or not data
     data = data if isinstance(data, dict) else {}
     label = _match_label(data.get("label"), labels)   # must be a real item on screen
     say = str(data.get("say") or "").strip()[:300] or "Choose what you want, then tap it."
@@ -1180,7 +1181,6 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     y = _fraction(data.get("y")) if image and not label else None
     if x is None or y is None:
         x = y = None
-    _watch_step(install_id, x_tester == "1", asked, goal, labels, history, body.note, label, say, dev, lang, image)
     if body.stuck:
         # Where people get stuck is what most needs fixing. Kept in memory only, numbers and emails removed.
         _stuck.append({"t": time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 7200)), "goal": _scrub(goal, 100),
@@ -1193,8 +1193,10 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     need_picture = bool(not label and x is None and not image and not look and not is_gallery and not done and _ICON.search(say))
     if need_picture:
         STATS["picture_wanted"] += 1
+    watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
+                        need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image)
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
-            "look_for": None if (label or x is not None) else look, "need_picture": need_picture}
+            "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch}
 
 
 # ---- Self-test: real questions from field testing, run through the same code. Open in a browser. ----
@@ -1371,7 +1373,7 @@ _event_minute = defaultdict(deque)
 
 
 @app.post("/event")
-async def event(body: Event, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+async def event(body: Event, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_tester: str = Header(default="")):
     install_id = _check(x_app_token, x_install_id)
     q = _event_minute[install_id]
     _prune(q, 60, time.time())
@@ -1379,9 +1381,11 @@ async def event(body: Event, x_app_token: str = Header(default=""), x_install_id
         return {"ok": False}
     q.append(time.time())
     ev = body.event if body.event in ("start", "done", "stop", "setup", "extra") else "other"
-    if ev == "stop":
-        _watch_stop(install_id)
     guide = re.sub(r"[^a-z0-9_-]", "", (body.guide or "").lower())[:30] or "unknown"
+    if x_tester == "1" and ev == "start":
+        _watch_start(install_id, guide)
+    elif ev in ("stop", "done"):
+        _watch_end(install_id, ev, guide)
     STATS["%s:%s" % (ev, guide)] += 1
     log.info("EVENT %s %s", ev, guide)
     return {"ok": True}
@@ -2363,14 +2367,15 @@ async def _ask_ai_fix(cid: str, rec: dict):
         STATS["ai_fix_errors"] += 1
         log.warning("AI fixer issue not opened: %s", str(e)[:200])
 
-# ---- The watcher (tester phones only): notice when a guide goes wrong, and ask the AI fixer, without anyone reporting it ----
-# Seen 1 Nov: in Help, "I don't understand" got back the same sentence word for word. No crash, so nothing reported it;
-# only a screen recording showed it. The watcher notices such moments itself. Only phones that send X-Tester (TEST builds,
-# or "Show what ScreenGuide sees" switched on) are watched. What leaves the server is cleaned: words on the screen are kept
-# only when they are known button names ("Upload from gallery", "Videos", "0:09"); every other word (names, messages,
-# numbers) becomes "…". Issues go to the public app repository, so nothing personal may reach them.
-AI_WATCH_PER_DAY = int(os.getenv("AI_WATCH_PER_DAY", "2"))   # guide problems sent to the AI fixer per day
-_help_seen = {}   # install id -> the last Help moment (in memory, a few minutes)
+# ---- The watcher (developer phones only): every guide is watched, problems flash red, and after the guide the developer
+# sees them in a pop-up with what went wrong and how to fix it. Only "Allow" sends them to the AI fixer. ----
+# Seen 1 Nov: in Help, "I don't understand" got back the same sentence word for word. No crash, so nothing reported it.
+# Developer phones send X-Tester (TEST builds, or "Show what ScreenGuide sees" switched on). Rules notice the clear signs
+# (Help, a step that did not work, nothing to point at, slow, going round in circles, stopped), and an AI review at the end
+# finds the rest. What leaves the server is cleaned: screen words are kept only when they are known button names
+# ("Upload from gallery", "Videos", "0:09"); every other word (names, messages, numbers) becomes "…". Issues go to the
+# public app repository, so nothing personal may reach them.
+AI_WATCH_PER_DAY = int(os.getenv("AI_WATCH_PER_DAY", "3"))   # guide problems sent to the AI fixer per day
 _UI_WORDS = {
     "settings", "search", "next", "done", "ok", "okay", "cancel", "back", "close", "menu", "more", "more options", "share",
     "send", "save", "edit", "delete", "remove", "open", "install", "uninstall", "update", "upload", "post", "publish", "create",
@@ -2437,109 +2442,235 @@ def _screen_print(labels: list) -> str:
     return _hash("|".join(sorted({_key(_clean_label(l)) for l in labels})), 10)
 
 
-def _watch_evidence(goal, labels, history, note, label, say, dev, lang, image) -> dict:
-    return {"goal": _clean_text(goal, 120), "told": [_clean_text(h, 140) for h in history[-3:]], "note": _clean_text(note, 100),
-            "screen": [_clean_label(l) for l in labels[:60]], "label": _clean_word(label) if label else None,
-            "say": _clean_text(say, 220), "device": dev, "lang": lang, "picture": bool(image)}
+# One watched guide per developer phone, in memory: its steps (cleaned) and the problems the rules noticed.
+_sessions = {}
+_review_day = defaultdict(int)
 
-
-_WATCH_WHAT = {
-    "help_repeated": "In Help the person said “{note}”, and the answer was the same sentence they had already heard.",
-    "still_stuck": "The person asked for Help twice on the same screen: the first answer did not get them past it.",
-    "gave_up": "The person stopped the guide less than 3 minutes after asking for Help.",
+_RULE_TEXT = {
+    "help_repeated": ("Help repeated itself", "In Help they said “{note}”, and got back the same sentence they had already heard.",
+                      "When someone asks for Help, explain in different, simpler words what to look for and where it is."),
+    "help": ("Needed Help on step {n}", "The person tapped Help and said “{note}”.",
+             "Make step {n}'s instruction clearer for this screen, or point at the right thing."),
+    "not_working": ("Step {n} did not work", "The person pressed Help: the instruction on step {n} did not work for them.",
+                    "Check that step {n} points at a button that is really on this screen."),
+    "no_point": ("Could not point on step {n}", "ScreenGuide told them to tap something on step {n} but could not show where.",
+                 "Name the exact button from the screen words, or ask the phone for a screen picture."),
+    "slow": ("Slow answer on step {n}", "The answer to step {n} took {secs} seconds. On a weak network people give up.",
+             "Send less, or make this kind of step faster."),
+    "loop": ("Same instruction three times", "Steps {n0} to {n} said the same thing: the person may be going round in circles.",
+             "Notice when the screen does not change, and suggest another way (scroll, go back, another button)."),
+    "ai_empty": ("No usable answer on step {n}", "The AI's answer for step {n} could not be read, so a general sentence was shown.",
+                 "Check the AI's answer format for this kind of screen."),
+    "stopped": ("Stopped at step {n}", "The person stopped the guide before it finished.",
+                "Look at step {n}: the instruction may not have fitted the screen."),
+    "idle": ("Left untouched at step {n}", "Nothing happened for 4 minutes on step {n}, so the guide stopped itself.",
+             "Look at step {n}: the person may not have known what to do."),
 }
 
 
-def _watch_note(install_id, kind, ev):
-    """One row per kind of problem on one kind of screen, counted. The first time: ask the AI fixer (a few a day)."""
-    wid = _hash(kind + "|" + _key(ev["goal"]) + "|" + _hash("|".join(sorted({_key(x) for x in ev["screen"]})), 10), 16)
+def _watch_start(install_id: str, guide: str):
+    now = time.time()
+    for k in [k for k, v in _sessions.items() if now - v["t"] > 3600][:200]:
+        _sessions.pop(k, None)
+    if len(_sessions) < 2000:
+        _sessions[install_id] = {"t": now, "guide": guide, "goal": "", "steps": [], "problems": [], "end": "", "review": None}
+
+
+def _add_problem(s: dict, kind: str, n: int, **kw):
+    if any(p["kind"] == kind and p["step"] == n for p in s["problems"]) or len(s["problems"]) >= 12:
+        return
+    if kind == "help" and any(p["kind"] == "help_repeated" and p["step"] == n for p in s["problems"]):
+        return   # the repeat says it already
+    s["problems"].append(dict(kind=kind, step=n, **kw))
     STATS["watch:" + kind] += 1
-    async def go():
-        try:
-            rec = await _gdb(_store.kv_get, "watch", wid) or {"kind": kind, "first": int(time.time()), "count": 0, "phones": []}
-            rec["count"] += 1; rec["last"] = int(time.time()); rec["ev"] = ev
-            ph = _hash("watch:" + install_id, 10)
-            if ph not in rec["phones"]:
-                rec["phones"] = (rec["phones"] + [ph])[-50:]
-            need = 1 if kind == "help_repeated" else 2   # a repeat is surely a bug; being stuck once may just be a hard moment
-            ask = GITHUB_TOKEN and AI_WATCH_PER_DAY > 0 and rec["count"] >= need and not rec.get("asked") and wid not in _fix_asked
-            if ask:
-                _fix_asked.add(wid); rec["asked"] = int(time.time())
-            await _gdb(_store.kv_put, "watch", wid, rec)
-            if ask:
-                await _ask_watch_fix(wid, rec)
-        except Exception as e:
-            log.warning("Watcher note not kept: %s", str(e)[:160])
-    asyncio.create_task(go())
 
 
-def _watch_issue(rec: dict) -> tuple:
-    ev = rec["ev"]
-    what = _WATCH_WHAT[rec["kind"]].format(note=ev.get("note") or "…")
-    title = "Guide problem: %s (%s)" % ({"help_repeated": "Help repeated the same sentence", "still_stuck": "still stuck after Help",
-                                          "gave_up": "gave up after Help"}[rec["kind"]], ev["goal"][:60] or "a guide")
-    told = "\n".join("%d. %s" % (i + 1, t) for i, t in enumerate(ev["told"])) or "(nothing yet)"
-    body = ("The watcher saw this on a tester's phone. Nobody had to report it.\n\n**What went wrong:** %s\n\n"
-            "- Goal: %s\n- Phone: %s, language: %s\n- Times seen: %d, on %d phone(s)\n\n"
-            "**What they had been told:**\n%s\n\n**What they said in Help:** %s\n\n"
-            "**The screen** (the words ScreenGuide read, in order; only known button names are kept, other words are …):\n"
-            "```json\n%s\n```\n**The answer the server gave:** label %s, say: %s\n\n"
-            "**AI fixer:** follow CLAUDE.md. This is probably in the server (server/ in your run; read server/CLAUDE.md). "
-            "Replay this screen in a server test first (POST /next with these screen words, the goal, already told, stuck and "
-            "the note above) and show the bad answer. Then fix the cause, not just this one screen. If the fix needs the "
-            "owner's decision, ask on this issue and stop.\n"
-            % (what, ev["goal"] or "…", ev["device"] or "unknown", ev["lang"], rec["count"], len(rec["phones"]), told,
-               ev.get("note") or "(nothing)", json.dumps(ev["screen"], ensure_ascii=False, indent=0)[:3000],
-               ("“%s”" % ev["label"]) if ev.get("label") else "none", ev["say"]))
+def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, say, x, look, done, need_picture, is_gallery,
+                secs, ai_empty, lang, dev, image) -> int:
+    """Each guide step on a developer phone: kept (cleaned), checked by the rules. Returns how many problems so far,
+    so the phone can flash red when the number goes up."""
+    if not tester:
+        return 0
+    s = _sessions.get(install_id)
+    if not s or s["end"] or time.time() - s["t"] > 3600:
+        _watch_start(install_id, "ai"); s = _sessions.get(install_id)
+        if not s:
+            return 0
+    if len(s["steps"]) >= 30:
+        return len(s["problems"])
+    s["goal"] = s["goal"] or _clean_text(goal, 120)
+    s["lang"], s["device"] = lang, dev
+    n = len(s["steps"]) + 1
+    asked = stuck and bool(note.strip())
+    step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(history[-1], 140) if history else "",
+            "note": _clean_text(note, 100), "stuck": bool(stuck), "label": _clean_word(label) if label else None,
+            "say": _clean_text(say, 220), "picture": bool(image), "secs": round(secs, 1)}
+    s["steps"].append(step)
+    if asked and history and _key(say) == _key(history[-1]):
+        _add_problem(s, "help_repeated", n, note=step["note"])
+    elif asked:
+        _add_problem(s, "help", n, note=step["note"])
+    elif stuck:
+        _add_problem(s, "not_working", n)
+    if not done and not label and x is None and not look and not is_gallery and not need_picture and not ai_empty and _ACTION.search(say):
+        _add_problem(s, "no_point", n)
+    if secs > 10:
+        _add_problem(s, "slow", n, secs=int(secs))
+    if n >= 3 and len({_key(t["say"]) for t in s["steps"][-3:]}) == 1:
+        _add_problem(s, "loop", n, n0=n - 2)
+    if ai_empty:
+        _add_problem(s, "ai_empty", n)
+    return len(s["problems"])
+
+
+def _watch_end(install_id: str, ev: str, guide: str):
+    s = _sessions.get(install_id)
+    if not s or s["end"]:
+        return
+    s["end"] = ev
+    n = len(s["steps"])
+    if ev == "stop" and n:
+        _add_problem(s, "idle" if guide.startswith("idle") else "stopped", n)
+
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {"problems": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"step": {"type": "integer"}, "kind": {"type": "string"}, "title": {"type": "string"},
+                       "what": {"type": "string"}, "fix": {"type": "string"}},
+        "required": ["step", "kind", "title", "what", "fix"], "additionalProperties": False}}},
+    "required": ["problems"],
+    "additionalProperties": False,
+}
+
+REVIEW_SYSTEM = """You review one guide that ScreenGuide gave on a developer's test phone. ScreenGuide helps first-time smartphone users by pointing at the next thing to tap and saying what to do.
+You get the goal and every step: the words on the screen (personal words are replaced by …), what ScreenGuide said and pointed at, and the problems its rules already noticed.
+Return JSON: {"problems": [{"step", "kind", "title", "what", "fix"}]}.
+- Include every problem the rules noticed, with the same step and kind, and explain it.
+- Add any other real problem you can see, with kind "review": an instruction that does not fit the screen, pointing at the wrong thing, words too hard for a first-time user, a step that goes backwards, finishing too early, the wrong language.
+- title: under 8 words. what: one or two plain sentences on what went wrong for the person. fix: one or two plain sentences on what the developer should change.
+- At most 6 problems. If the guide went well and the rules noticed nothing, return {"problems": []}."""
+
+
+def _valid_review(d) -> bool:
+    return isinstance(d, dict) and isinstance(d.get("problems"), list)
+
+
+def _rule_card(p: dict) -> dict:
+    t, w, f = _RULE_TEXT[p["kind"]]
+    v = dict(n=p["step"], note=p.get("note") or "…", secs=p.get("secs", ""), n0=p.get("n0", ""))
+    return {"step": p["step"], "kind": p["kind"], "title": t.format(**v), "what": w.format(**v), "fix": f.format(**v)}
+
+
+async def _watch_review_cards(s: dict) -> list:
+    """The rules' problems, explained, plus what the AI review finds. Without the AI, the rules' own words."""
+    cards = [_rule_card(p) for p in s["problems"]]
+    user = "<goal>%s</goal>\n<steps>\n%s\n</steps>\n<rules_noticed>\n%s\n</rules_noticed>" % (
+        _safe(s["goal"], 200), _safe(json.dumps(s["steps"], ensure_ascii=False), 9000),
+        _safe(json.dumps([{"step": c["step"], "kind": c["kind"], "title": c["title"]} for c in cards], ensure_ascii=False), 2000))
+    try:
+        _, data = await _ai_json(REVIEW_SYSTEM, user, None, "review", REVIEW_SCHEMA, _valid_review)
+        got = data.get("problems", []) if isinstance(data, dict) else []
+    except Exception as e:
+        log.warning("Guide review failed: %s", str(e)[:120])
+        got = []
+    for g in got:
+        if not isinstance(g, dict) or not str(g.get("title", "")).strip():
+            continue
+        g = {k: _clean_text(str(g.get(k, "")), 300 if k != "title" else 80) for k in ("title", "what", "fix")} | \
+            {"step": int(g.get("step") or 0) if str(g.get("step", "")).isdigit() else 0, "kind": str(g.get("kind", "review"))[:20]}
+        same = next((c for c in cards if c["kind"] == g["kind"] and c["step"] == g["step"]), None)
+        if same:
+            same.update({k: g[k] for k in ("title", "what", "fix") if g[k].strip()})
+        elif len(cards) < 6:
+            cards.append(dict(g, kind="review"))
+            STATS["watch:review"] += 1
+    for c in cards:
+        c["id"] = _hash("%s|%s|%s" % (c["kind"], c["step"], c["title"]), 8)
+    return cards[:6]
+
+
+def _watch_issue(s: dict, c: dict) -> tuple:
+    title = "Guide problem: %s (%s)" % (c["title"][:70], s["goal"][:50] or "a guide")
+    steps = "\n".join("%s%d. said: %s | pointed at: %s%s%s" % ("**→** " if st["n"] == c["step"] else "", st["n"], st["say"],
+                      st["label"] or "nothing", (" | Help: “%s”" % st["note"]) if st["note"] else (" | pressed Help" if st["stuck"] else ""),
+                      " | %ss" % st["secs"]) for st in s["steps"])
+    shown = next((st for st in s["steps"] if st["n"] == c["step"]), s["steps"][-1] if s["steps"] else None)
+    body = ("Noticed by the watcher on a developer's test phone; the developer tapped **Allow** to send it.\n\n"
+            "**What went wrong:** %s\n\n**Suggested fix:** %s\n\n- Goal: %s\n- Phone: %s, language: %s\n\n"
+            "**The whole guide** (the problem step is marked →):\n%s\n\n"
+            "**The screen at step %s** (the words ScreenGuide read, in order; only known button names are kept, other words are …):\n"
+            "```json\n%s\n```\n**Already told before that step:** %s\n\n"
+            "**AI fixer:** follow CLAUDE.md. Find where the cause really is: usually the server (server/ in your run; read "
+            "server/CLAUDE.md), sometimes the app. Replay this screen in a test first and show the problem, then fix the "
+            "cause for every screen like it. If the fix needs the owner's decision, ask on this issue and stop.\n"
+            % (c["what"], c["fix"], s["goal"] or "…", s.get("device") or "unknown", s.get("lang", "en"), steps or "(no steps)",
+               c["step"], json.dumps(shown["screen"] if shown else [], ensure_ascii=False, indent=0)[:3000],
+               (shown or {}).get("told_before") or "(nothing)"))
     return title, body
 
 
-async def _ask_watch_fix(wid: str, rec: dict):
-    """Like crash issues: GitHub is the memory (no duplicates after a restart), and a daily limit counted there."""
-    marker = "<!-- watch-id: %s -->" % wid
+class WatchSend(BaseModel):
+    ids: list[str] = []
+
+
+@app.post("/watch/review")
+async def watch_review(x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_tester: str = Header(default="")):
+    """After a guide on a developer phone: the problems, each with what went wrong and how to fix it, for the pop-up."""
+    install_id = _check(x_app_token, x_install_id)
+    s = _sessions.get(install_id)
+    if x_tester != "1" or not s or not s["steps"]:
+        return {"problems": []}
+    if s["review"] is None:
+        day = install_id + _today()
+        if _review_day[day] >= 40 or _over_budget():
+            s["review"] = [dict(_rule_card(p), id=_hash("%s|%s" % (p["kind"], p["step"]), 8)) for p in s["problems"]][:6]
+        else:
+            _review_day[day] += 1
+            s["review"] = await _watch_review_cards(s)
+    return {"problems": [{k: c[k] for k in ("id", "step", "title", "what", "fix")} for c in s["review"]]}
+
+
+@app.post("/watch/send")
+async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""),
+                     x_tester: str = Header(default="")):
+    """The developer tapped Allow: each chosen problem becomes an "ai-fix" issue, so the AI fixer works on it.
+    GitHub is the memory: the same problem is never sent twice, and at most AI_WATCH_PER_DAY a day (each fix costs AI money)."""
+    install_id = _check(x_app_token, x_install_id)
+    s = _sessions.get(install_id)
+    if x_tester != "1" or not s or not s.get("review"):
+        return {"sent": 0, "skipped": 0}
+    if not GITHUB_TOKEN:
+        return {"sent": 0, "skipped": len(body.ids), "error": "The fixer is not set up on the server (GITHUB_TOKEN)."}
+    chosen = [c for c in s["review"] if c["id"] in set(body.ids[:6]) and not c.get("sent")]
+    sent, skipped = 0, 0
     try:
         recent = await _github("GET", "/repos/%s/issues?labels=%s&state=all&sort=created&direction=desc&per_page=50"
                                % (AI_FIX_REPO, AI_FIX_LABEL), None)
-        mine = [i for i in recent if "<!-- watch-id: " in (i.get("body") or "")]
-        today = sum(1 for i in mine if str(i.get("created_at", "")).startswith(time.strftime("%Y-%m-%d", time.gmtime())))
-        if any(marker in (i.get("body") or "") for i in mine) or today >= AI_WATCH_PER_DAY:
-            STATS["watch_skipped"] += 1
-            return
-        title, body = _watch_issue(rec)
-        issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": body + "\n" + marker})
-        await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
-        STATS["watch_issues"] += 1
-        log.warning("WATCH asked: issue #%s (%s)", issue["number"], rec["kind"])
     except Exception as e:
-        STATS["ai_fix_errors"] += 1
-        log.warning("Watcher issue not opened: %s", str(e)[:200])
-
-
-def _watch_step(install_id, tester, asked, goal, labels, history, note, label, say, dev, lang, image):
-    """Called after each guide step. Tester phones only."""
-    if not tester:
-        return
-    now = time.time()
-    for k in [k for k, v in _help_seen.items() if now - v["t"] > 600][:200]:
-        _help_seen.pop(k, None)
-    if not asked:
-        return
-    ev = _watch_evidence(goal, labels, history, note, label, say, dev, lang, image)
-    fp = _screen_print(labels)
-    before = _help_seen.get(install_id)
-    if history and _key(say) == _key(history[-1]):
-        _watch_note(install_id, "help_repeated", ev)
-    elif before and before["fp"] == fp and now - before["t"] < 600:
-        _watch_note(install_id, "still_stuck", ev)
-    if len(_help_seen) < 2000:
-        _help_seen[install_id] = {"t": now, "fp": fp, "ev": ev}
-
-
-def _watch_stop(install_id):
-    """The guide was stopped. Right after Help, that is a person giving up."""
-    h = _help_seen.pop(install_id, None)
-    if h and time.time() - h["t"] < 180:
-        _watch_note(install_id, "gave_up", h["ev"])
+        log.warning("Watcher could not read GitHub: %s", str(e)[:160])
+        return {"sent": 0, "skipped": len(chosen), "error": "GitHub could not be reached. Try again later."}
+    mine = [i for i in recent if "<!-- watch-id: " in (i.get("body") or "")]
+    today = sum(1 for i in mine if str(i.get("created_at", "")).startswith(time.strftime("%Y-%m-%d", time.gmtime())))
+    for c in chosen:
+        shown = next((st for st in s["steps"] if st["n"] == c["step"]), None)
+        wid = _hash("%s|%s|%s" % (c["kind"], _key(s["goal"]), _hash("|".join(sorted({_key(x) for x in (shown or {}).get("screen", [])})), 10)), 16)
+        marker = "<!-- watch-id: %s -->" % wid
+        if any(marker in (i.get("body") or "") for i in mine) or today >= AI_WATCH_PER_DAY:
+            skipped += 1; STATS["watch_skipped"] += 1
+            continue
+        try:
+            title, text = _watch_issue(s, c)
+            issue = await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": title, "body": text + "\n" + marker})
+            await _github("POST", "/repos/%s/issues/%d/labels" % (AI_FIX_REPO, issue["number"]), {"labels": [AI_FIX_LABEL]})
+            c["sent"] = issue["number"]; sent += 1; today += 1
+            mine.append({"body": marker})
+            STATS["watch_issues"] += 1
+        except Exception as e:
+            STATS["ai_fix_errors"] += 1; skipped += 1
+            log.warning("Watcher issue not opened: %s", str(e)[:200])
+    return {"sent": sent, "skipped": skipped}
 
 
 @app.get("/privacy", response_class=HTMLResponse)
@@ -2563,7 +2694,7 @@ async def privacy():
 <li><b>Read button.</b> When you tap it, the words on that screen (long numbers removed) are sent to get an explanation in your language. Never on password, banking or mobile money screens.</li>
 <li><b>Live help.</b> Only when you start it and send the link: the person you sent it to sees the words on your screen, drawn as boxes (never pictures, never password, bank or mobile money screens, long numbers hidden), and can point where to tap. They can never tap for you. Stop it any time; it is kept in the server's memory only and ends by itself.</li>
 <li><b>Crash reports.</b> If the app crashes, it sends where in its own code it went wrong, the app version and your phone's make and kind. Never what was on your screen, and numbers and email addresses are removed.</li>
-<li><b>Testers only: guide problems.</b> On test phones (or when "Show what ScreenGuide sees" is on), if a guide goes wrong after you ask for Help, the server keeps a note of that screen so the problem can be fixed: the names of the buttons it showed, what ScreenGuide had said, and the kind of phone. Names, messages, numbers and any other words are removed first.</li>
+<li><b>Test phones only: guide problems.</b> On test phones (or when "Show what ScreenGuide sees" is on), every guide is checked for problems. After the guide, a pop-up lists them, and they are sent to be fixed only if you tap Allow. What is sent: the names of the buttons on the screen, what ScreenGuide said, and the kind of phone. Names, messages, numbers and any other words are removed first.</li>
 <li><b>Voice recordings</b> you make for the steps stay on your phone. Only the ScreenGuide owner can share recordings with everyone, and phones then download those.</li>
 <li><b>Scam guard</b> and <b>error explanations</b>, if you turn them on, work on your phone only. Nothing is sent.</li>
 <li><b>Pictures you attach.</b> Screenshots or videos you choose with the + button.</li>
