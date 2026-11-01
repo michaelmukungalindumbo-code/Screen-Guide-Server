@@ -42,7 +42,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "38"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "39"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -507,7 +507,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.38"
+SERVER_VERSION = "0.39"
 
 
 @app.get("/health")
@@ -783,6 +783,8 @@ Rules:
 - Some actions need a long press: forwarding, deleting, copying or replying to one message, recording a voice note, or moving an app icon. Then say: Press and hold "...", with that word as label.
 - Never point at ads or sponsored items (near the words Ad, Ads, Sponsored, Promoted). On a store page, Install must belong to the app they want: its name must be in <screen_words>.
 - If a pop-up that is clearly not part of the task covers the screen (asking to rate the app, to update it, showing new features, or an ad), point at the button that closes it: Not now, Later, No thanks, Skip, Close or X. A screen for choosing photos or videos, a sign-in step or a permission question is part of the task: never close it.
+- Keep moving forward. In an editor or a form that belongs to the goal (after choosing a video, writing a post), the next tap is usually Next, Done, Upload, Post or Save. Point at back, close, exit or cancel only when the person is clearly in the wrong place.
+- If the goal is to check or see something and the screen already shows the answer, say what it shows in a few words, use label null and set done true. Never point at a switch just to show its state: a tap would change it.
 - <user_note> may say what the person just did on the phone (scrolled the list, typed in a box). Use it to understand the new screen."""
 
 SHOT_NOTE = """
@@ -845,12 +847,28 @@ _WHERE = re.compile(r"\s+(?:at|in|on|near)\s+the\s+(?:very\s+)?(?:top|bottom|upp
                     r"(?:\s+(?:corner|side|edge|of the screen|of your screen))?\b", re.I)
 
 
+# Words that tell the person to do something. A sentence without one is a remark ("Mobile data is on").
+_ACTION = re.compile(r"\b(tap|press|swipe|scroll|choose|select|type|drag|open|turn|pick|hold|slide|dinani|kandeni|kokani|sankhani|lembani)\b", re.I)
+_CHECK_GOAL = re.compile(r"^\W*(check|see|find out|look|know|confirm|verify|is|are|what|how much|how many)\b", re.I)
+# Leaving a task that makes something (an upload, a post): seen on YouTube's editor, the ring went on "Exit editor"
+# while "Next" was on screen.
+_EXITISH = re.compile(r"^(exit\b.*|close|cancel|back|navigate up|discard|go back|x)$", re.I)
+_FORWARD = re.compile(r"^(next|done|upload|post|publish|share|save|continue|send|create)$", re.I)
+_MAKING = re.compile(r"\b(upload|post|publish|send|share|create|make|record|save)\b", re.I)
+_TAP_WORD = {"en": "Tap \u201c%s\u201d.", "ny": "Dinani \u201c%s\u201d.", "bem": "Kandeni \u201c%s\u201d."}
+
+
 def _one_action(say: str, pointing: bool) -> str:
     """With a ring there is one tap to describe: "Tap the Search box at the top, then type storage." becomes
     "Tap the Search box." The ring shows the place, and the next screen gets its own instruction."""
     if not pointing:
         return say
     s = _WHERE.sub("", say)
+    parts = re.split(r"(?<=[.!?])\s+", s.strip())
+    if len(parts) > 1 and not _ACTION.search(parts[0]):
+        firstact = next((p for p in parts if _ACTION.search(p)), None)
+        if firstact:
+            s = firstact   # the ring needs the instruction, not the remark before it
     cut = _THEN.sub("", s).strip()
     if len(cut) >= 6 and cut != s.strip():
         s = cut if cut.endswith((".", "!", "?")) else cut + "."
@@ -1017,6 +1035,18 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             STATS["label_from_words"] += 1
     say = _one_action(say, bool(label))
     label, say = _gallery_fix(goal, labels, label, say, lang)
+    done = bool(data.get("done"))
+    if label and _EXITISH.match(label) and _MAKING.search(goal):
+        fwd = next((_plain(l) for l in labels if _FORWARD.match(_plain(l)) and not l.rstrip().lower().endswith("[text]")), None)
+        if fwd:
+            STATS["kept_going_forward"] += 1
+            label, say = fwd, _TAP_WORD.get(lang, _TAP_WORD["en"]) % fwd
+    if lang == "en" and label and not _ACTION.search(say) and not (image and data.get("x") is not None):
+        STATS["remark_without_ring"] += 1
+        label = None   # a remark ("Good, Mobile Data is on") never gets a ring: tapping it could switch the thing off
+    if lang == "en" and not label and not done and _CHECK_GOAL.search(goal) and not _ACTION.search(say) and not data.get("look_for"):
+        STATS["check_answered"] += 1
+        done = True    # "check" goals end when the screen shows the answer
     is_gallery = _gallery(labels)[0]
     look = None
     if not label and data.get("look_for") and not (image and data.get("x") is not None):
@@ -1044,10 +1074,10 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         _samples.append({"t": time.strftime("%H:%M", time.gmtime(time.time() + 7200)), "kind": "step", "v": PROMPT_VERSION,
                          "ms": int((time.time() - t0) * 1000), "q": _scrub(goal), "a": _scrub("%s -> %s" % (label or "-", say))})
     # An icon with no name: ask the phone for a picture so the next answer can point at it (only if the person agreed).
-    need_picture = bool(not label and x is None and not image and not look and not is_gallery and not data.get("done") and _ICON.search(say))
+    need_picture = bool(not label and x is None and not image and not look and not is_gallery and not done and _ICON.search(say))
     if need_picture:
         STATS["picture_wanted"] += 1
-    return {"label": label, "say": say, "done": bool(data.get("done")), "x": x, "y": y,
+    return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture}
 
 
