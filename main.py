@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.52"
+SERVER_VERSION = "0.53"
 
 
 @app.get("/health")
@@ -989,6 +989,15 @@ _EXPLAIN_MORE = {"en": " If yours is not here, tap {plus}."}
 _ALBUM_SAY = re.compile(r"\b(?:all albums|albums|recents)\b|\btap\s+[\"“]?videos\b", re.I)
 
 
+def _last_told(history: list) -> str:
+    """The last instruction the person heard. In the Help chat the phone adds "User said: …" and "Told: …" lines."""
+    for h in reversed(history):
+        if h.startswith("User said:"):
+            continue
+        return h[len("Told:"):].strip() if h.startswith("Told:") else h
+    return ""
+
+
 def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = ""):
     """On a picker of the person's own videos or photos, in any app, they choose; the AI only says how. Seen on a
     phone: it pointed at YouTube's "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds
@@ -1130,7 +1139,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     asked = body.stuck and bool(body.note.strip())   # they told us in Help why they are stuck: explain, do not repeat
     if not asked:
         say = _one_action(say, bool(label))
-    label, say = _gallery_fix(goal, labels, label, say, lang, explain=asked, told=history[-1] if history else "")
+    told_last = _last_told(history)
+    label, say = _gallery_fix(goal, labels, label, say, lang, explain=asked, told=told_last)
     done = bool(data.get("done"))
     plain_all = [_plain(l) for l in labels]
     low_words = [p.lower() for p in plain_all]
@@ -2502,11 +2512,12 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     s["lang"], s["device"] = lang, dev
     n = len(s["steps"]) + 1
     asked = stuck and bool(note.strip())
-    step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(history[-1], 140) if history else "",
+    told = _last_told(history)
+    step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(told, 140),
             "note": _clean_text(note, 100), "stuck": bool(stuck), "label": _clean_word(label) if label else None,
             "say": _clean_text(say, 220), "picture": bool(image), "secs": round(secs, 1)}
     s["steps"].append(step)
-    if asked and history and _key(say) == _key(history[-1]):
+    if asked and told and _key(say) == _key(told):
         _add_problem(s, "help_repeated", n, note=step["note"])
     elif asked:
         _add_problem(s, "help", n, note=step["note"])
