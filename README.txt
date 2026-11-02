@@ -14,3 +14,7 @@ At most AI_WATCH_PER_DAY (default 3) a day.
 
 Test an app (developer phones): problems found while testing another app go to that app's GitHub repository. Allow
 each repository with AI_FIX_REPOS (comma-separated, "owner/name"), and add it to the GITHUB_TOKEN's repositories.
+
+Past results (developer phones): each pop-up is also kept on the phone with a signed copy, so Allow still works up to
+30 days later, even after the server restarted. The signature uses WATCH_SECRET if set, otherwise the GITHUB_TOKEN
+(so a new GITHUB_TOKEN makes older saved results unsendable; run the test again).

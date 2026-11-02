@@ -53,14 +53,15 @@ main._claude_client = Client([json.dumps({"label": "Settings", "say": "Tap “Se
 r = run(main.next_step(main.Next(goal="Turn on the torch", labels=HOME), **H))
 assert r["watch_step"] == 3 and len(s["steps"]) == 3
 run(main.event(main.Event(event="stop", guide="ai"), **H))
-assert "stopped" not in [p["kind"] for p in s["problems"]]       # stopping a test is not a problem
+# Server 0.58: stopping while the guide is still guiding counts (the owner wants every problem caught; seen 2 Nov)
+assert [p["kind"] for p in s["problems"]][-1] == "stopped" and s["problems"][-1]["step"] == 3
 
 # After the test: problems explained, and they go to the app's own repository
 main._claude_client = Client([json.dumps({"problems": []})])
 ps = run(main.watch_review(**H))["problems"]
 titles = [p["title"] for p in ps]
-assert titles[:5] == ["Error message on screen 1", "A tap did nothing on screen 1", "Buttons with no name on screen 2",
-                      "Small buttons on screen 2", "The app crashed on screen 2"], titles
+assert titles[:6] == ["Error message on screen 1", "A tap did nothing on screen 1", "Buttons with no name on screen 2",
+                      "Small buttons on screen 2", "The app crashed on screen 2", "Stopped at step 3"], titles
 assert ps[2]["what"].startswith("3 buttons have no text") and "“Speak” was tapped 3 times" in ps[1]["what"]
 out = run(main.watch_send(main.WatchSend(ids=[ps[0]["id"], ps[4]["id"]]), **H))
 assert out == {"sent": 2, "skipped": 0}, out

@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.57"
+SERVER_VERSION = "0.58"
 
 
 @app.get("/health")
@@ -1081,6 +1081,7 @@ class Next(BaseModel):
     image: str = ""
     level: str = ""
     device: str = ""
+    tapped: bool = False   # developer phones: the person tapped what the last step pointed at (for the watcher only)
 
 
 @app.post("/next")
@@ -1204,7 +1205,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if need_picture:
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
-                        need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image)
+                        need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped)
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
@@ -2511,6 +2512,10 @@ _RULE_TEXT = {
                  "Check the AI's answer format for this kind of screen."),
     "stopped": ("Stopped at step {n}", "The person stopped the guide before it finished.",
                 "Look at step {n}: the instruction may not have fitted the screen."),
+    "repeat": ("Step {n} repeated step {n0}", "Step {n} said “{note}” again, after the person had already done it at step {n0}. "
+               "The task may already be done (for example the scan was saved), and ScreenGuide sent them back.",
+               "Before repeating an instruction, look at the screen for signs it was done (a new file, “upload complete”, "
+               "“saved”) and move on or finish. If it really must be done again, say why."),
     "idle": ("Left untouched at step {n}", "Nothing happened for 4 minutes on step {n}, so the guide stopped itself.",
              "Look at step {n}: the person may not have known what to do."),
     # "Test an app": spotted on the phone, in any app, with or without a guide
@@ -2554,7 +2559,7 @@ def _add_problem(s: dict, kind: str, n: int, **kw):
 
 
 def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, say, x, look, done, need_picture, is_gallery,
-                secs, ai_empty, lang, dev, image) -> int:
+                secs, ai_empty, lang, dev, image, tapped=False) -> int:
     """Each guide step on a developer phone: kept (cleaned), checked by the rules. Returns how many problems so far,
     so the phone can flash red when the number goes up."""
     if not tester:
@@ -2595,6 +2600,16 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
         _add_problem(s, "loop", n, n0=n - 2)
     if ai_empty:
         _add_problem(s, "ai_empty", n)
+    # The same instruction again after it was done: the person tapped what it pointed at and got it back (seen 2 Nov:
+    # the scan was saved, and the guide still said "Tap Scan Document"), or it comes back after other steps.
+    k = _key(say)
+    if k and not stuck and not any(p["kind"] in ("repeat", "loop") and _key(p.get("note", "")) == k for p in s["problems"]):
+        said = [t for t in s["steps"][:-1] if t["say"]]
+        back = next((t for t in reversed(said[:-1]) if _key(t["say"]) == k), None)
+        if said and _key(said[-1]["say"]) == k and tapped and not any(p["kind"] == "loop" and p["step"] == n for p in s["problems"]):
+            _add_problem(s, "repeat", n, n0=said[-1]["n"], note=step["say"][:90])
+        elif back and said and _key(said[-1]["say"]) != k and not note.strip():
+            _add_problem(s, "repeat", n, n0=back["n"], note=step["say"][:90])
     return len(s["problems"])
 
 
@@ -2606,6 +2621,11 @@ def _watch_end(install_id: str, ev: str, guide: str):
     n = len(s["steps"])
     if ev == "stop" and n and s.get("kind") != "test":
         _add_problem(s, "idle" if guide.startswith("idle") else "stopped", n)
+    elif ev == "stop" and s.get("kind") == "test" and guide not in ("test", "unknown"):
+        # Stopped while ScreenGuide was still guiding (seen 2 Nov: stopped because the guide kept repeating a done step)
+        said = [t for t in s["steps"] if t["say"]]
+        if said:
+            _add_problem(s, "idle" if guide.startswith("idle") else "stopped", said[-1]["n"])
 
 
 REVIEW_SCHEMA = {
@@ -2803,6 +2823,7 @@ def _test_issue(s: dict, c: dict) -> tuple:
 class WatchSend(BaseModel):
     ids: list[str] = []
     shots: list[dict] = []   # developer phones: a small picture of the screen at each step, {"n": step, "jpg": base64}
+    saved: dict = {}         # from "Past results": the signed result the phone kept, instead of the one in memory
 
 
 # Step pictures, kept only in memory and only for the AI fixer: never put on GitHub (the repository is public and the
@@ -2939,6 +2960,50 @@ def _change_issue(s: dict, c: dict, have: set = frozenset()) -> tuple:
     return title, body[:60000]
 
 
+# "Past results" on the phone: the whole result (steps, problems, explanations) is given to the phone, signed, so the
+# developer can still tap Allow days later, after the server restarted. The signature means only what this server
+# made can be sent, and only by the phone it was made for.
+_SAVE_KEYS = ("t", "kind", "guide", "goal", "steps", "problems", "changes", "review", "app", "pkg", "repo", "device", "lang")
+SAVED_DAYS = 30
+
+
+def _seal_key() -> bytes:
+    secret = os.getenv("WATCH_SECRET", "").strip() or GITHUB_TOKEN
+    return hashlib.sha256(("screenguide-saved|" + secret).encode()).digest() if secret else b""
+
+
+def _seal(install_id: str, s: dict):
+    key = _seal_key()
+    if not key:
+        return None
+    data = json.dumps({"id": _hash("inst:" + install_id, 16), "at": int(time.time()), "s": {k: s[k] for k in _SAVE_KEYS if k in s}},
+                      ensure_ascii=False, separators=(",", ":"))
+    if len(data) > 200_000:
+        return None
+    return {"data": data, "sig": hmac.new(key, data.encode(), hashlib.sha256).hexdigest()}
+
+
+def _unseal(install_id: str, saved: dict):
+    key = _seal_key()
+    if not key or not isinstance(saved, dict):
+        return None
+    data, sig = str(saved.get("data", "")), str(saved.get("sig", ""))
+    if len(data) > 200_000 or not hmac.compare_digest(hmac.new(key, data.encode(), hashlib.sha256).hexdigest(), sig):
+        return None
+    try:
+        d = json.loads(data)
+        s = d["s"]
+        if d["id"] != _hash("inst:" + install_id, 16) or time.time() - float(d["at"]) > SAVED_DAYS * 86400:
+            return None
+        if not isinstance(s.get("review"), list) or not isinstance(s.get("steps"), list) or not isinstance(s.get("t"), (int, float)):
+            return None
+    except Exception:
+        return None
+    for k, v in (("goal", ""), ("problems", []), ("changes", []), ("end", "stop")):
+        s.setdefault(k, v)
+    return s
+
+
 @app.post("/watch/review")
 async def watch_review(x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_tester: str = Header(default="")):
     """After a guide on a developer phone: the problems, each with what went wrong and how to fix it, for the pop-up."""
@@ -2956,8 +3021,14 @@ async def watch_review(x_app_token: str = Header(default=""), x_install_id: str 
             _review_day[day] += 1
             s["review"] = await _watch_review_cards(s)
         s["review"] = [c for c in s["review"] if c.get("kind") != "change"] + _change_cards(s)
-    return {"problems": [dict({k: c[k] for k in ("id", "step", "title", "what", "fix")},
-                              kind=c["kind"] if c["kind"] in ("change", "idea") else "problem") for c in s["review"]]}
+    ps = [dict({k: c[k] for k in ("id", "step", "title", "what", "fix")}, kind=c["kind"] if c["kind"] in ("change", "idea") else "problem")
+          for c in s["review"]]
+    out = {"problems": ps}
+    if ps:
+        out["saved"] = _seal(install_id, s)
+        out["title"] = (("Test of %s" % s.get("app", "the app")) if s.get("kind") == "test" else "Guide") + \
+            ((": " + s["goal"][:60]) if s["goal"] else "")
+    return out
 
 
 @app.post("/watch/send")
@@ -2966,7 +3037,12 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
     """The developer tapped Allow: each chosen problem becomes an "ai-fix" issue, so the AI fixer works on it.
     GitHub is the memory: the same problem is never sent twice, and at most AI_WATCH_PER_DAY a day (each fix costs AI money)."""
     install_id = _check(x_app_token, x_install_id)
-    s = _sessions.get(install_id)
+    if body.saved:
+        s = _unseal(install_id, body.saved)
+        if x_tester == "1" and not s:
+            return {"sent": 0, "skipped": len(body.ids), "error": "This result is older than %d days or damaged. Run the test again." % SAVED_DAYS}
+    else:
+        s = _sessions.get(install_id)
     if x_tester != "1" or not s or not s.get("review"):
         return {"sent": 0, "skipped": 0}
     if not GITHUB_TOKEN:
