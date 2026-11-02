@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "50"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "51"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.63"
+SERVER_VERSION = "0.64"
 
 
 @app.get("/health")
@@ -826,7 +826,7 @@ Rules:
 
 SHOT_NOTE = """
 
-A picture of the user's screen is attached. Use it to understand the screen. If the thing to tap has a word in the list, use that word as label and leave x and y null. If it has no word (an icon such as +, a pencil, a switch or a picture), set label null and give its centre as x and y: fractions of the picture's width and height, from 0 to 1, measured from the top-left corner. Only give x and y when you can clearly see the thing. Ignore the round grey buttons ScreenGuide draws at the side. Never describe or repeat personal details you see in the picture."""
+A picture of the user's screen is attached. Use it to understand the screen. If the thing to tap has a word in the list, use that word as label and leave x and y null. If it is not in the list (an icon such as +, a pencil, a switch or a picture, or a button whose word the app hides from the list, like "Next" in a camera or scanner), set label null and give its centre as x and y: fractions of the picture's width and height, from 0 to 1, measured from the top-left corner. Only give x and y when you can clearly see the thing. Ignore the round grey buttons ScreenGuide draws at the side. Never describe or repeat personal details you see in the picture."""
 
 _s_minute = defaultdict(deque)
 _s_day = defaultdict(deque)
@@ -909,6 +909,11 @@ _UPLOADING_SAY = re.compile(r"\buploading\b", re.I)
 # "The screen is black right now": what the AI says when the app blocked the screen picture
 _BLACK_SAY = re.compile(r"\b(screen|picture|display|phone)\b[^.]{0,40}\b(is|looks|appears|seems|was|went)\b[^.]{0,20}\b(black|dark|blank|empty)\b"
                         r"|\b(black|blank|dark) (screen|picture)\b", re.I)
+# The main button of a screen, for when the AI will not name one (see the black picture rule in next_step)
+_MAIN_BUTTON = re.compile(r"^(upload|save|done|next|ok|send|continue|finish|confirm|post|share|submit|install|allow|accept)$", re.I)
+# Watcher: instructions that need something pointed at. "Hold the camera still" or "do not tap anything yet" do not.
+_POINT_ACTION = re.compile(r"\b(tap|press|choose|select|type|open|turn|pick|slide|dinani|kandeni|sankhani|lembani)\b", re.I)
+_NEGATED = re.compile(r"\b(do not|don['’]?t|never|without)\s+(\w+\s+)?\w+", re.I)
 _DONE_SAY = {"en": "Done! It worked. You did it yourself.", "ny": "Zabwino! Zatheka. Mwachita nokha.", "bem": "Nawamya! Capwa. Mwacita nemwe bene."}
 _TAP_WORD = {"en": "Tap \u201c%s\u201d.", "ny": "Dinani \u201c%s\u201d.", "bem": "Kandeni \u201c%s\u201d."}
 
@@ -1144,6 +1149,24 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         user += ("\nThe screen picture came back black only because this app blocks pictures. The screen is not black: "
                  "<screen_words> is what is really on it. Never say the screen is black.")
         text, data = await _ai_json(NEXT_SYSTEM.format(language=LANGS[lang]), user, None, "step", NEXT_SCHEMA, _valid_next)
+        # Seen 3 Nov: it still said "The screen looks black" for Drive's Upload screen. Then point at the screen's main
+        # button ourselves, or at least never tell them the screen is black.
+        if isinstance(data, dict) and _BLACK_SAY.search(str(data.get("say") or "")):
+            STATS["black_picture_fallback"] += 1
+            btn = next((_plain(l) for l in labels if l.rstrip().lower().endswith("[tap]") and _MAIN_BUTTON.match(_plain(l))), None)
+            data = dict(data, label=btn, x=None, y=None, done=False,
+                        say=(_TAP_WORD.get(lang, _TAP_WORD["en"]) % btn) if btn else "Look at the buttons on this screen and tap the one for your next step.")
+    # A button the AI can see in the picture but that is not in the screen words (Google's scanner hides its words: seen
+    # 1-3 Nov, "Tap Next" with nothing pointed at, three times). Ask once more for where it is in the picture.
+    named = str(data.get("label") or "").strip() if isinstance(data, dict) else ""
+    if image and named and data.get("x") is None and not _match_label(named, labels):
+        STATS["point_from_picture_asked"] += 1
+        _, again = await _ai_json(system, user + "\n\u201c%s\u201d is not in <screen_words>: this app hides its words. If you can see it "
+                                  "in the picture, set label null and give its centre as x and y." % _safe(named, 40),
+                                  [image], "step+picture", NEXT_SCHEMA, _valid_next)
+        if isinstance(again, dict) and _fraction(again.get("x")) is not None and _fraction(again.get("y")) is not None:
+            STATS["point_from_picture"] += 1
+            data = dict(again, label=None)
     ai_empty = not isinstance(data, dict) or not data
     data = data if isinstance(data, dict) else {}
     label = _match_label(data.get("label"), labels)   # must be a real item on screen
@@ -2616,7 +2639,8 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
         _add_problem(s, "help", on, note=step["note"])
     elif stuck:
         _add_problem(s, "not_working", on)
-    if not done and not label and x is None and not look and not is_gallery and not need_picture and not ai_empty and _ACTION.search(say):
+    if (not done and not label and x is None and not look and not is_gallery and not need_picture and not ai_empty
+            and _POINT_ACTION.search(_NEGATED.sub("", say))):
         _add_problem(s, "no_point", n)
     if secs > 10:
         _add_problem(s, "slow", n, secs=int(secs))

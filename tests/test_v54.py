@@ -24,7 +24,7 @@ J = lambda label, say: json.dumps({"label": label, "say": say, "done": False, "x
 def ev(phone, e, guide="ai"):
     run(main.event(main.Event(event=e, guide=guide), x_app_token="tok", x_install_id=phone, x_tester="1"))
 def step(phone, out, labels, stuck=False, note="", history=(), image=""):
-    main._claude_client = Client([out, out])  # the same answer twice: since server 0.61 a black-screen answer is asked again without the picture
+    main._claude_client = Client([out, json.dumps({"label": None, "say": "Tap the button at the top to save your scan.", "done": False, "x": None, "y": None, "look_for": None})])  # since server 0.61 a black-screen answer is asked again without the picture; this pretend AI then answers without naming the button
     return run(main.next_step(main.Next(goal="Scan a document with the Drive app", labels=labels, stuck=stuck, note=note,
                                         history=list(history), image=image, device="Infinix phone, Android 14"),
                               x_app_token="tok", x_install_id=phone, x_tester="1"))

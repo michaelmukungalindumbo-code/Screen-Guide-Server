@@ -23,7 +23,7 @@ async def fake_github(method, path, payload):
 main._github = fake_github
 H = dict(x_app_token="tok", x_install_id="dev59", x_tester="1")
 def step(label, say, labels, note="", stuck=False, tapped=False, image=""):
-    main._claude_client = Client([json.dumps({"label": label, "say": say, "done": False, "x": None, "y": None, "look_for": None})] * 2)  # the same answer twice: since server 0.61 a black-screen answer is asked again without the picture
+    main._claude_client = Client([json.dumps({"label": label, "say": say, "done": False, "x": None, "y": None, "look_for": None}), json.dumps({"label": None, "say": "Tap the button at the top to save your scan.", "done": False, "x": None, "y": None, "look_for": None}), json.dumps({"label": None, "say": "Tap the button at the top to save your scan.", "done": False, "x": None, "y": None, "look_for": None})])  # since server 0.61 a black-screen answer is asked again without the picture; this pretend AI then answers without naming the button
     return run(main.next_step(main.Next(goal="How do I scan a document", labels=labels, note=note, stuck=stuck, tapped=tapped, image=image), **H))
 def kinds(): return [(p["kind"], p["step"]) for p in main._sessions["dev59"]["problems"]]
 
@@ -34,7 +34,7 @@ UPLOAD = ["Cancel [tap]", "Upload [tap]", "PDF [switch]", "JPEG [switch]", "My D
 SCAN = "Tap “Scan Document” to scan your paper."
 assert run(main.watch_test_start(main.WatchTest(pkg="zm.screenguide", app="ScreenGuide", repo="michaelmukungalindumbo-code/Screen-Guide"), **H))["ok"]
 step("Scan Document", SCAN, DRIVE)                                                                          # 1
-step(None, "Hold the camera still over the paper. The Scan button appears when it sees the page.", [], image="iVBOR")   # 2
+step(None, "Hold the camera still over the paper, then tap the big round button in the bottom middle to take the photo.", [], image="iVBOR")   # 2 (2 Nov wording)
 step(None, "The page is still being checked, so wait a moment. When the scan looks clear, tap Next.", [], note="Help", stuck=True, image="iVBOR")  # 3
 step(None, "The screen is black with only ScreenGuide's bar at the top. Wait a moment, then tap the Stop button.", UPLOAD, image="iVBOR")  # 4
 step("Scan Document", SCAN, DRIVE)                                                                          # 5: sent back to the start
