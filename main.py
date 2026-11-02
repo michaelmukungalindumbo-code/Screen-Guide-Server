@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.61"
+SERVER_VERSION = "0.62"
 
 
 @app.get("/health")
@@ -2536,6 +2536,10 @@ _RULE_TEXT = {
                "The task may already be done (for example the scan was saved), and ScreenGuide sent them back.",
                "Before repeating an instruction, look at the screen for signs it was done (a new file, “upload complete”, "
                "“saved”) and move on or finish. If it really must be done again, say why."),
+    "stale": ("Screen changed, step {n} stayed", "About {secs} seconds after the screen changed, ScreenGuide was still showing step {n} and had not looked "
+              "again. Picture {pic} (media/step{pic}.jpg) shows the screen after it changed.",
+              "When the screen changes while a step is shown, look again, even in apps whose words ScreenGuide cannot read: "
+              "the person may already have done it (seen 2 Nov: the photo was taken, the guide still said to take it)."),
     "idle": ("Left untouched at step {n}", "Nothing happened for 4 minutes on step {n}, so the guide stopped itself.",
              "Look at step {n}: the person may not have known what to do."),
     # "Test an app": spotted on the phone, in any app, with or without a guide
@@ -2639,6 +2643,8 @@ def _watch_end(install_id: str, ev: str, guide: str):
         return
     s["end"] = ev
     n = len(s["steps"])
+    if guide.startswith("quit"):
+        return   # developer phones: "Why did you stop?" -> "Just testing". Seen 2 Nov: a Stop on purpose came back as a problem.
     if ev == "stop" and n and s.get("kind") != "test":
         _add_problem(s, "idle" if guide.startswith("idle") else "stopped", n)
     elif ev == "stop" and s.get("kind") == "test" and guide not in ("test", "unknown"):
@@ -2680,7 +2686,8 @@ def _valid_review(d) -> bool:
 
 def _rule_card(p: dict) -> dict:
     t, w, f = _RULE_TEXT[p["kind"]]
-    v = dict(n=p["step"], note=p.get("note") or "…", secs=p.get("secs", ""), n0=p.get("n0", ""), detail=p.get("detail") or "…")
+    v = dict(n=p["step"], note=p.get("note") or "…", secs=p.get("secs", ""), n0=p.get("n0", ""), detail=p.get("detail") or "…",
+             pic=p.get("pic", ""))
     return {"step": p["step"], "kind": p["kind"], "title": t.format(**v), "what": w.format(**v), "fix": f.format(**v)}
 
 
@@ -2700,7 +2707,10 @@ async def _watch_review_cards(s: dict, pics: list = ()) -> list:
         user += ("\nFor this test, also look for problems in the app itself: confusing words, a screen with no way forward, "
                  "English only where users may not read English, text too long for a small phone.")
     if pics:
-        user += "\n<pictures>%s</pictures>" % ", ".join("step %d" % n for n, _ in pics)
+        changed = {p.get("pic"): p["step"] for p in s["problems"] if p.get("pic")}
+        user += "\n<pictures>%s</pictures>" % ", ".join(
+            ("picture %d (the screen after it changed while step %d was still shown)" % (n, changed[n])) if n in changed else ("step %d" % n)
+            for n, _ in pics)
     try:
         _, data = await _ai_json(REVIEW_SYSTEM, user, [b for _, b in pics] or None, "review+pictures" if pics else "review",
                                  REVIEW_SCHEMA, _valid_review)
@@ -2850,6 +2860,28 @@ def _test_issue(s: dict, c: dict) -> tuple:
     return title, body[:60000]
 
 
+class WatchStale(BaseModel):
+    step: int = 0    # the step that stayed (the watcher's number)
+    secs: int = 0    # how long it stayed after the screen changed
+
+
+@app.post("/watch/stale")
+async def watch_stale(body: WatchStale, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""),
+                      x_tester: str = Header(default="")):
+    """Developer phones: the screen changed (a new picture) while ScreenGuide kept showing the same step. The phone keeps a
+    picture of the changed screen under the number returned ("pic"), sent with the others only on Allow."""
+    install_id = _check(x_app_token, x_install_id)
+    s = _sessions.get(install_id)
+    if x_tester != "1" or not s or s["end"] or not (0 < body.step <= len(s["steps"])):
+        return {"watch": 0, "pic": 0}
+    pic = 151 + sum(1 for p in s["problems"] if p["kind"] == "stale")
+    if pic > 160 or any(p["kind"] == "stale" and p["step"] == body.step for p in s["problems"]):
+        return {"watch": len(s["problems"]), "pic": 0}
+    _add_problem(s, "stale", body.step, secs=max(0, min(int(body.secs), 600)), pic=pic)
+    s["review"] = None
+    return {"watch": len(s["problems"]), "pic": pic if any(p.get("pic") == pic for p in s["problems"]) else 0}
+
+
 class WatchSend(BaseModel):
     ids: list[str] = []
     shots: list[dict] = []   # developer phones: a small picture of the screen at each step, {"n": step, "jpg": base64}
@@ -2871,7 +2903,7 @@ def _keep_shots(sid: str, shots: list) -> int:
     good = []
     for x in shots[:30]:
         n, jpg = x.get("n") if isinstance(x, dict) else None, x.get("jpg") if isinstance(x, dict) else None
-        if isinstance(n, int) and 0 < n <= 120 and isinstance(jpg, str) and 100 < len(jpg) <= 400_000 and _B64.match(jpg[:2000]):
+        if isinstance(n, int) and 0 < n <= 160 and isinstance(jpg, str) and 100 < len(jpg) <= 400_000 and _B64.match(jpg[:2000]):
             good.append({"n": n, "jpg": jpg})
     if good:
         while len(_shots) >= 50:
@@ -3045,10 +3077,10 @@ REVIEW_PICS = 12
 
 def _review_wants(s: dict, have: list) -> list:
     """The pictures that help the review most: each problem's step and the step before it, then the last steps."""
-    have = {n for n in have if isinstance(n, int) and 0 < n <= 120}
+    have = {n for n in have if isinstance(n, int) and 0 < n <= 160}
     want = []
     for p in s["problems"]:
-        for n in (p["step"], p["step"] - 1):
+        for n in (p.get("pic") or 0, p["step"], p["step"] - 1):
             if n in have and n not in want:
                 want.append(n)
     for st in reversed(s["steps"]):
@@ -3063,7 +3095,7 @@ def _review_pics(shots: list) -> list:
     out = []
     for x in shots[:REVIEW_PICS]:
         n, jpg = (x.get("n"), x.get("jpg")) if isinstance(x, dict) else (None, None)
-        if isinstance(n, int) and 0 < n <= 120 and isinstance(jpg, str) and 100 < len(jpg) <= 400_000 and _B64.match(jpg[:2000]):
+        if isinstance(n, int) and 0 < n <= 160 and isinstance(jpg, str) and 100 < len(jpg) <= 400_000 and _B64.match(jpg[:2000]):
             out.append((n, jpg))
     return sorted(out)
 
