@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "47"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "48"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.58"
+SERVER_VERSION = "0.59"
 
 
 @app.get("/health")
@@ -2648,6 +2648,8 @@ Return JSON: {"problems": [{"step", "kind", "title", "what", "fix"}]}.
 - At most 6 problems. If the guide went well and the rules noticed nothing, return {"problems": []}.
 - Only describe what the steps show. Never guess what happened on the phone between steps (for example that a menu did not open, or that a button was a Close button).
 - "help_after" on a step means the person pressed Help while that step was shown; the next step ("stuck": true) is ScreenGuide's answer to that Help.
+- For a problem the rules noticed, keep its meaning: explain why it happened on that step. Never turn it into a different problem.
+- Pictures of some steps may be attached; <pictures> lists their step numbers in order. They show what was really on the screen, with ScreenGuide's ring, card and buttons on top. Trust them over the screen words and over what ScreenGuide said: if a picture shows a button that ScreenGuide said was not there, or a screen it called black, say what was really there. A picture can only come back black if the app blocked it; then the words decide. Never write names, messages, numbers or anything personal you see in a picture.
 - A screen picture can come back black (some apps block pictures). If a step's screen words show buttons, that screen was not black.
 - You may also add up to 2 improvement ideas, with kind "idea": a small, specific change that would make this guide easier for a first-time smartphone user (clearer or shorter words, pointing earlier, one step fewer). Only real ideas from these steps."""
 
@@ -2662,7 +2664,7 @@ def _rule_card(p: dict) -> dict:
     return {"step": p["step"], "kind": p["kind"], "title": t.format(**v), "what": w.format(**v), "fix": f.format(**v)}
 
 
-async def _watch_review_cards(s: dict) -> list:
+async def _watch_review_cards(s: dict, pics: list = ()) -> list:
     """The rules' problems, explained, plus what the AI review finds. Without the AI, the rules' own words."""
     cards = [_rule_card(p) for p in s["problems"]]
     if s.get("kind") == "test":
@@ -2677,8 +2679,11 @@ async def _watch_review_cards(s: dict) -> list:
     if s.get("kind") == "test":
         user += ("\nFor this test, also look for problems in the app itself: confusing words, a screen with no way forward, "
                  "English only where users may not read English, text too long for a small phone.")
+    if pics:
+        user += "\n<pictures>%s</pictures>" % ", ".join("step %d" % n for n, _ in pics)
     try:
-        _, data = await _ai_json(REVIEW_SYSTEM, user, None, "review", REVIEW_SCHEMA, _valid_review)
+        _, data = await _ai_json(REVIEW_SYSTEM, user, [b for _, b in pics] or None, "review+pictures" if pics else "review",
+                                 REVIEW_SCHEMA, _valid_review)
         got = data.get("problems", []) if isinstance(data, dict) else []
     except Exception as e:
         log.warning("Guide review failed: %s", str(e)[:120])
@@ -2690,16 +2695,21 @@ async def _watch_review_cards(s: dict) -> list:
             {"step": int(g.get("step") or 0) if str(g.get("step", "")).isdigit() else 0, "kind": str(g.get("kind", "review"))[:20]}
         same = next((c for c in cards if c["kind"] == g["kind"] and c["step"] == g["step"] and c["kind"] in _RULE_TEXT), None)
         if same:
-            same.update({k: g[k] for k in ("title", "what", "fix") if g[k].strip()})
+            # The rule's title and what it saw stay (they are facts); the AI adds why, and how to fix it.
+            if g["what"].strip() and _key(g["what"]) not in _key(same["what"]):
+                same["what"] = (same["what"] + " " + g["what"])[:420]
+            if g["fix"].strip():
+                same["fix"] = g["fix"]
         elif g["kind"] == "idea" and sum(1 for c in cards if c["kind"] == "idea") < 2:
             cards.append(dict(g, kind="idea"))
             STATS["watch:idea"] += 1
-        elif g["kind"] != "idea" and sum(1 for c in cards if c["kind"] != "idea") < 6:
+        elif g["kind"] != "idea" and sum(1 for c in cards if c["kind"] == "review") < 3:
             cards.append(dict(g, kind="review"))
             STATS["watch:review"] += 1
     for c in cards:
         c["id"] = _hash("%s|%s|%s" % (c["kind"], c["step"], c["title"]), 8)
-    return [c for c in cards if c["kind"] != "idea"][:6] + [c for c in cards if c["kind"] == "idea"][:2]
+    # Every problem the rules saw (at most 12), up to 3 more from the AI, and up to 2 ideas
+    return [c for c in cards if c["kind"] != "idea"][:15] + [c for c in cards if c["kind"] == "idea"][:2]
 
 
 def _short_screen(screen: list) -> str:
@@ -2824,6 +2834,7 @@ class WatchSend(BaseModel):
     ids: list[str] = []
     shots: list[dict] = []   # developer phones: a small picture of the screen at each step, {"n": step, "jpg": base64}
     saved: dict = {}         # from "Past results": the signed result the phone kept, instead of the one in memory
+    report: bool = False     # also say which ids are dealt with ("done": sent now or before) and which wait (daily limit)
 
 
 # Step pictures, kept only in memory and only for the AI fixer: never put on GitHub (the repository is public and the
@@ -3004,27 +3015,72 @@ def _unseal(install_id: str, saved: dict):
     return s
 
 
+class WatchReview(BaseModel):
+    have: list[int] = []     # developer phones: the steps the phone has a picture of
+    shots: list[dict] = []   # the pictures the server asked for, {"n": step, "jpg": base64}; used for the review only
+
+
+REVIEW_PICS = 12
+
+
+def _review_wants(s: dict, have: list) -> list:
+    """The pictures that help the review most: each problem's step and the step before it, then the last steps."""
+    have = {n for n in have if isinstance(n, int) and 0 < n <= 120}
+    want = []
+    for p in s["problems"]:
+        for n in (p["step"], p["step"] - 1):
+            if n in have and n not in want:
+                want.append(n)
+    for st in reversed(s["steps"]):
+        if len(want) >= REVIEW_PICS:
+            break
+        if st["n"] in have and st["n"] not in want:
+            want.append(st["n"])
+    return sorted(want[:REVIEW_PICS])
+
+
+def _review_pics(shots: list) -> list:
+    out = []
+    for x in shots[:REVIEW_PICS]:
+        n, jpg = (x.get("n"), x.get("jpg")) if isinstance(x, dict) else (None, None)
+        if isinstance(n, int) and 0 < n <= 120 and isinstance(jpg, str) and 100 < len(jpg) <= 400_000 and _B64.match(jpg[:2000]):
+            out.append((n, jpg))
+    return sorted(out)
+
+
 @app.post("/watch/review")
-async def watch_review(x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_tester: str = Header(default="")):
-    """After a guide on a developer phone: the problems, each with what went wrong and how to fix it, for the pop-up."""
+async def watch_review(body: WatchReview = WatchReview(), x_app_token: str = Header(default=""), x_install_id: str = Header(default=""),
+                       x_tester: str = Header(default="")):
+    """After a guide on a developer phone: the problems, each with what went wrong and how to fix it, for the pop-up.
+    With step pictures on the phone: first the server answers which pictures it wants ("want"); the phone asks again with
+    them, and the AI review looks at them. They are used for this review only and not kept (Allow sends them for keeps)."""
     install_id = _check(x_app_token, x_install_id)
     s = _sessions.get(install_id)
     if x_tester != "1" or not s or not (s["steps"] or s.get("changes")):
         return {"problems": []}
     if s["review"] is None:
         day = install_id + _today()
+        ai = s["steps"] and _review_day[day] < 40 and not _over_budget()
+        if ai and body.have and not body.shots:
+            want = _review_wants(s, body.have)
+            if want:
+                return {"problems": [], "want": want}
         if not s["steps"]:
             s["review"] = []
-        elif _review_day[day] >= 40 or _over_budget():
-            s["review"] = [dict(_rule_card(p), id=_hash("%s|%s" % (p["kind"], p["step"]), 8)) for p in s["problems"]][:6]
+        elif not ai:
+            s["review"] = [dict(_rule_card(p), id=_hash("%s|%s" % (p["kind"], p["step"]), 8)) for p in s["problems"]]
         else:
             _review_day[day] += 1
-            s["review"] = await _watch_review_cards(s)
+            pics = _review_pics(body.shots)
+            if pics:
+                STATS["review_pictures"] += len(pics)
+            s["review"] = await _watch_review_cards(s, pics)
         s["review"] = [c for c in s["review"] if c.get("kind") != "change"] + _change_cards(s)
     ps = [dict({k: c[k] for k in ("id", "step", "title", "what", "fix")}, kind=c["kind"] if c["kind"] in ("change", "idea") else "problem")
           for c in s["review"]]
     out = {"problems": ps}
     if ps:
+        out["limits"] = {"problems": AI_WATCH_PER_DAY, "changes": AI_CHANGE_PER_DAY}
         out["saved"] = _seal(install_id, s)
         out["title"] = (("Test of %s" % s.get("app", "the app")) if s.get("kind") == "test" else "Guide") + \
             ((": " + s["goal"][:60]) if s["goal"] else "")
@@ -3050,8 +3106,17 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
     repo = s.get("repo") or AI_FIX_REPO   # "Test an app": that app's repository
     if not _repo_ok(repo):
         return {"sent": 0, "skipped": len(body.ids), "error": "Add %s to AI_FIX_REPOS on Render, and to the GitHub token, first." % repo}
-    chosen = [c for c in s["review"] if c["id"] in set(body.ids[:16]) and not c.get("sent")]
+    asked = set(body.ids[:20])
+    chosen = [c for c in s["review"] if c["id"] in asked and not c.get("sent")]
     sent, skipped = 0, 0
+    done = [c["id"] for c in s["review"] if c["id"] in asked and c.get("sent")]   # sent before, from this list
+    wait = []
+
+    def reply():
+        out = {"sent": sent, "skipped": skipped}
+        if body.report:
+            out.update(done=done, wait=wait)
+        return out
     try:
         recent = await _github("GET", "/repos/%s/issues?labels=%s&state=all&sort=created&direction=desc&per_page=50"
                                % (repo, AI_FIX_LABEL), None)
@@ -3073,12 +3138,13 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
             marker = "<!-- change-id: %s -->" % cid
             if any(marker in (i.get("body") or "") for i in asks) or asked_today >= AI_CHANGE_PER_DAY:
                 skipped += 1; STATS["change_skipped"] += 1
+                (done if any(marker in (i.get("body") or "") for i in asks) else wait).append(c["id"])
                 continue
             try:
                 title, text = _change_issue(s, c, {x["n"] for x in _shots.get(sid, {}).get("shots", [])})
                 issue = await _github("POST", "/repos/%s/issues" % repo, {"title": title, "body": text + pics + "\n" + marker})
                 await _github("POST", "/repos/%s/issues/%d/labels" % (repo, issue["number"]), {"labels": [AI_FIX_LABEL]})
-                c["sent"] = issue["number"]; sent += 1; asked_today += 1
+                c["sent"] = issue["number"]; sent += 1; asked_today += 1; done.append(c["id"])
                 asks.append({"body": marker})
                 STATS["change_issues"] += 1
             except Exception as e:
@@ -3090,18 +3156,19 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
         marker = "<!-- watch-id: %s -->" % wid
         if any(marker in (i.get("body") or "") for i in mine) or today >= AI_WATCH_PER_DAY:
             skipped += 1; STATS["watch_skipped"] += 1
+            (done if any(marker in (i.get("body") or "") for i in mine) else wait).append(c["id"])
             continue
         try:
             title, text = _watch_issue(s, c)
             issue = await _github("POST", "/repos/%s/issues" % repo, {"title": title, "body": text + pics + "\n" + marker})
             await _github("POST", "/repos/%s/issues/%d/labels" % (repo, issue["number"]), {"labels": [AI_FIX_LABEL]})
-            c["sent"] = issue["number"]; sent += 1; today += 1
+            c["sent"] = issue["number"]; sent += 1; today += 1; done.append(c["id"])
             mine.append({"body": marker})
             STATS["watch_issues"] += 1
         except Exception as e:
             STATS["ai_fix_errors"] += 1; skipped += 1
             log.warning("Watcher issue not opened: %s", str(e)[:200])
-    return {"sent": sent, "skipped": skipped}
+    return reply()
 
 
 @app.get("/privacy", response_class=HTMLResponse)

@@ -18,3 +18,7 @@ each repository with AI_FIX_REPOS (comma-separated, "owner/name"), and add it to
 Past results (developer phones): each pop-up is also kept on the phone with a signed copy, so Allow still works up to
 30 days later, even after the server restarted. The signature uses WATCH_SECRET if set, otherwise the GITHUB_TOKEN
 (so a new GITHUB_TOKEN makes older saved results unsendable; run the test again).
+
+Review pictures (developer phones, the owner agreed on 2 Nov): before the pop-up, the phone sends up to 12 of its step
+pictures (the problem steps and the step before each) so the AI review can see what was really on the screen. They are
+used for that review only and not kept; Allow sends them again for the AI fixer, kept 48 hours as before.

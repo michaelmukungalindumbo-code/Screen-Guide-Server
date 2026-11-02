@@ -101,5 +101,5 @@ run(main.event(main.Event(event="start", guide="ai"), **H5))
 step("Scan Document", SCAN, DRIVE, h=H5)
 main._claude_client = Client([json.dumps({"problems": []})])
 assert run(main.watch_review(**H5)) == {"problems": []}
-assert main.SERVER_VERSION == "0.58"
+assert main.SERVER_VERSION >= "0.58"
 print("v58 ok")

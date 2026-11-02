@@ -50,12 +50,14 @@ REV = json.dumps({"problems": [{"step": 3, "kind": "no_point", "title": "Said bl
 main._claude_client = Client([REV])
 ps = run(main.watch_review(x_app_token="tok", x_install_id="dev54", x_tester="1"))["problems"]
 titles = [p["title"] for p in ps]
-assert titles == ["Step 1 did not work", "Said black screen on step 3", "Stopped at step 3"], titles
+# Server 0.59: a rule's title stays (it is the fact); the AI's explanation is added to what happened
+assert titles == ["Step 1 did not work", "Could not point on step 3", "Stopped at step 3"], titles
+assert "but it said the screen was black" in ps[1]["what"] and ps[1]["fix"] == "Trust the words."
 assert "0977" not in json.dumps(ps) and "#" in ps[1]["what"]
 out = run(main.watch_send(main.WatchSend(ids=[ps[1]["id"]]), x_app_token="tok", x_install_id="dev54", x_tester="1"))
 assert out == {"sent": 1, "skipped": 0}, out
 t, b = issues[0]["title"], issues[0]["body"]
-assert t.startswith("Guide problem: Said black screen on step 3"), t
+assert t.startswith("Guide problem: Could not point on step 3"), t
 # Every step's screen is in the issue, Help is shown where it was pressed, and the picture is mentioned
 assert "1. said: Tap “Scan Document” to start scanning your paper." in b and "**then the person pressed Help: “pressed Help”**" in b, b
 assert "(answer after Help)" in b and "with a screen picture" in b

@@ -61,7 +61,9 @@ REV = json.dumps({"problems": [
     {"step": 2, "kind": "help_repeated", "title": "Help said the same thing", "what": "They said they did not understand and heard the same words.", "fix": "Explain where Wi-Fi is on the screen."},
     {"step": 1, "kind": "review", "title": "Goal names a person", "what": "The goal mentions Mary, which does not matter here.", "fix": "Ignore names in the goal."}]})
 ps = review("devphone1", [REV])
-assert [p["title"] for p in ps] == ["Help said the same thing", "Could not point on step 3", "Goal names a person"], ps
+# Server 0.59: the rule's title stays (it is the fact); the AI's words explain it and say how to fix it
+assert [p["title"] for p in ps] == ["Help repeated itself", "Could not point on step 3", "Goal names a person"], ps
+assert ps[0]["what"].endswith("They said they did not understand and heard the same words.") and ps[0]["fix"] == "Explain where Wi-Fi is on the screen."
 assert all(p["id"] and p["what"] and p["fix"] for p in ps)
 assert "Mary" not in json.dumps(ps)
 assert review("devphone1") == ps            # asked again: the same answer, no second AI call
@@ -73,7 +75,7 @@ assert out == {"sent": 2, "skipped": 0}, out
 assert [p for p in posts if p.endswith("/labels")] == ["/repos/michaelmukungalindumbo-code/Screen-Guide/issues/60/labels",
                                                        "/repos/michaelmukungalindumbo-code/Screen-Guide/issues/61/labels"]
 b = issues[0]["body"]
-assert issues[0]["title"].startswith("Guide problem: Help said the same thing"), issues[0]["title"]
+assert issues[0]["title"].startswith("Guide problem: Help repeated itself"), issues[0]["title"]
 assert "tapped **Allow**" in b and "**→** 2." in b and "Explain where Wi-Fi is" in b and '"… [tap]"' in b and "<!-- watch-id: " in b
 assert "Mum" not in b and "0977" not in b and "Mary" not in b and "devphone" not in b, b       # nothing personal reaches GitHub
 assert send("devphone1", [ps[0]["id"]]) == {"sent": 0, "skipped": 0}      # already sent
