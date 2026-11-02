@@ -22,7 +22,7 @@ async def fake_github(method, path, payload):
 main._github = fake_github
 J = lambda label, say: json.dumps({"label": label, "say": say, "done": False, "x": None, "y": None, "look_for": None})
 def step(out, labels, **kw):
-    main._claude_client = Client([out])
+    main._claude_client = Client([out, out])  # the same answer twice: since server 0.61 a black-screen answer is asked again without the picture
     return run(main.next_step(main.Next(goal="Scan a document with the Drive app", labels=labels, **kw), x_app_token="tok", x_install_id="dev55", x_tester="1"))
 
 run(main.event(main.Event(event="start", guide="ai"), x_app_token="tok", x_install_id="dev55", x_tester="1"))

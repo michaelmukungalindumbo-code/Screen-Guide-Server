@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "49"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "50"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.60"
+SERVER_VERSION = "0.61"
 
 
 @app.get("/health")
@@ -906,6 +906,9 @@ _FINISHED = [(re.compile(r"\bupload"), re.compile(r"\b(\d+ )?uploads? (complete|
              (re.compile(r"\binstall"), re.compile(r"^uninstall$"))]
 _SCAN_GOAL = re.compile(r"\bscan", re.I)
 _UPLOADING_SAY = re.compile(r"\buploading\b", re.I)
+# "The screen is black right now": what the AI says when the app blocked the screen picture
+_BLACK_SAY = re.compile(r"\b(screen|picture|display|phone)\b[^.]{0,40}\b(is|looks|appears|seems|was|went)\b[^.]{0,20}\b(black|dark|blank|empty)\b"
+                        r"|\b(black|blank|dark) (screen|picture)\b", re.I)
 _DONE_SAY = {"en": "Done! It worked. You did it yourself.", "ny": "Zabwino! Zatheka. Mwachita nokha.", "bem": "Nawamya! Capwa. Mwacita nemwe bene."}
 _TAP_WORD = {"en": "Tap \u201c%s\u201d.", "ny": "Dinani \u201c%s\u201d.", "bem": "Kandeni \u201c%s\u201d."}
 
@@ -1132,6 +1135,15 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     system = NEXT_SYSTEM.format(language=LANGS[lang]) + (SHOT_NOTE if image else "")
     t0 = time.time()
     text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
+    # A blocked (black) picture must never beat the screen words. Seen 1 and 2 Nov: Drive's Upload screen had Cancel and
+    # Upload, the picture came back black, and the guide said "The screen is black" instead of "Tap Upload". Ask again
+    # with the words only, telling the AI why the picture was black. Any app that blocks pictures gets the same help.
+    taps = sum(1 for l in labels if l.rstrip().lower().endswith(("[tap]", "[switch]")))
+    if image and taps >= 2 and isinstance(data, dict) and _BLACK_SAY.search(str(data.get("say") or "")):
+        STATS["black_picture_ignored"] += 1
+        user += ("\nThe screen picture came back black only because this app blocks pictures. The screen is not black: "
+                 "<screen_words> is what is really on it. Never say the screen is black.")
+        text, data = await _ai_json(NEXT_SYSTEM.format(language=LANGS[lang]), user, None, "step", NEXT_SCHEMA, _valid_next)
     ai_empty = not isinstance(data, dict) or not data
     data = data if isinstance(data, dict) else {}
     label = _match_label(data.get("label"), labels)   # must be a real item on screen
