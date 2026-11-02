@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "48"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "49"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.59"
+SERVER_VERSION = "0.60"
 
 
 @app.get("/health")
@@ -821,6 +821,7 @@ Rules:
 - If the goal is to check or see something and the screen already shows the answer, say what it shows in a few words, use label null and set done true. Never point at a switch just to show its state: a tap would change it.
 - <user_note> may say what the person just did on the phone (scrolled the list, typed in a box). Use it to understand the new screen.
 - <device> tells you the phone maker and whether it is a phone or a tablet. Menu names and places differ by maker. On a tablet, an app's main buttons are often in a list down the side instead of a bar at the bottom.
+- After a scan is uploaded, Drive shows its file list again, with the new "Scanned" PDF files in it. That means the upload is finished: set done true. Never say "wait, it is uploading" twice in a row.
 - In the camera, some buttons appear only when it sees something (Scan for a document, a link for a QR code). If the goal needs one and it is not in <screen_words>, use label null and say: Hold the camera still over the paper. Opening the camera does not finish the goal."""
 
 SHOT_NOTE = """
@@ -903,6 +904,8 @@ _PICK_FILE = {"en": "Tap the file you want to upload.", "ny": "Dinani fayilo ime
 _FINISHED = [(re.compile(r"\bupload"), re.compile(r"\b(\d+ )?uploads? (complete|completed|finished|done)\b|\b(file|video|photo|\d+ files?) uploaded\b|\buploaded successfully\b|\bsuccessfully uploaded\b|\bupload successful\b")),
              (re.compile(r"\b(post|publish)"), re.compile(r"\b(posted|published|your post is live|post shared)\b")),
              (re.compile(r"\binstall"), re.compile(r"^uninstall$"))]
+_SCAN_GOAL = re.compile(r"\bscan", re.I)
+_UPLOADING_SAY = re.compile(r"\buploading\b", re.I)
 _DONE_SAY = {"en": "Done! It worked. You did it yourself.", "ny": "Zabwino! Zatheka. Mwachita nokha.", "bem": "Nawamya! Capwa. Mwacita nemwe bene."}
 _TAP_WORD = {"en": "Tap \u201c%s\u201d.", "ny": "Dinani \u201c%s\u201d.", "bem": "Kandeni \u201c%s\u201d."}
 
@@ -1151,6 +1154,11 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             STATS["finished_seen"] += 1
             done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
             break
+    # Back on Drive's file list after the Upload screen: the scan is saved. Seen, the guide kept saying "uploading, wait".
+    if (not done and _SCAN_GOAL.search(goal) and any(_UPLOADING_SAY.search(h) for h in history) and "my drive" in low_words
+            and any(w in low_words for w in ("scan document", "create new")) and "upload" not in low_words and "cancel" not in low_words):
+        STATS["scan_saved_seen"] += 1
+        done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
     # "Tap the + button" with no label: use the + button's own name when it is on screen.
     if not done and not label and _PLUS_SAY.search(say) and not (image and data.get("x") is not None):
         plus = next((p for p, l in zip(plain_all, labels) if _PLUS_NAME.match(p) and not l.rstrip().lower().endswith("[text]")), None)

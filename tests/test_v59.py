@@ -102,5 +102,5 @@ run(main.next_step(main.Next(goal="Scan", labels=DRIVE, note="Where?", stuck=Tru
 main._review_day["dev59c" + main._today()] = 40
 r = run(main.watch_review(main.WatchReview(have=[1]), **H3))
 assert [p["title"] for p in r["problems"]] == ["Needed Help on step 1"] and "want" not in r, r
-assert main.SERVER_VERSION >= "0.59" and main.PROMPT_VERSION == "48"
+assert main.SERVER_VERSION >= "0.59" and int(main.PROMPT_VERSION) >= 48
 print("v59 ok")
