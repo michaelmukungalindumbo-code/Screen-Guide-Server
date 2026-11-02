@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.62"
+SERVER_VERSION = "0.63"
 
 
 @app.get("/health")
@@ -3176,6 +3176,13 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
         log.warning("Watcher could not read GitHub: %s", str(e)[:160])
         return {"sent": 0, "skipped": len(chosen), "error": "GitHub could not be reached. Try again later."}
     mine = [i for i in recent if "<!-- watch-id: " in (i.get("body") or "")]
+    # "Sent before" means still open. A closed issue was fixed: if the same problem comes back, it is sent again, as a
+    # problem that came back after that fix (otherwise a fix that did not hold would never be reported).
+    def is_open(i): return i.get("state", "open") == "open"
+    def again(marker, pool):
+        old = next((i for i in pool if marker in (i.get("body") or "") and not is_open(i) and i.get("number")), None)
+        return ("\n**This came back:** the same problem was reported in #%d, which was closed as fixed. The fix may not have "
+                "worked for this screen.\n" % old["number"]) if old else ""
     today = sum(1 for i in mine if str(i.get("created_at", "")).startswith(time.strftime("%Y-%m-%d", time.gmtime())))
     asks = [i for i in recent if "<!-- change-id: " in (i.get("body") or "")]
     asked_today = sum(1 for i in asks if str(i.get("created_at", "")).startswith(time.strftime("%Y-%m-%d", time.gmtime())))
@@ -3188,9 +3195,9 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
         if c["kind"] in ("change", "idea"):
             cid = _hash("%s|%s|%s" % (c["kind"], _key(s["goal"]), _key((c.get("change") or {}).get("text") or c["title"])), 16)
             marker = "<!-- change-id: %s -->" % cid
-            if any(marker in (i.get("body") or "") for i in asks) or asked_today >= AI_CHANGE_PER_DAY:
+            if any(marker in (i.get("body") or "") and is_open(i) for i in asks) or asked_today >= AI_CHANGE_PER_DAY:
                 skipped += 1; STATS["change_skipped"] += 1
-                (done if any(marker in (i.get("body") or "") for i in asks) else wait).append(c["id"])
+                (done if any(marker in (i.get("body") or "") and is_open(i) for i in asks) else wait).append(c["id"])
                 continue
             try:
                 title, text = _change_issue(s, c, {x["n"] for x in _shots.get(sid, {}).get("shots", [])})
@@ -3206,13 +3213,13 @@ async def watch_send(body: WatchSend, x_app_token: str = Header(default=""), x_i
         shown = next((st for st in s["steps"] if st["n"] == c["step"]), None)
         wid = _hash("%s|%s|%s" % (c["kind"], _key(s["goal"]), _hash("|".join(sorted({_key(x) for x in (shown or {}).get("screen", [])})), 10)), 16)
         marker = "<!-- watch-id: %s -->" % wid
-        if any(marker in (i.get("body") or "") for i in mine) or today >= AI_WATCH_PER_DAY:
+        if any(marker in (i.get("body") or "") and is_open(i) for i in mine) or today >= AI_WATCH_PER_DAY:
             skipped += 1; STATS["watch_skipped"] += 1
-            (done if any(marker in (i.get("body") or "") for i in mine) else wait).append(c["id"])
+            (done if any(marker in (i.get("body") or "") and is_open(i) for i in mine) else wait).append(c["id"])
             continue
         try:
             title, text = _watch_issue(s, c)
-            issue = await _github("POST", "/repos/%s/issues" % repo, {"title": title, "body": text + pics + "\n" + marker})
+            issue = await _github("POST", "/repos/%s/issues" % repo, {"title": title, "body": text + again(marker, mine) + pics + "\n" + marker})
             await _github("POST", "/repos/%s/issues/%d/labels" % (repo, issue["number"]), {"labels": [AI_FIX_LABEL]})
             c["sent"] = issue["number"]; sent += 1; today += 1; done.append(c["id"])
             mine.append({"body": marker})
