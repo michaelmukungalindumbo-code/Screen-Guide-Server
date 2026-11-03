@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "51"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "52"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.64"
+SERVER_VERSION = "0.65"
 
 
 @app.get("/health")
@@ -913,6 +913,8 @@ _BLACK_SAY = re.compile(r"\b(screen|picture|display|phone)\b[^.]{0,40}\b(is|look
 _MAIN_BUTTON = re.compile(r"^(upload|save|done|next|ok|send|continue|finish|confirm|post|share|submit|install|allow|accept)$", re.I)
 # Watcher: instructions that need something pointed at. "Hold the camera still" or "do not tap anything yet" do not.
 _POINT_ACTION = re.compile(r"\b(tap|press|choose|select|type|open|turn|pick|slide|dinani|kandeni|sankhani|lembani)\b", re.I)
+# "Tap the video you want": the person chooses; ScreenGuide never points at one of their own items for them
+_YOUR_CHOICE = re.compile(r"\b(you want|you need|of your choice|your own)\b", re.I)
 _NEGATED = re.compile(r"\b(do not|don['’]?t|never|without)\s+(\w+\s+)?\w+", re.I)
 _DONE_SAY = {"en": "Done! It worked. You did it yourself.", "ny": "Zabwino! Zatheka. Mwachita nokha.", "bem": "Nawamya! Capwa. Mwacita nemwe bene."}
 _TAP_WORD = {"en": "Tap \u201c%s\u201d.", "ny": "Dinani \u201c%s\u201d.", "bem": "Kandeni \u201c%s\u201d."}
@@ -1144,11 +1146,16 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     # Upload, the picture came back black, and the guide said "The screen is black" instead of "Tap Upload". Ask again
     # with the words only, telling the AI why the picture was black. Any app that blocks pictures gets the same help.
     taps = sum(1 for l in labels if l.rstrip().lower().endswith(("[tap]", "[switch]")))
+    image_blocked = False
     if image and taps >= 2 and isinstance(data, dict) and _BLACK_SAY.search(str(data.get("say") or "")):
         STATS["black_picture_ignored"] += 1
+        image_blocked = True   # the picture shows nothing: never ask it where something is
         user += ("\nThe screen picture came back black only because this app blocks pictures. The screen is not black: "
                  "<screen_words> is what is really on it. Never say the screen is black.")
-        text, data = await _ai_json(NEXT_SYSTEM.format(language=LANGS[lang]), user, None, "step", NEXT_SCHEMA, _valid_next)
+        try:   # a second try that fails keeps the first answer (corrected just below): the step never fails because of it
+            text, data = await _ai_json(NEXT_SYSTEM.format(language=LANGS[lang]), user, None, "step", NEXT_SCHEMA, _valid_next)
+        except HTTPException:
+            STATS["second_try_failed"] += 1
         # Seen 3 Nov: it still said "The screen looks black" for Drive's Upload screen. Then point at the screen's main
         # button ourselves, or at least never tell them the screen is black.
         if isinstance(data, dict) and _BLACK_SAY.search(str(data.get("say") or "")):
@@ -1158,12 +1165,21 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
                         say=(_TAP_WORD.get(lang, _TAP_WORD["en"]) % btn) if btn else "Look at the buttons on this screen and tap the one for your next step.")
     # A button the AI can see in the picture but that is not in the screen words (Google's scanner hides its words: seen
     # 1-3 Nov, "Tap Next" with nothing pointed at, three times). Ask once more for where it is in the picture.
+    # Also a tap with no name at all (3 Nov: "tap the big round button" in the scanner, nothing pointed at).
     named = str(data.get("label") or "").strip() if isinstance(data, dict) else ""
-    if image and named and data.get("x") is None and not _match_label(named, labels):
+    said = str(data.get("say") or "") if isinstance(data, dict) else ""
+    unpointed = (isinstance(data, dict) and not data.get("done") and data.get("x") is None and _POINT_ACTION.search(_NEGATED.sub("", said))
+                 and ((named and not _match_label(named, labels)) or (not named and not _label_from_say(said, labels))))
+    if (image and unpointed and not image_blocked and not _gallery(labels)[0] and not _YOUR_CHOICE.search(said)
+            and not _BLACK_SAY.search(said)):
         STATS["point_from_picture_asked"] += 1
-        _, again = await _ai_json(system, user + "\n\u201c%s\u201d is not in <screen_words>: this app hides its words. If you can see it "
-                                  "in the picture, set label null and give its centre as x and y." % _safe(named, 40),
-                                  [image], "step+picture", NEXT_SCHEMA, _valid_next)
+        ask = (("\u201c%s\u201d is not in <screen_words>: this app hides its words." % _safe(named, 40)) if named
+               else "Nothing in <screen_words> is the thing to tap: this app hides its words.")
+        try:   # only a better answer is taken; a failed try keeps the first one
+            _, again = await _ai_json(system, user + "\n" + ask + " If you can see it in the picture, set label null and give its centre as x and y.",
+                                      [image], "step+picture", NEXT_SCHEMA, _valid_next)
+        except HTTPException:
+            again = None; STATS["second_try_failed"] += 1
         if isinstance(again, dict) and _fraction(again.get("x")) is not None and _fraction(again.get("y")) is not None:
             STATS["point_from_picture"] += 1
             data = dict(again, label=None)
@@ -2700,7 +2716,7 @@ Return JSON: {"problems": [{"step", "kind", "title", "what", "fix"}]}.
 - "help_after" on a step means the person pressed Help while that step was shown; the next step ("stuck": true) is ScreenGuide's answer to that Help.
 - For a problem the rules noticed, keep its meaning: explain why it happened on that step. Never turn it into a different problem.
 - Pictures of some steps may be attached; <pictures> lists their step numbers in order. They show what was really on the screen, with ScreenGuide's ring, card and buttons on top. Trust them over the screen words and over what ScreenGuide said: if a picture shows a button that ScreenGuide said was not there, or a screen it called black, say what was really there. A picture can only come back black if the app blocked it; then the words decide. Never write names, messages, numbers or anything personal you see in a picture.
-- A screen picture can come back black (some apps block pictures). If a step's screen words show buttons, that screen was not black.
+- A screen picture can come back black (some apps block pictures; Drive's Upload screen does). If a step's screen words show buttons, that screen was not black. Never describe a screen from a black picture (not as a camera view either): use its words.
 - You may also add up to 2 improvement ideas, with kind "idea": a small, specific change that would make this guide easier for a first-time smartphone user (clearer or shorter words, pointing earlier, one step fewer). Only real ideas from these steps."""
 
 
@@ -2882,6 +2898,28 @@ def _test_issue(s: dict, c: dict) -> tuple:
                c["what"], c["fix"], s.get("device") or "unknown", s.get("lang", "en"), "\n".join(lines) or "(no screens)",
                ("screen %s" % c["step"]) if shown else "the end", json.dumps(shown["screen"] if shown else [], ensure_ascii=False, indent=0)[:3000]))
     return title, body[:60000]
+
+
+class WatchSlow(BaseModel):
+    step: int = 0    # the step whose answer was slow (the watcher's number)
+    ms: int = 0      # how long the phone waited for it, network included
+
+
+@app.post("/watch/slow")
+async def watch_slow(body: WatchSlow, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""),
+                     x_tester: str = Header(default="")):
+    """Developer phones: an answer took long as the phone saw it (3 Nov: 20 seconds; the server's own clock said less,
+    so the watcher missed it). Kept as the step's "slow" problem."""
+    install_id = _check(x_app_token, x_install_id)
+    s = _sessions.get(install_id)
+    secs = int(body.ms) // 1000
+    if x_tester != "1" or not s or s["end"] or not (0 < body.step <= len(s["steps"])) or not (10 < secs <= 600):
+        return {"watch": len(s["problems"]) if s and x_tester == "1" else 0}
+    st = s["steps"][body.step - 1]
+    st["phone_secs"] = secs
+    _add_problem(s, "slow", body.step, secs=secs)
+    s["review"] = None
+    return {"watch": len(s["problems"])}
 
 
 class WatchStale(BaseModel):
