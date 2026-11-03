@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.65"
+SERVER_VERSION = "0.66"
 
 
 @app.get("/health")
@@ -872,7 +872,9 @@ def _match_label(label, labels: list[str]):
 def _label_from_say(say: str, labels: list):
     """ "Tap Phone to make a call." -> "Phone", when Phone is a tappable word on screen. Longest name first,
     so "Phone Master" wins only if the instruction says "Phone Master"."""
-    names = sorted({_plain(l) for l in labels if not _TAG.search(l) or not l.rstrip().lower().endswith("[text]")}, key=len, reverse=True)
+    # Never a tab that is already chosen ("[selected]"): 3 Nov, "Tap the video you want" became YouTube's "Video" tab.
+    names = sorted({_plain(l) for l in labels if not _TAG.search(l) or not l.rstrip().lower().endswith(("[text]", "[selected]"))},
+                   key=len, reverse=True)
     for n in names:
         if len(n) >= 2 and re.search(r"\b(tap|press|open|choose|select|dinani|kandeni)\s+(the\s+)?[\"\u201c']?" + re.escape(n) + r"(?![\w])", say, re.I):
             return n
@@ -901,7 +903,9 @@ _FILE_PICKER = ("recent", "images", "audio", "videos", "documents", "downloads",
 _FILE_WORDS = re.compile(r"\b(files?|documents?|photos?|pictures?|videos?|folders?|recent|images|downloads|audio)\b", re.I)
 _PICK_FILE = {"en": "Tap the file you want to upload.", "ny": "Dinani fayilo imene mukufuna.", "bem": "Kandeni pa fayilo mulefwaya."}
 # The screen says the task is finished ("1 upload complete"): seen, the AI went on to "Tap Create new" again.
-_FINISHED = [(re.compile(r"\bupload"), re.compile(r"\b(\d+ )?uploads? (complete|completed|finished|done)\b|\b(file|video|photo|\d+ files?) uploaded\b|\buploaded successfully\b|\bsuccessfully uploaded\b|\bupload successful\b")),
+_FINISHED = [(re.compile(r"\bupload"), re.compile(r"\b(\d+ )?uploads? (complete|completed|finished|done)\b|\b(file|video|photo|\d+ files?) uploaded\b|\buploaded successfully\b|\bsuccessfully uploaded\b|\bupload successful\b"
+                                                    # YouTube after "Upload Short": the upload is under way and goes on by itself (3 Nov)
+                                                    r"|\bsending file\b|\bpreparing \d{1,3} ?%")),
              (re.compile(r"\b(post|publish)"), re.compile(r"\b(posted|published|your post is live|post shared)\b")),
              (re.compile(r"\binstall"), re.compile(r"^uninstall$"))]
 _SCAN_GOAL = re.compile(r"\bscan", re.I)
@@ -1183,6 +1187,21 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         if isinstance(again, dict) and _fraction(again.get("x")) is not None and _fraction(again.get("y")) is not None:
             STATS["point_from_picture"] += 1
             data = dict(again, label=None)
+    # 3 Nov: "Tap Next" on YouTube's Add details screen, which has "Upload Short" and no Next. Ask once more.
+    named = str(data.get("label") or "").strip() if isinstance(data, dict) else ""
+    # Only on a screen whose buttons can clearly be read (3 or more): where an app hides its words (Google's scanner),
+    # "not on this screen" would be wrong, and the picture rule above is the one that helps.
+    if (not image and named and taps >= 3 and not data.get("done") and data.get("x") is None and not _match_label(named, labels)
+            and _POINT_ACTION.search(_NEGATED.sub("", str(data.get("say") or "")))):
+        STATS["missing_button_asked"] += 1
+        try:   # only a better answer is taken; a failed try keeps the first one
+            _, again = await _ai_json(system, user + "\n\u201c%s\u201d is not on this screen. Name the button from <screen_words> exactly as "
+                                      "it is written, or say what to wait for." % _safe(named, 40), None, "step", NEXT_SCHEMA, _valid_next)
+        except HTTPException:
+            again = None; STATS["second_try_failed"] += 1
+        if isinstance(again, dict) and _match_label(again.get("label"), labels):
+            STATS["missing_button_fixed"] += 1
+            data = again
     ai_empty = not isinstance(data, dict) or not data
     data = data if isinstance(data, dict) else {}
     label = _match_label(data.get("label"), labels)   # must be a real item on screen
@@ -1195,7 +1214,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if not asked:
         say = _one_action(say, bool(label))
     told_last = _last_told(history)
-    label, say = _gallery_fix(goal, labels, label, say, lang, explain=asked, told=told_last)
+    label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last)
     done = bool(data.get("done"))
     plain_all = [_plain(l) for l in labels]
     low_words = [p.lower() for p in plain_all]
@@ -2776,6 +2795,16 @@ async def _watch_review_cards(s: dict, pics: list = ()) -> list:
         elif g["kind"] != "idea" and sum(1 for c in cards if c["kind"] == "review") < 3:
             cards.append(dict(g, kind="review"))
             STATS["watch:review"] += 1
+    seen = defaultdict(list)
+    for c in cards:
+        if c["kind"] in _RULE_TEXT:
+            seen[c["kind"]].append(c["step"])
+    where = "test" if s.get("kind") == "test" else "guide"
+    for c in cards:
+        steps = sorted(set(seen.get(c["kind"], [])))
+        if len(steps) >= 2:
+            c["what"] = (c["what"] + " This happened %d times in this %s (steps %s and %s)." % (
+                len(steps), where, ", ".join(map(str, steps[:-1])), steps[-1]))[:520]
     for c in cards:
         c["id"] = _hash("%s|%s|%s" % (c["kind"], c["step"], c["title"]), 8)
     # Every problem the rules saw (at most 12), up to 3 more from the AI, and up to 2 ideas
@@ -3193,6 +3222,9 @@ async def watch_review(body: WatchReview = WatchReview(), x_app_token: str = Hea
     ps = [dict({k: c[k] for k in ("id", "step", "title", "what", "fix")}, kind=c["kind"] if c["kind"] in ("change", "idea") else "problem")
           for c in s["review"]]
     out = {"problems": ps}
+    if ps and s.get("end") == "stop":
+        said = [t["n"] for t in s["steps"] if t["say"]]
+        out["stopped"] = said[-1] if said else len(s["steps"])
     if ps:
         out["limits"] = {"problems": AI_WATCH_PER_DAY, "changes": AI_CHANGE_PER_DAY}
         out["saved"] = _seal(install_id, s)
