@@ -43,7 +43,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "52"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "53"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.66"
+SERVER_VERSION = "0.67"
 
 
 @app.get("/health")
@@ -2756,7 +2756,8 @@ async def _watch_review_cards(s: dict, pics: list = ()) -> list:
     if s.get("kind") == "test":
         user = "<test app=\"%s\">%s</test>\n" % (_safe(s.get("app", ""), 40), "A developer used this app while ScreenGuide watched each "
                "screen%s. Steps are screens; \"say\" is ScreenGuide's instruction only when it was guiding." %
-               (" and guided them through the goal" if s["goal"] else ""))
+               (" and guided them through the goal" if s["goal"] else
+                ". No goal was set, so ScreenGuide was watching only and gave no instructions: that is normal, never report missing guidance"))
     else:
         user = ""
     user += "<goal>%s</goal>\n<steps>\n%s\n</steps>\n<rules_noticed>\n%s\n</rules_noticed>" % (
@@ -2780,6 +2781,9 @@ async def _watch_review_cards(s: dict, pics: list = ()) -> list:
     for g in got:
         if not isinstance(g, dict) or not str(g.get("title", "")).strip():
             continue
+        if s.get("kind") == "test" and not s["goal"] and re.search(r"(?i)\b(guidance|instruction|goal)\b", str(g.get("title", ""))) \
+                and re.search(r"(?i)\b(no|without|missing|empty|never|not)\b", str(g.get("title", "")) + " " + str(g.get("what", ""))):
+            continue   # no goal means watching only: nothing was meant to be said
         g = {k: _clean_text(str(g.get(k, "")), 300 if k != "title" else 80, ours=True) for k in ("title", "what", "fix")} | \
             {"step": int(g.get("step") or 0) if str(g.get("step", "")).isdigit() else 0, "kind": str(g.get("kind", "review"))[:20]}
         same = next((c for c in cards if c["kind"] == g["kind"] and c["step"] == g["step"] and c["kind"] in _RULE_TEXT), None)
