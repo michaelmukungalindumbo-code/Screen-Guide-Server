@@ -528,7 +528,7 @@ SERVER_VERSION = "0.71"
 @app.get("/health")
 async def health():
     try:
-        digest_soon()   # visited every 10 minutes by the keep-awake service: on Monday mornings, the weekly users issue
+        digest_soon()   # phones visit /health when ScreenGuide opens: on Monday mornings, the weekly users issue
     except Exception as e:
         log.warning("Weekly users issue check failed: %s", str(e)[:160])
     return {"ok": True}
@@ -2098,7 +2098,7 @@ async def admin_pause(key: str = "", rule: str = "", on: str = "1"):
 
 
 # ---- The Mother Ship's weekly look at users (Performance -> Diagnostics and Innovation). Every Monday from 07:00
-# (Zambia time) one GitHub issue says where users got stuck in the last 7 days, compared with the week before, how each
+# (Zambia time; at the first visit after that, when a phone opens ScreenGuide) one GitHub issue says where users got stuck in the last 7 days, compared with the week before, how each
 # server version did, and which staged rules paused. It has no fixer label: the AI fixer looks at a screen only when the
 # owner replies `@claude look at 2`. Nothing is sent in a week with fewer than DIGEST_MIN_STEPS steps.
 DIGEST_MIN_STEPS = 20
@@ -3516,6 +3516,11 @@ async def watch_slow(body: WatchSlow, x_app_token: str = Header(default=""), x_i
     st = s["steps"][body.step - 1]
     st["phone_secs"] = secs
     old = next((p for p in s["problems"] if p["kind"] == "slow" and p["step"] == body.step), None)
+    # The free server was waking up (it had just started) and its own part was quick: a known cost of the free plan
+    # that the owner accepted on 4 Nov, not something to fix. The phone already says "Waking up the helper".
+    if not old and st.get("up") is not None and st["up"] < 180 and st.get("secs", 0) <= 10:
+        STATS["slow_waking_not_reported"] += 1
+        return {"watch": len(s["problems"])}
     if old:   # the server's own clock saw it first: keep one problem, with the time the person really waited
         old.update(secs=max(old["secs"], secs), where=_slow_where(st))
     else:

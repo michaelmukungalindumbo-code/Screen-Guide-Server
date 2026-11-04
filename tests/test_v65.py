@@ -41,6 +41,7 @@ assert "Never describe a screen from a black picture (not as a camera view eithe
 
 # Slow answers as the phone saw them (3 Nov: 20 seconds, network and a waking server included; the watcher missed it)
 H = dict(H, x_install_id="dev65s")
+main.STARTED -= 3600   # v0.71: the server had been awake (a wait only from waking up is not reported since 4 Nov)
 run(main.event(main.Event(event="start", guide="ai"), **H))
 step([J("Upload", "Tap “Upload”.")], UPLOAD, image="", h=H)
 assert run(main.watch_slow(main.WatchSlow(step=1, ms=20200), **H)) == {"watch": 1}

@@ -95,3 +95,19 @@ pp = run(main.privacy())
 assert "Test phones are not counted" in str(getattr(pp, "body", pp) if not isinstance(getattr(pp, "body", None), bytes) else pp.body.decode())
 assert main.SERVER_VERSION >= "0.71"
 print("real-user counts kept")
+
+# 4 Nov: the owner stays on the free plan and accepts the wait while the server wakes up. A slow answer on a test phone
+# is then not reported when the server had just started and its own part was quick; any other slow answer still is.
+main.DATABASE_URL = ""; main.UPSTASH_URL = ""
+H = dict(x_app_token="tok", x_install_id="dev71w", x_tester="1")
+run(main.event(main.Event(event="start", guide="ai"), **H))
+main.STARTED = main.time.time() - 20                                   # the server started 20 seconds ago
+main._claude_client = Client([J("Videos", "Tap “Videos”.")])
+run(main.next_step(main.Next(goal="Upload a video in the YouTube app", labels=GAL), **H))
+assert run(main.watch_slow(main.WatchSlow(step=1, ms=35000), **H)) == {"watch": 0}
+assert not main._sessions["dev71w"]["problems"]
+main.STARTED = main.time.time() - 3600                                 # awake for an hour: the wait was the network
+main._claude_client = Client([J("Videos", "Tap “Videos”.")])
+run(main.next_step(main.Next(goal="Upload a video in the YouTube app", labels=GAL), **H))
+assert run(main.watch_slow(main.WatchSlow(step=2, ms=35000), **H)) == {"watch": 1}
+print("waking up is not reported")
