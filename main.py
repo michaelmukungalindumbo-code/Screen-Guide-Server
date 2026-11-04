@@ -512,7 +512,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.67"
+SERVER_VERSION = "0.68"
 
 
 @app.get("/health")
@@ -2688,7 +2688,10 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     k = _key(say)
     if k and not stuck and not any(p["kind"] in ("repeat", "loop") and _key(p.get("note", "")) == k for p in s["problems"]):
         said = [t for t in s["steps"][:-1] if t["say"]]
-        back = next((t for t in reversed(said[:-1]) if _key(t["say"]) == k), None)
+        # Only when the screen is the same as then: a changed screen (a new video in the gallery after the picker's
+        # Done, 4 Nov) means the person moved forward and the same words are right again.
+        now = {_key(w) for w in step["screen"]}
+        back = next((t for t in reversed(said[:-1]) if _key(t["say"]) == k and {_key(w) for w in t["screen"]} == now), None)
         if said and _key(said[-1]["say"]) == k and tapped and not any(p["kind"] == "loop" and p["step"] == n for p in s["problems"]):
             _add_problem(s, "repeat", n, n0=said[-1]["n"], note=step["say"][:90])
         elif back and said and _key(said[-1]["say"]) != k and not note.strip():
