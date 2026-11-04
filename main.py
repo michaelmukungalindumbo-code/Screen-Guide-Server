@@ -522,7 +522,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.71"
+SERVER_VERSION = "0.72"
 
 
 @app.get("/health")
@@ -1520,14 +1520,24 @@ async def event(body: Event, x_app_token: str = Header(default=""), x_install_id
 
 
 # ---- Accounts (optional): sign in with Google. Settings, learned tasks and the Plus plan follow the person to a new
-# phone. Chats are never sent here; they stay on the phone. Needs GOOGLE_CLIENT_ID, DATABASE_URL and ADMIN_KEY on Render.
+# phone. Chats are never sent here; they stay on the phone. Needs GOOGLE_CLIENT_ID and ADMIN_KEY on Render, and a place to
+# keep accounts: Upstash (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN) or a database (DATABASE_URL).
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
+def _upstash_sync(cmd: list):
+    """One Upstash command, for the account store (which runs in a worker thread). Standard library only."""
+    import urllib.request
+    req = urllib.request.Request(UPSTASH_URL, data=json.dumps(cmd).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + UPSTASH_TOKEN, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode()).get("result")
+
+
 class _Store:
-    """Accounts in a Postgres database when DATABASE_URL is set (kept for good). Without it, in memory (lost on restart).
-    "sqlite:" addresses are for the tests."""
+    """Accounts, shared, learned and official guides: in a Postgres database when DATABASE_URL is set, else in Upstash
+    when its keys are set (both kept for good), else in memory (lost on restart). "sqlite:" addresses are for the tests."""
 
     COLS = "id, name, email, created, seen, profile, learned, plan_exp, plan_batch"
 
@@ -1537,7 +1547,10 @@ class _Store:
 
     @property
     def kind(self) -> str:
-        return "database" if self.url else "memory"
+        return "database" if self.url else "Upstash" if self._up() else "memory"
+
+    def _up(self) -> bool:
+        return not self.url and bool(UPSTASH_URL and UPSTASH_TOKEN)
 
     def _run(self, sql: str, args=(), fetch=False):
         """fetch: False (nothing), True (one row) or "all" (every row)."""
@@ -1562,6 +1575,9 @@ class _Store:
             self._kv_ready = True
 
     def kv_get(self, kind: str, kid: str):
+        if self._up():
+            r = _upstash_sync(["GET", "sg:kv:%s:%s" % (kind, kid)])
+            return json.loads(r).get("data") if r else None
         if not self.url:
             return self.kv.get((kind, kid))
         self._kv_setup()
@@ -1569,6 +1585,11 @@ class _Store:
         return json.loads(r[0]) if r and r[0] else None
 
     def kv_put(self, kind: str, kid: str, data: dict):
+        if self._up():
+            t = time.time()
+            _upstash_sync(["SET", "sg:kv:%s:%s" % (kind, kid), json.dumps({"data": data, "updated": int(t)})])
+            _upstash_sync(["ZADD", "sg:kvidx:" + kind, t, kid])   # newest first for kv_list
+            return
         if not self.url:
             self.kv.pop((kind, kid), None); self.kv[(kind, kid)] = data   # newest last
             return
@@ -1577,6 +1598,10 @@ class _Store:
                   "data = excluded.data, updated = excluded.updated", (kind, kid, json.dumps(data), int(time.time())))
 
     def kv_delete(self, kind: str, kid: str):
+        if self._up():
+            _upstash_sync(["DEL", "sg:kv:%s:%s" % (kind, kid)])
+            _upstash_sync(["ZREM", "sg:kvidx:" + kind, kid])
+            return
         if not self.url:
             self.kv.pop((kind, kid), None)
             return
@@ -1585,6 +1610,10 @@ class _Store:
 
     def kv_list(self, kind: str, limit: int = 100) -> list:
         """(id, data) pairs, newest first."""
+        if self._up():
+            ids = _upstash_sync(["ZREVRANGE", "sg:kvidx:" + kind, 0, max(0, limit - 1)]) or []
+            vals = _upstash_sync(["MGET"] + ["sg:kv:%s:%s" % (kind, i) for i in ids]) if ids else []
+            return [(i, json.loads(v).get("data")) for i, v in zip(ids, vals or []) if v]
         if not self.url:
             return [(k[1], v) for k, v in self.kv.items() if k[0] == kind][::-1][:limit]
         self._kv_setup()
@@ -1598,6 +1627,9 @@ class _Store:
             self._ready = True
 
     def get(self, uid: str):
+        if self._up():
+            r = _upstash_sync(["GET", "sg:user:" + uid])
+            return json.loads(r) if r else None
         if not self.url:
             return self.mem.get(uid)
         self._setup()
@@ -1608,6 +1640,10 @@ class _Store:
                 "profile": json.loads(r[5] or "{}"), "learned": json.loads(r[6] or "[]"), "plan_exp": r[7] or 0, "plan_batch": r[8] or 0}
 
     def put(self, u: dict):
+        if self._up():
+            _upstash_sync(["SET", "sg:user:" + u["id"], json.dumps(u)])
+            _upstash_sync(["SADD", "sg:users", u["id"]])
+            return
         if not self.url:
             self.mem[u["id"]] = u
             return
@@ -1619,6 +1655,10 @@ class _Store:
                    int(u["plan_exp"]), int(u["plan_batch"])))
 
     def delete(self, uid: str):
+        if self._up():
+            _upstash_sync(["DEL", "sg:user:" + uid])
+            _upstash_sync(["SREM", "sg:users", uid])
+            return
         if not self.url:
             self.mem.pop(uid, None)
             return
@@ -1626,6 +1666,8 @@ class _Store:
         self._run("delete from sg_users where id = %s", (uid,))
 
     def count(self) -> int:
+        if self._up():
+            return int(_upstash_sync(["SCARD", "sg:users"]) or 0)
         if not self.url:
             return len(self.mem)
         self._setup()
@@ -4016,7 +4058,7 @@ async def admin_report(key: str = ""):
         n_acc = -1
     acc = ("<p>Accounts: <b>%s</b> (%s). %s</p>" % (n_acc if n_acc >= 0 else "database not reachable", _store.kind,
            "Sign-in is on." if _accounts_on() else "Sign-in is off: set GOOGLE_CLIENT_ID and ADMIN_KEY on Render.")
-           + ("<p style='color:#f88'>Accounts are only in memory and are lost when the server restarts: set DATABASE_URL.</p>" if _accounts_on() and not DATABASE_URL else ""))
+           + ("<p style='color:#f88'>Accounts are only in memory and are lost when the server restarts: set the Upstash keys or DATABASE_URL.</p>" if _accounts_on() and _store.kind == "memory" else ""))
     spend = acc + ("<p>Spend today (Zambia time): <b>$%.4f</b>%s. Since restart: <b>$%.4f</b>. Alerts passed: %s.</p>"
              % (SPEND["today"] if SPEND["day"] == _today() else 0.0,
                 (" of $%.2f daily budget" % DAILY_BUDGET) if DAILY_BUDGET else " (no daily budget set: DAILY_BUDGET_USD)",
