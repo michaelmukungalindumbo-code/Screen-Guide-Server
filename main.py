@@ -522,7 +522,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.69"
+SERVER_VERSION = "0.70"
 
 
 @app.get("/health")
@@ -2682,7 +2682,7 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     _learn_words(install_id, labels)
     step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(told, 140, ours=True),
             "note": _clean_text(note, 100), "stuck": bool(stuck), "label": _clean_word(label) if label else None,
-            "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1)}
+            "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1), "tapped": bool(tapped)}
     if tally:
         step.update(ai_calls=tally["ai"], again=tally["again"][:3], timeouts=tally["timeouts"], backup=tally["backup"],
                     up=int(tally["up"]))
@@ -2703,7 +2703,7 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
         _add_problem(s, "no_point", n)
     if secs > 10:
         _add_problem(s, "slow", n, secs=int(secs), where=_slow_where(step))
-    if n >= 3 and len({_key(t["say"]) for t in s["steps"][-3:]}) == 1:
+    if n >= 3 and len({_key(t["say"]) for t in s["steps"][-3:]}) == 1 and not _rechecks(s["steps"][-3:]):
         _add_problem(s, "loop", n, n0=n - 2)
     if ai_empty:
         _add_problem(s, "ai_empty", n)
@@ -2721,6 +2721,14 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
         elif back and said and _key(said[-1]["say"]) != k and not note.strip():
             _add_problem(s, "repeat", n, n0=back["n"], note=step["say"][:90])
     return len(s["problems"])
+
+
+def _rechecks(last: list) -> bool:
+    """The same instruction three times is right while the person scrolls or the screen fills in: each time it pointed at
+    the same button, still on the changing screen, and they had not tapped it yet (#22, 4 Nov: "Tap Done" in the photo
+    picker while they scrolled their videos). Going round in circles is a tap, Help, nothing pointed at, or the same screen."""
+    return (all(t["label"] and t["label"] == last[0]["label"] for t in last) and not any(t["stuck"] for t in last)
+            and not any(t.get("tapped") for t in last[1:]) and all(a["screen"] != b["screen"] for a, b in zip(last, last[1:])))
 
 
 def _watch_end(install_id: str, ev: str, guide: str):
