@@ -18,4 +18,4 @@ jobs:
         with: {python-version: "3.12"}
       - run: pip install -q -r requirements.txt httpx
       - run: python tests/real_start.py
-        env: {GEMINI_API_KEY: ci, APP_TOKEN: ci, ADMIN_KEY: ci}
+        env: {PYTHONPATH: ".", GEMINI_API_KEY: ci, APP_TOKEN: ci, ADMIN_KEY: ci}
