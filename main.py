@@ -527,7 +527,10 @@ SERVER_VERSION = "0.71"
 
 @app.get("/health")
 async def health():
-    digest_soon()   # visited every 10 minutes by the keep-awake service: on Monday mornings, the weekly users issue
+    try:
+        digest_soon()   # visited every 10 minutes by the keep-awake service: on Monday mornings, the weekly users issue
+    except Exception as e:
+        log.warning("Weekly users issue check failed: %s", str(e)[:160])
     return {"ok": True}
 
 
@@ -1307,9 +1310,13 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
                         need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped, tally)
-    if x_tester != "1":
-        _count_step(install_id, labels, dev, body.stuck, time.time() - t0)   # users' phones only, kept across restarts
-        await _launch_step(install_id, body.stuck, tally)
+    if x_tester != "1":   # users' phones only, kept across restarts; counting never breaks a step
+        try:
+            _count_step(install_id, labels, dev, body.stuck, time.time() - t0)
+            await _launch_step(install_id, body.stuck, tally)
+        except Exception as e:
+            STATS["count_failed"] += 1
+            log.warning("Step not counted: %s", str(e)[:160])
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
@@ -1504,7 +1511,10 @@ async def event(body: Event, x_app_token: str = Header(default=""), x_install_id
         _watch_end(install_id, ev, guide)
     STATS["%s:%s" % (ev, guide)] += 1
     if x_tester != "1":
-        _count_event(ev, guide)   # users' phones only, kept across restarts
+        try:
+            _count_event(ev, guide)   # users' phones only, kept across restarts
+        except Exception as e:
+            log.warning("Event not counted: %s", str(e)[:160])
     log.info("EVENT %s %s", ev, guide)
     return {"ok": True}
 
@@ -2201,8 +2211,11 @@ async def _counts_on_shutdown():
     await counts_flush(force=True)
 
 
-if hasattr(app, "on_event"):   # a restart or an update: save what is not saved yet
-    app.on_event("shutdown")(_counts_on_shutdown)
+try:   # a restart or an update: save what is not saved yet (never stops the server from starting)
+    if hasattr(app, "on_event"):
+        app.on_event("shutdown")(_counts_on_shutdown)
+except Exception as e:
+    log.warning("Counts will not be saved on shutdown: %s", str(e)[:160])
 
 
 class GoogleIn(BaseModel):
