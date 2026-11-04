@@ -29,6 +29,15 @@ In the AI fixer's run, this repository is checked out in `server/`, next to the 
 5. Do not commit or push anything in `server/` yourself. A later step in the run sends your server changes as a pull
    request. Write its title on the first line of `media/server-fix.md`, then a short plain-English description.
 
+## When you cannot reproduce a problem (learned 4 Nov)
+
+- Do not stop at "probably the phone", "probably Android" or "probably the network". Check our own side first: replay
+  the screen with the issue's exact words, and look at what the server's rules did to the AI's answer.
+- If a test cannot show the cause, add a measurement so the next report proves it (a field on the watcher's step, a
+  STATS counter on the report page), the way slow answers now say where the time went. Include it in your change.
+- If you still stop without a fix, start your comment with the line `**Needs a deeper look**`, so the owner's next
+  session with Claude picks it up.
+
 ## Change requests and ideas
 
 Issues titled "Change request: …" or "Idea: …" are not bugs: the developer asked for something to be added, removed or
