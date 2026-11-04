@@ -1739,8 +1739,8 @@ async def _db(fn, *a):
 # button names that many phones share ("Videos, Settings, Select more media"; every other word is left out). Never what people asked, never
 # their own words. Saved every 10 minutes to the database (DATABASE_URL) or to Upstash (UPSTASH_REDIS_REST_URL and
 # UPSTASH_REDIS_REST_TOKEN); with neither, kept in memory until the next restart.
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().strip("\"'").strip().rstrip("/")   # pasted with quotes: fine
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'").strip()
 COUNTS_DAYS = 90
 COUNTS_FLUSH_SECONDS = 600
 _counts = {}                 # day -> counts not saved yet
