@@ -44,7 +44,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "53"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "54"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -522,7 +522,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.72"
+SERVER_VERSION = "0.74"
 
 
 @app.get("/health")
@@ -1269,6 +1269,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             label, say = None, _PICK_FILE.get(lang, _PICK_FILE["en"])
     if label and _EXITISH.match(label) and _MAKING.search(goal):
         fwd = next((_plain(l) for l in labels if _FORWARD.match(_plain(l)) and not l.rstrip().lower().endswith("[text]")), None)
+        # 4 Nov, YouTube's Shorts editor: Next is plain words inside a tappable box ([text]), so "Tap Exit editor" stayed
+        # and sent the upload backwards. The phone rings the tappable box around such words.
+        if not fwd and _staged("forward_from_text", x_tester == "1"):
+            fwd = next((_plain(l) for l in labels if _FORWARD.match(_plain(l))), None)
+            if fwd:
+                _fired("forward_from_text")
         if fwd:
             STATS["kept_going_forward"] += 1
             label, say = fwd, _TAP_WORD.get(lang, _TAP_WORD["en"]) % fwd
@@ -1974,7 +1980,9 @@ async def users_report_html(n: int = 7) -> str:
 # once without an update (PAUSED_RULES on Render, or Pause on the report page), and it pauses itself when people press
 # Help right after it far more often than usual. Its clock is kept with the counts (database or Upstash); in memory
 # only, it starts again whenever the server restarts.
-STAGED = {}            # rule name -> the server version that brought it, for example {"gallery_wait": "0.72"}
+STAGED = {              # rule name -> the server version that brought it
+    "forward_from_text": "0.73",   # an upload going backwards ("Exit editor") uses a Next shown as plain words
+}
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
 AUTO_PAUSE_MIN = 20    # times a rule changed an answer on users' phones before it may pause itself
@@ -3163,6 +3171,9 @@ _RULE_TEXT = {
               "again. Picture {pic} (media/step{pic}.jpg) shows the screen after it changed.",
               "When the screen changes while a step is shown, look again, even in apps whose words ScreenGuide cannot read: "
               "the person may already have done it (seen 2 Nov: the photo was taken, the guide still said to take it)."),
+    "backwards": ("Sent backwards on step {n}", "While making or uploading something, step {n} pointed at “{note}”, which "
+                  "leaves it before it is done.",
+                  "Point at the way forward (Next, Upload, Post, Save). Only go back if the person asked to, or the task is finished."),
     "idle": ("Left untouched at step {n}", "Nothing happened for 4 minutes on step {n}, so the guide stopped itself.",
              "Look at step {n}: the person may not have known what to do."),
     # "Test an app": spotted on the phone, in any app, with or without a guide
@@ -3247,6 +3258,10 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
         _add_problem(s, "no_point", n)
     if secs > 10:
         _add_problem(s, "slow", n, secs=int(secs), where=_slow_where(step))
+    # 4 Nov: "Tap Exit editor" in the middle of a YouTube upload looked like a normal step to every rule
+    if label and not done and not stuck and _EXITISH.match(label) and _MAKING.search(goal):
+        w = _clean_word(label)   # unknown words stay hidden; the way-out word itself ("Exit", "Close") is never personal
+        _add_problem(s, "backwards", n, note=w if w != "…" else _plain(label).split()[0].capitalize() + " …")
     if n >= 3 and len({_key(t["say"]) for t in s["steps"][-3:]}) == 1 and not _rechecks(s["steps"][-3:]):
         _add_problem(s, "loop", n, n0=n - 2)
     if ai_empty:
@@ -3308,6 +3323,7 @@ You get the goal and every step: the words on the screen (personal words are rep
 Return JSON: {"problems": [{"step", "kind", "title", "what", "fix"}]}.
 - Include every problem the rules noticed, with the same step and kind, and explain it.
 - Add any other real problem you can see, with kind "review": an instruction that does not fit the screen, pointing at the wrong thing, words too hard for a first-time user, a step that goes backwards, finishing too early, the wrong language.
+- Check every step against the goal: does it move the person toward it? When the goal is to make, upload, post, send or save something, an instruction to exit, close, cancel or go back before it is done is a problem ("Sent backwards on step N"), unless the person asked for it in Help. So is pointing at something that starts the task over.
 - title: under 8 words. what: one or two plain sentences on what went wrong for the person. fix: one or two plain sentences on what the developer should change.
 - At most 6 problems. If the guide went well and the rules noticed nothing, return {"problems": []}.
 - Only describe what the steps show. Never guess what happened on the phone between steps (for example that a menu did not open, or that a button was a Close button).
@@ -3820,7 +3836,7 @@ async def watch_review(body: WatchReview = WatchReview(), x_app_token: str = Hea
     install_id = _check(x_app_token, x_install_id)
     s = _sessions.get(install_id)
     if x_tester != "1" or not s or not (s["steps"] or s.get("changes")):
-        return {"problems": []}
+        return {"problems": [], "lost": x_tester == "1" and not s}   # lost: the server restarted and forgot this guide
     if s["review"] is None:
         day = install_id + _today()
         ai = s["steps"] and _review_day[day] < 40 and not _over_budget()
