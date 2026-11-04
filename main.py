@@ -522,7 +522,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.70"
+SERVER_VERSION = "0.71"
 
 
 @app.get("/health")
@@ -1305,6 +1305,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
                         need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped, tally)
+    if x_tester != "1":
+        _count_step(install_id, labels, dev, body.stuck, time.time() - t0)   # users' phones only, kept across restarts
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
@@ -1498,6 +1500,8 @@ async def event(body: Event, x_app_token: str = Header(default=""), x_install_id
     elif ev in ("stop", "done"):
         _watch_end(install_id, ev, guide)
     STATS["%s:%s" % (ev, guide)] += 1
+    if x_tester != "1":
+        _count_event(ev, guide)   # users' phones only, kept across restarts
     log.info("EVENT %s %s", ev, guide)
     return {"ok": True}
 
@@ -1714,6 +1718,206 @@ async def _db(fn, *a):
     except Exception as e:
         log.warning("Account store error: %s", str(e)[:160])
         raise HTTPException(503, "Your account could not be reached. Please try again.")
+
+
+# ---- The Mother Ship's Performance deck: anonymous counts from users' phones (test phones are left out), per day,
+# kept across restarts. Counts only: guides started, finished and stopped, steps, Help presses and slow answers, by kind
+# of phone and server version, and each screen a guide went through (with its Help presses), named only by common
+# button names that many phones share ("Videos, Settings, Select more media"; every other word is left out). Never what people asked, never
+# their own words. Saved every 10 minutes to the database (DATABASE_URL) or to Upstash (UPSTASH_REDIS_REST_URL and
+# UPSTASH_REDIS_REST_TOKEN); with neither, kept in memory until the next restart.
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+COUNTS_DAYS = 90
+COUNTS_FLUSH_SECONDS = 600
+_counts = {}                 # day -> counts not saved yet
+_counts_mem = {}             # day -> saved counts, when there is no database and no Upstash
+_counts_state = {"saved_at": time.time(), "busy": False, "error": ""}
+_bg = set()                  # background saves in progress (kept so they are not dropped)
+
+
+def counts_kind() -> str:
+    return "database" if DATABASE_URL else "Upstash" if (UPSTASH_URL and UPSTASH_TOKEN) else "memory"
+
+
+def _bump(d: dict, path: tuple, n=1):
+    for k in path[:-1]:
+        d = d.setdefault(k, {})
+    d[path[-1]] = d.get(path[-1], 0) + n
+
+
+def _counts_merge(a: dict, b: dict) -> dict:
+    """a + b: numbers add up, lists of phones join (at most 20), words take the newest."""
+    out = dict(a)
+    for k, v in b.items():
+        if isinstance(v, dict):
+            out[k] = _counts_merge(out.get(k) or {}, v)
+        elif isinstance(v, list):
+            out[k] = (list(out.get(k) or []) + [x for x in v if x not in (out.get(k) or [])])[:20]
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = round((out.get(k) or 0) + v, 1)
+        else:
+            out[k] = v
+    return out
+
+
+def _screen_name(labels: list) -> tuple:
+    """(key, words): a screen by its common button names only. Numbers, times and anyone's own words are left out."""
+    words, seen = [], set()
+    for l in labels[:60]:
+        w = _clean_word(l)
+        if w != "…" and not re.search(r"\d", w) and w.lower() not in seen:
+            seen.add(w.lower()); words.append(w)
+    if not words:
+        return "none", "(no common button names)"
+    return _hash("screen:" + "|".join(sorted(seen)), 10), ", ".join(words[:12])
+
+
+def _count_step(install_id: str, labels: list, dev: str, stuck: bool, secs: float):
+    """One guide step on a user's phone (never a test phone: the caller checks)."""
+    d = _counts.setdefault(_today(), {})
+    kind = dev or "unknown phone"
+    _bump(d, ("steps",)); _bump(d, ("secs",), round(secs, 1))
+    if len(d.get("kinds", {})) < 50 or kind in d.get("kinds", {}):
+        _bump(d, ("kinds", kind, "steps"))
+    _bump(d, ("versions", SERVER_VERSION, "steps"))
+    if secs > 10:
+        _bump(d, ("slow",)); _bump(d, ("versions", SERVER_VERSION, "slow"))
+    if stuck:
+        _bump(d, ("help",)); _bump(d, ("versions", SERVER_VERSION, "help"))
+        if kind in d.get("kinds", {}):
+            _bump(d, ("kinds", kind, "help"))
+    key, words = _screen_name(labels)
+    screens = d.setdefault("screens", {})
+    if key in screens or len(screens) < 300:
+        sc = screens.setdefault(key, {"words": words})
+        sc["words"] = words
+        _bump(sc, ("steps",))
+        if stuck:
+            _bump(sc, ("help",))
+            ph, phones = _hash("count:" + install_id, 8), sc.setdefault("phones", [])
+            if ph not in phones and len(phones) < 20:
+                phones.append(ph)
+    _counts_soon()
+
+
+def _count_event(ev: str, guide: str):
+    if ev in ("start", "done", "stop"):
+        d = _counts.setdefault(_today(), {})
+        _bump(d, ("guides", ev))
+        _counts_soon()
+
+
+def _counts_soon():
+    if time.time() - _counts_state["saved_at"] >= COUNTS_FLUSH_SECONDS and not _counts_state["busy"]:
+        try:
+            t = asyncio.get_running_loop().create_task(counts_flush())
+            _bg.add(t); t.add_done_callback(_bg.discard)
+        except RuntimeError:
+            pass
+
+
+async def _upstash(cmd: list):
+    import httpx
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(UPSTASH_URL, headers={"Authorization": "Bearer " + UPSTASH_TOKEN}, json=cmd)
+        r.raise_for_status()
+        return r.json().get("result")
+
+
+async def _counts_get(day: str):
+    if DATABASE_URL:
+        return await asyncio.to_thread(_store.kv_get, "counts", day)
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        r = await _upstash(["GET", "sg:counts:" + day])
+        return json.loads(r) if r else None
+    return _counts_mem.get(day)
+
+
+async def _counts_put(day: str, doc: dict):
+    if DATABASE_URL:
+        await asyncio.to_thread(_store.kv_put, "counts", day, doc)
+        old = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 7200 - COUNTS_DAYS * 86400))
+        await asyncio.to_thread(_store.kv_delete, "counts", old)
+    elif UPSTASH_URL and UPSTASH_TOKEN:
+        await _upstash(["SET", "sg:counts:" + day, json.dumps(doc), "EX", str(COUNTS_DAYS * 86400)])
+    else:
+        _counts_mem[day] = doc
+        for k in sorted(_counts_mem)[:-COUNTS_DAYS]:
+            _counts_mem.pop(k, None)
+
+
+async def counts_flush(force: bool = False):
+    """Saves the counts not saved yet. If saving fails, they are kept for the next try."""
+    global _counts
+    if _counts_state["busy"] or not _counts or (not force and time.time() - _counts_state["saved_at"] < COUNTS_FLUSH_SECONDS):
+        return
+    _counts_state["busy"] = True
+    pending, _counts = _counts, {}
+    _counts_state["saved_at"] = time.time()
+    try:
+        for day in sorted(pending):
+            try:
+                await _counts_put(day, _counts_merge(await _counts_get(day) or {}, pending[day]))
+                _counts_state["error"] = ""
+            except Exception as e:
+                _counts[day] = _counts_merge(pending[day], _counts.get(day, {}))
+                _counts_state["error"] = str(e)[:160]
+                STATS["counts_save_failed"] += 1
+                log.warning("Counts not saved (kept for the next try): %s", str(e)[:160])
+    finally:
+        _counts_state["busy"] = False
+
+
+async def counts_days(n: int = 7) -> list:
+    """[(day, counts)] for the last n days, newest first, including counts not saved yet."""
+    out = []
+    for i in range(n):
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 7200 - i * 86400))
+        try:
+            saved = await _counts_get(day) or {}
+        except Exception as e:
+            saved = {}; _counts_state["error"] = str(e)[:160]
+        out.append((day, _counts_merge(saved, _counts.get(day, {}))))
+    return out
+
+
+async def users_report_html(n: int = 7) -> str:
+    """The owner report's "Real users" part: each day, where people pressed Help most, and by kind of phone."""
+    days = await counts_days(n)
+    rows, screens, kinds = "", {}, {}
+    for day, d in days:
+        st, hp, g = d.get("steps", 0), d.get("help", 0), d.get("guides", {})
+        rows += ("<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%d</td><td>%s</td></tr>"
+                 % (day, g.get("start", 0), g.get("done", 0), g.get("stop", 0), st, hp, ("%.1f" % (100.0 * hp / st)) if st else "-",
+                    d.get("slow", 0), ("%.1f s" % (d.get("secs", 0) / st)) if st else "-"))
+        for k, v in (d.get("screens") or {}).items():
+            screens[k] = _counts_merge(screens.get(k, {}), v)
+        for k, v in (d.get("kinds") or {}).items():
+            kinds[k] = _counts_merge(kinds.get(k, {}), v)
+    top = sorted((v for v in screens.values() if v.get("help")), key=lambda v: (-len(v.get("phones") or []), -v.get("help", 0)))[:10]
+    top_rows = "".join("<tr><td>%d</td><td>%d</td><td>%d</td><td>%s</td></tr>" % (len(v.get("phones") or []), v.get("help", 0),
+                       v.get("steps", 0), html.escape(v.get("words", ""))) for v in top)
+    kind_rows = "".join("<tr><td>%s</td><td>%d</td><td>%d</td></tr>" % (html.escape(k), v.get("steps", 0), v.get("help", 0))
+                        for k, v in sorted(kinds.items(), key=lambda kv: -kv[1].get("steps", 0))[:15])
+    where = {"database": "the database (kept for %d days)" % COUNTS_DAYS, "Upstash": "Upstash (kept for %d days)" % COUNTS_DAYS,
+             "memory": "memory only, lost on restart: set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN, or DATABASE_URL"}[counts_kind()]
+    return ("<h3>Real users (test phones left out), last %d days</h3><p class='m'>Saved in %s.%s</p>"
+            "<table><tr><th>Day</th><th>Guides started</th><th>Finished</th><th>Stopped</th><th>Steps</th><th>Help</th>"
+            "<th>Help per 100 steps</th><th>Slow (over 10 s)</th><th>Average answer</th></tr>%s</table>"
+            "<h3>Where users pressed Help most</h3><p class='m'>Screens named by common button names only.</p>"
+            "<table><tr><th>Phones</th><th>Help</th><th>Steps</th><th>Screen</th></tr>%s</table>"
+            "<h3>By kind of phone</h3><table><tr><th>Phone</th><th>Steps</th><th>Help</th></tr>%s</table>"
+            % (n, where, (" <span style='color:#f88'>Last save failed: %s</span>" % html.escape(_counts_state["error"])) if _counts_state["error"] else "",
+               rows, top_rows or "<tr><td colspan=4>No Help presses yet</td></tr>", kind_rows or "<tr><td colspan=3>No steps yet</td></tr>"))
+
+
+async def _counts_on_shutdown():
+    await counts_flush(force=True)
+
+
+if hasattr(app, "on_event"):   # a restart or an update: save what is not saved yet
+    app.on_event("shutdown")(_counts_on_shutdown)
 
 
 class GoogleIn(BaseModel):
@@ -3428,7 +3632,7 @@ async def privacy():
 <h2>What is kept</h2>
 <ul>
 <li><b>Chats</b> are saved on your phone only. Incognito chats are not saved. You can delete saved chats in the app (menu, Past chats, Clear all) or by removing the app.</li>
-<li><b>Our server</b> does not save your questions, screen words or pictures on disk, apart from the shared and finished guides described above. It keeps counts (for example how many guides finished) in memory, and short answers to common questions for up to a week, so they do not cost money twice and still work when the AI service is down.</li>
+<li><b>Our server</b> does not save your questions, screen words or pictures on disk, apart from the shared and finished guides described above and these counts, kept for up to 90 days: how many guides started and finished, how often Help was pressed, how long answers took, by kind of phone (for example "Infinix phone, Android 14"), and, for each screen a guide went through, the names of its common buttons that appear on many phones (like Settings or Upload; never your own words). Test phones are not counted. It also keeps short answers to common questions for up to a week, so they do not cost money twice and still work when the AI service is down.</li>
 <li><b>Your account (optional).</b> If you sign in with Google, we keep your Google account number, name and email, your ScreenGuide settings, the tasks your phone has learned, and any Plus plan, so they come back on a new phone. Your chats are never sent to your account. Delete it any time in the app (menu, Your account, Delete my account) or use <a href="/account/delete">the account deletion page</a>.</li>
 <li><b>Help during a guide.</b> When you tap Help (?) during a guide, the words on that screen are kept in the server's memory, with numbers and email addresses removed, so we can fix the guide. They are deleted when the server restarts.</li>
 <li><b>Thumbs-down.</b> If you mark an answer as bad, that question and answer are kept in the server's memory, with numbers and email addresses removed, so we can improve the helper. They are deleted when the server restarts.</li>__SAMPLES__
@@ -3547,7 +3751,11 @@ async def admin_report(key: str = ""):
                                  html.escape("\n".join(d.get("trace", "").splitlines()[:14]))) for d in crashes[:20]))
     head = ("<h2>ScreenGuide report</h2><p class='m'>Since the server last started: %.1f hours ago. "
             "The free server restarts when idle, so these numbers reset. Screenshot this page each day.</p>" % hours)
-    body = health + head + spend + quality + (
+    try:
+        users = await users_report_html(7)
+    except Exception as e:
+        users = "<p style='color:#f88'>Real-user counts could not be read: %s</p>" % html.escape(str(e)[:160])
+    body = health + head + spend + users + quality + (
             "<h3>AI use</h3><table><tr><th>Kind</th><th>Calls</th><th>Tokens in</th><th>Tokens out</th><th>Average per call (in / out)</th><th>Cost</th></tr>%s</table>"
             "<p>Total AI cost: <b>%s</b>. Finished guides: <b>%d</b>. AI cost per finished guide: <b>%s</b>.</p>"
             "<p class='m'>Prices for claude-haiku-5-5 are built in. For another model, set PRICE_IN_PER_MILLION and PRICE_OUT_PER_MILLION on Render.</p>"
