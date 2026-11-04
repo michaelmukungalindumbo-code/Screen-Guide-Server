@@ -1133,6 +1133,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         raise HTTPException(429, _limit_message(why, tier, "step-by-step help"))
 
     lang = body.lang if body.lang in LANGS else "en"
+    await _launch_load()   # when this server version went live, and which staged rules are paused
     # Untrusted text goes inside tags, cleaned so it cannot close a tag or hide characters.
     user = ("<goal>%s</goal>\n<already_told>%s</already_told>\n<screen_words>\n%s\n</screen_words>"
             % (_safe(goal, 300), _safe(" | ".join(history), 800) or "(nothing yet)",
@@ -1307,6 +1308,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
                         need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped, tally)
     if x_tester != "1":
         _count_step(install_id, labels, dev, body.stuck, time.time() - t0)   # users' phones only, kept across restarts
+        await _launch_step(install_id, body.stuck, tally)
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
@@ -1853,6 +1855,8 @@ async def counts_flush(force: bool = False):
     if _counts_state["busy"] or not _counts or (not force and time.time() - _counts_state["saved_at"] < COUNTS_FLUSH_SECONDS):
         return
     _counts_state["busy"] = True
+    if _launch_state["dirty"]:
+        await _launch_save()
     pending, _counts = _counts, {}
     _counts_state["saved_at"] = time.time()
     try:
@@ -1910,6 +1914,168 @@ async def users_report_html(n: int = 7) -> str:
             "<h3>By kind of phone</h3><table><tr><th>Phone</th><th>Steps</th><th>Help</th></tr>%s</table>"
             % (n, where, (" <span style='color:#f88'>Last save failed: %s</span>" % html.escape(_counts_state["error"])) if _counts_state["error"] else "",
                rows, top_rows or "<tr><td colspan=4>No Help presses yet</td></tr>", kind_rows or "<tr><td colspan=3>No steps yet</td></tr>"))
+
+
+# ---- The Mother Ship's Launch Bay (server). A new rule that changes what people see is "staged": on at once for test
+# phones, and for everyone only after its server version has been live for STAGE_HOURS. Any staged rule can be paused at
+# once without an update (PAUSED_RULES on Render, or Pause on the report page), and it pauses itself when people press
+# Help right after it far more often than usual. Its clock is kept with the counts (database or Upstash); in memory
+# only, it starts again whenever the server restarts.
+STAGED = {}            # rule name -> the server version that brought it, for example {"gallery_wait": "0.72"}
+STAGE_HOURS = 24
+PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
+AUTO_PAUSE_MIN = 20    # times a rule changed an answer on users' phones before it may pause itself
+_launch = {"live": {}, "paused": {}, "seen": {}, "users": {"steps": 0, "help": 0}}
+_launch_state = {"loaded": False, "dirty": False}
+_last_rules = {}       # phone -> (when, the staged rules that changed its last answer)
+
+
+def _staged(name: str, tester: bool) -> bool:
+    """Is this staged rule on for this phone? (Every staged rule is listed in STAGED.)"""
+    ver = STAGED[name]
+    if name in PAUSED_RULES or "all" in PAUSED_RULES or name in _launch["paused"] or "all" in _launch["paused"]:
+        return False
+    if tester:
+        return True
+    since = _launch["live"].get(ver)
+    return since is not None and time.time() - since >= STAGE_HOURS * 3600
+
+
+def _fired(name: str):
+    """A staged rule changed this answer: Help pressed right after it counts against it."""
+    t = _TALLY.get()
+    if t is not None and name not in t.setdefault("rules", []):
+        t["rules"].append(name)
+
+
+async def _launch_get():
+    if DATABASE_URL:
+        return await asyncio.to_thread(_store.kv_get, "launch", "state")
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        r = await _upstash(["GET", "sg:launch:state"])
+        return json.loads(r) if r else None
+    return _counts_mem.get("launch")
+
+
+async def _launch_save():
+    doc = {k: _launch[k] for k in ("live", "paused", "seen", "users")}
+    try:
+        if DATABASE_URL:
+            await asyncio.to_thread(_store.kv_put, "launch", "state", doc)
+        elif UPSTASH_URL and UPSTASH_TOKEN:
+            await _upstash(["SET", "sg:launch:state", json.dumps(doc)])
+        else:
+            _counts_mem["launch"] = json.loads(json.dumps(doc))
+        _launch_state["dirty"] = False
+    except Exception as e:
+        _launch_state["dirty"] = True
+        log.warning("Launch Bay not saved (kept for the next try): %s", str(e)[:160])
+
+
+async def _launch_load():
+    if _launch_state["loaded"]:
+        return
+    _launch_state["loaded"] = True
+    try:
+        saved = await _launch_get() or {}
+        for k in ("live", "paused", "seen", "users"):
+            if isinstance(saved.get(k), dict):
+                _launch[k] = saved[k]
+    except Exception as e:
+        log.warning("Launch Bay could not be read: %s", str(e)[:160])
+    if SERVER_VERSION not in _launch["live"]:
+        _launch["live"][SERVER_VERSION] = time.time()   # this version went live now
+        await _launch_save()
+
+
+async def _launch_step(install_id: str, stuck: bool, tally: dict):
+    """A step on a user's phone: Help right after a staged rule counts against it, and may pause it."""
+    now = time.time()
+    _launch["users"]["steps"] = _launch["users"].get("steps", 0) + 1
+    if stuck:
+        _launch["users"]["help"] = _launch["users"].get("help", 0) + 1
+    prev = _last_rules.pop(install_id, None)
+    day = _counts.setdefault(_today(), {})
+    if stuck and prev and now - prev[0] < 600:
+        for r in prev[1]:
+            seen = _launch["seen"].setdefault(r, {"fired": 0, "help_after": 0})
+            seen["help_after"] += 1
+            _bump(day, ("rules", r, "help_after"))
+            await _maybe_pause(r)
+    rules = [r for r in (tally or {}).get("rules") or [] if r in STAGED]
+    for r in rules:
+        _launch["seen"].setdefault(r, {"fired": 0, "help_after": 0})["fired"] += 1
+        _bump(day, ("rules", r, "fired"))
+    if rules and len(_last_rules) < 5000:
+        _last_rules[install_id] = (now, rules)
+    _launch_state["dirty"] = True
+
+
+async def _maybe_pause(rule: str):
+    s, u = _launch["seen"].get(rule) or {}, _launch["users"]
+    fired, after = s.get("fired", 0), s.get("help_after", 0)
+    base = u.get("help", 0) / u["steps"] if u.get("steps") else 0.0
+    rate = after / fired if fired else 0.0
+    if rule in _launch["paused"] or fired < AUTO_PAUSE_MIN or rate < 0.3 or rate < 2 * base:
+        return
+    why = ("people pressed Help right after it %d times in %d (%.0f%%), against %.0f%% of all steps"
+           % (after, fired, 100 * rate, 100 * base))
+    _launch["paused"][rule] = "Paused itself: " + why
+    STATS["rule_paused_itself"] += 1
+    log.warning("Launch Bay: rule %s paused itself: %s", rule, why)
+    await _launch_save()
+    if GITHUB_TOKEN:
+        try:
+            await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {
+                "title": "Launch Bay: rule “%s” paused itself" % rule,
+                "body": ("The server rule **%s** (server %s) was switched off for everyone except test phones, because %s.\n\n"
+                         "Nothing else changed. To look into it, reply here with @claude. To switch it back on, open the "
+                         "server report page and tap Resume next to it.\n\n<!-- launch-paused: %s -->"
+                         % (rule, STAGED.get(rule, "?"), why, rule))})
+        except Exception as e:
+            log.warning("Launch Bay issue not opened: %s", str(e)[:160])
+
+
+def launch_report_html(key: str) -> str:
+    """The report page's Launch Bay: when each server version went live, how the staged rules are doing, Pause/Resume."""
+    from urllib.parse import quote
+    k = quote(key, safe="")
+    vers = "".join("<tr><td>%s</td><td>%s</td></tr>" % (html.escape(v), time.strftime("%Y-%m-%d %H:%M", time.gmtime(t + 7200)))
+                   for v, t in sorted(_launch["live"].items(), key=lambda kv: -kv[1])[:6])
+    rows = ""
+    for r, ver in sorted(STAGED.items()):
+        s = _launch["seen"].get(r) or {}
+        paused = _launch["paused"].get(r) or ("Paused on Render (PAUSED_RULES)" if r in PAUSED_RULES or "all" in PAUSED_RULES else "")
+        state = paused or ("on for everyone" if _staged(r, False) else "test phones only for now")
+        act = ("<a href='/admin/pause?key=%s&rule=%s&on=0'>Resume</a>" if paused else "<a href='/admin/pause?key=%s&rule=%s&on=1'>Pause</a>") % (k, quote(r))
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%d</td><td>%s</td></tr>" % (
+            html.escape(r), html.escape(ver), html.escape(state), s.get("fired", 0), s.get("help_after", 0), act)
+    return ("<h3>Launch Bay</h3><p class='m'>New rules reach test phones at once and everyone after %d quiet hours. "
+            "A rule pauses itself if people press Help right after it far more than usual.</p>"
+            "<table><tr><th>Server version</th><th>Live since</th></tr>%s</table>"
+            "<table><tr><th>Staged rule</th><th>Version</th><th>State</th><th>Changed answers</th><th>Help right after</th><th></th></tr>%s</table>"
+            "<p><a href='/admin/pause?key=%s&rule=all&on=1'>Pause all staged rules</a> · "
+            "<a href='/admin/pause?key=%s&rule=all&on=0'>Undo pause all</a></p>"
+            % (STAGE_HOURS, vers or "<tr><td colspan=2>Not read yet</td></tr>", rows or "<tr><td colspan=6>No staged rules right now</td></tr>", k, k))
+
+
+@app.get("/admin/pause", response_class=HTMLResponse)
+async def admin_pause(key: str = "", rule: str = "", on: str = "1"):
+    """Pause (on=1) or resume (on=0) a staged rule, or all of them (rule=all), at once, without an update."""
+    _admin(key)
+    await _launch_load()
+    if rule != "all" and rule not in STAGED:
+        raise HTTPException(404, "There is no staged rule called that.")
+    if on == "1":
+        _launch["paused"][rule] = "Paused by the owner"
+    else:
+        _launch["paused"].pop(rule, None)
+        if rule != "all":
+            _launch["seen"].pop(rule, None)   # a fresh start for its automatic pause
+    await _launch_save()
+    from urllib.parse import quote
+    return _page("Launch Bay", "<p>%s <b>%s</b>.</p><p><a href='/admin/report?key=%s'>Back to the report</a></p>"
+                 % ("Paused" if on == "1" else "Resumed", html.escape("every staged rule" if rule == "all" else rule), quote(key, safe="")))
 
 
 async def _counts_on_shutdown():
@@ -3752,7 +3918,8 @@ async def admin_report(key: str = ""):
     head = ("<h2>ScreenGuide report</h2><p class='m'>Since the server last started: %.1f hours ago. "
             "The free server restarts when idle, so these numbers reset. Screenshot this page each day.</p>" % hours)
     try:
-        users = await users_report_html(7)
+        await _launch_load()
+        users = await users_report_html(7) + launch_report_html(key)
     except Exception as e:
         users = "<p style='color:#f88'>Real-user counts could not be read: %s</p>" % html.escape(str(e)[:160])
     body = health + head + spend + users + quality + (
