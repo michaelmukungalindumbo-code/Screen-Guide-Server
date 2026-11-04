@@ -533,7 +533,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.75"
+SERVER_VERSION = "0.76"
 
 
 @app.get("/health")
@@ -1341,7 +1341,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             log.warning("Step not counted: %s", str(e)[:160])
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
-            "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
+            "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep,
+            "strong": bool(tally.get("strong"))}   # the stronger AI answered (after Help): the test strip shows it
 
 
 # ---- Self-test: real questions from field testing, run through the same code. Open in a browser. ----

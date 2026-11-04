@@ -24,8 +24,9 @@ def step(i, stuck=False, tester=True, note=""):
 assert main.STAGED["strong_on_help"] == "0.75" and main.STRONG_MODEL == "claude-sonnet-5-5"
 r, models = step("t1")
 assert models == ["claude-haiku-5-5"], models                         # a normal step: the usual fast AI
+assert r["strong"] is False                                            # 0.76: the phone is told which AI answered
 r, models = step("t1", stuck=True, note="I can't find it")
-assert models == ["claude-sonnet-5-5"] and r["label"] == "Apps", (models, r)
+assert models == ["claude-sonnet-5-5"] and r["label"] == "Apps" and r["strong"] is True, (models, r)
 # Its cost is counted at its own price (US$2 / US$10 per million tokens): 2000 in + 100 out = US$0.005
 assert abs(main.USAGE["step+strong"]["cost"] - 0.005) < 1e-9, main.USAGE["step+strong"]
 assert abs(main.USAGE["step"]["cost"] - (2000 * 0.10 + 100 * 0.50) / 1e6) < 1e-12, main.USAGE["step"]
