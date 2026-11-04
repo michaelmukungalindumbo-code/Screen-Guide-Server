@@ -33,7 +33,13 @@ LIMITS = {   # (questions per day, guided steps per day)
 }
 REVOKED = {int(b) for b in re.findall(r"\d+", os.getenv("REVOKED_BATCHES", ""))}
 # Prices in US dollars per million tokens. Known models are filled in; set these on Render to override.
-KNOWN_PRICES = {"claude-haiku-5-5": (0.10, 0.50)}   # platform.claude.com/docs/en/about-claude/pricing (prompts under 100K tokens)
+KNOWN_PRICES = {"claude-haiku-5-5": (0.10, 0.50),     # platform.claude.com/docs/en/about-claude/pricing (prompts under 100K tokens)
+                "claude-sonnet-5-5": (2.0, 10.0), "claude-opus-5-5": (4.0, 20.0)}   # (checked 4 Nov 2026)
+# Hard moments (the person pressed Help) get a stronger AI: better answers where they matter most, at about 20 times the
+# price of a normal step (about US$0.005-0.01 each). At most STRONG_PER_DAY a day; after that, the normal AI.
+STRONG_MODEL = os.getenv("STRONG_MODEL", "claude-sonnet-5-5").strip()
+STRONG_PER_DAY = int(os.getenv("STRONG_PER_DAY", "100"))
+_strong_day = defaultdict(int)
 _known = KNOWN_PRICES.get(settings.ANTHROPIC_MODEL, (0.0, 0.0))
 PRICE_IN = float(os.getenv("PRICE_IN_PER_MILLION", "0") or 0) or _known[0]
 PRICE_OUT = float(os.getenv("PRICE_OUT_PER_MILLION", "0") or 0) or _known[1]
@@ -65,7 +71,8 @@ def _today() -> str:
 
 def _count(kind: str, tin: int, tout: int, provider: str = "claude", model: str = "", secs: float = 0.0) -> None:
     tin, tout = int(tin or 0), int(tout or 0)
-    cost = (tin * PRICE_IN + tout * PRICE_OUT) / 1_000_000 if provider == "claude" else 0.0   # Gemini backup: free tier
+    pin, pout = (PRICE_IN, PRICE_OUT) if model in ("", settings.ANTHROPIC_MODEL) else KNOWN_PRICES.get(model, (PRICE_IN, PRICE_OUT))
+    cost = (tin * pin + tout * pout) / 1_000_000 if provider == "claude" else 0.0   # Gemini backup: free tier
     u = USAGE[kind]
     u["calls"] += 1; u["in"] += tin; u["out"] += tout; u["cost"] += cost
     day = _today()
@@ -240,6 +247,9 @@ async def _complete(system: str, question: str, images: list[str] | None = None,
     budget = budget or settings.REQUEST_TIMEOUT_SECONDS + (15 if images else 0)
     max_tokens = max_tokens or (400 if kind.startswith("step") else max(settings.MAX_OUTPUT_TOKENS, 1024))
     chain = _chain()
+    tally = _TALLY.get()
+    if tally and tally.get("strong") and settings.ANTHROPIC_API_KEY and ("claude", STRONG_MODEL) not in chain:
+        chain = [("claude", STRONG_MODEL)] + chain   # a hard moment: the stronger AI first, the usual ones as backups
     now = time.time()
     live = [p for p in chain if _down.get(p, 0) <= now] or chain[:1]
     start, last = time.time(), None
@@ -255,7 +265,8 @@ async def _complete(system: str, question: str, images: list[str] | None = None,
             tally["ai"] += 1
         try:
             call = _call_claude if prov == "claude" else _call_gemini
-            text = await asyncio.wait_for(call(model, system, question, images, kind, schema, max_tokens, t0), limit)
+            k = kind + ("+strong" if (prov, model) == ("claude", STRONG_MODEL) and tally and tally.get("strong") else "")
+            text = await asyncio.wait_for(call(model, system, question, images, k, schema, max_tokens, t0), limit)
             LAT[kind].append(time.time() - t0)
             if i:
                 STATS["backup_used_" + model] += 1
@@ -522,7 +533,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.74"
+SERVER_VERSION = "0.75"
 
 
 @app.get("/health")
@@ -1165,6 +1176,11 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     t0 = time.time()
     tally = {"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": t0 - STARTED}
     _TALLY.set(tally)
+    # A hard moment: they pressed Help. The stronger AI answers this step (staged; at most STRONG_PER_DAY a day).
+    if body.stuck and _staged("strong_on_help", x_tester == "1") and _strong_day[_today()] < STRONG_PER_DAY:
+        _strong_day[_today()] += 1
+        tally["strong"] = True
+        STATS["strong_steps"] += 1
     text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
     # A blocked (black) picture must never beat the screen words. Seen 1 and 2 Nov: Drive's Upload screen had Cancel and
     # Upload, the picture came back black, and the guide said "The screen is black" instead of "Tap Upload". Ask again
@@ -1982,6 +1998,7 @@ async def users_report_html(n: int = 7) -> str:
 # only, it starts again whenever the server restarts.
 STAGED = {              # rule name -> the server version that brought it
     "forward_from_text": "0.73",   # an upload going backwards ("Exit editor") uses a Next shown as plain words
+    "strong_on_help": "0.75",      # after Help, the stronger AI answers the step
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
@@ -3240,7 +3257,7 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
             "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1), "tapped": bool(tapped)}
     if tally:
         step.update(ai_calls=tally["ai"], again=tally["again"][:3], timeouts=tally["timeouts"], backup=tally["backup"],
-                    up=int(tally["up"]))
+                    up=int(tally["up"]), strong=bool(tally.get("strong")))
     s["steps"].append(step)
     # Help is pressed on the instruction the person already had: the step before this answer. Seen 1 Nov: Help on
     # "Tap Scan Document" was filed against the next answer, "Tap Create new", and the AI fixer chased the wrong step.
@@ -3444,7 +3461,8 @@ def _short_screen(screen: list) -> str:
 
 
 def _step_time(st: dict) -> str:
-    bits = (["the phone waited %ds" % st["phone_secs"]] if st.get("phone_secs") else []) + \
+    bits = (["the stronger AI"] if st.get("strong") else []) + \
+           (["the phone waited %ds" % st["phone_secs"]] if st.get("phone_secs") else []) + \
            (["the AI was asked %d times" % st["ai_calls"]] if (st.get("ai_calls") or 0) > 1 else [])
     return "s (%s)" % "; ".join(bits) if bits else "s"
 
