@@ -533,7 +533,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.76"
+SERVER_VERSION = "0.77"
 
 
 @app.get("/health")
@@ -1043,13 +1043,15 @@ def _last_told(history: list) -> str:
     return ""
 
 
-def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = ""):
+def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = "",
+                 video_first: bool = False):
     """On a picker of the person's own videos or photos, in any app, they choose; the AI only says how. Seen on a
     phone: it pointed at YouTube's "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds
     videos YouTube cannot see yet. One shows: ring it. No video shows: ring the "+". Several: no ring.
     explain: the person asked for help (I don't understand, I can't find it). The ring rules stay, but they get an
-    explanation instead of the sentence they already heard: the AI's own words when safe, else a plain one."""
-    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang)
+    explanation instead of the sentence they already heard: the AI's own words when safe, else a plain one.
+    video_first: the staged rule "video_before_plus" (see _plus_second)."""
+    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang, video_first)
     if tmpl is None:
         return label, say
     if not explain:
@@ -1070,13 +1072,16 @@ def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: b
     return lbl, ex["en"].format(eg=eg) + (_EXPLAIN_MORE["en"].format(plus=plus) if plus else "")
 
 
-def _gallery_pick(goal: str, labels: list, label, say: str, lang: str):
+def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_first: bool = False):
     """(label, sentence, kind, plus, items), or a None sentence when this is not a choosing moment in a gallery."""
     is_gallery, videos, photos, more = _gallery(labels)
     if not is_gallery:
         return label, None, "", "", []
     leaving = bool(label and _LEAVE.match(label)) or bool(not label and _LEAVE_SAY.search(say))
-    if label and not leaving and not (_ALBUM.match(label) or _VIDEO_ITEM.match(label) or _PHOTO_ITEM.match(label)):
+    second = video_first and _plus_second(label, say, more)
+    if second:
+        _fired("video_before_plus")
+    if label and not leaving and not second and not (_ALBUM.match(label) or _VIDEO_ITEM.match(label) or _PHOTO_ITEM.match(label)):
         return label, None, "", "", []   # Next, Done, Gallery, the "+" itself...: the AI is past choosing
     if not label and not leaving and not (_CHOOSING.search(say) and _MEDIA_WORDS.search(say)):
         return label, None, "", "", []
@@ -1095,6 +1100,19 @@ def _gallery_pick(goal: str, labels: list, label, say: str, lang: str):
     if kind == "video" and not videos and more:
         return more, t["only"].format(plus=plus), kind, plus, items   # photos often have no names: only safe for videos
     return None, t["many_more" if more else "many"].format(plus=plus), kind, plus, items
+
+
+# 4 Nov, 15:39: the person had just added their video with YouTube's "+" (Select more media). Back on the gallery the AI
+# said "Tap your video, or tap Select more media if it is not here", but rang the "+", which sent them straight back to
+# the picker. When the "+" is only the second choice ("…, or tap + if…"), the ring follows the first: their video.
+_OR = re.compile(r",?\s+\b(?:or|kapena|nangu)\b\s+", re.I)
+
+
+def _plus_second(label, say: str, more) -> bool:
+    if not label or not more or _plain(label).lower() != more.lower():
+        return False
+    first = _OR.split(say, 1)[0]
+    return first != say and bool(_CHOOSING.search(first) and _MEDIA_WORDS.search(first)) and not _MORE.search(first)
 
 
 # The AI names an icon it cannot point at from words alone ("Tap the + button", "Tap the three dots"): a picture helps.
@@ -1256,7 +1274,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if not asked:
         say = _one_action(say, bool(label))
     told_last = _last_told(history)
-    label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last)
+    label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last,
+                              video_first=not asked and _staged("video_before_plus", x_tester == "1"))
     done = bool(data.get("done"))
     plain_all = [_plain(l) for l in labels]
     low_words = [p.lower() for p in plain_all]
@@ -2000,6 +2019,7 @@ async def users_report_html(n: int = 7) -> str:
 STAGED = {              # rule name -> the server version that brought it
     "forward_from_text": "0.73",   # an upload going backwards ("Exit editor") uses a Next shown as plain words
     "strong_on_help": "0.75",      # after Help, the stronger AI answers the step
+    "video_before_plus": "0.77",   # on a gallery, the ring goes to their video, not a "+" named only as a second choice
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
