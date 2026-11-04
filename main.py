@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextvars
 import hashlib
 import hmac
 import html
@@ -45,6 +46,8 @@ IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
 PROMPT_VERSION = "53"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
+# Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
+_TALLY = contextvars.ContextVar("tally", default=None)
 
 # Counters for the owner report. Kept in memory only: no questions, no screen words, no names.
 USAGE = defaultdict(lambda: {"calls": 0, "in": 0, "out": 0, "cost": 0.0})
@@ -247,15 +250,22 @@ async def _complete(system: str, question: str, images: list[str] | None = None,
         # The main AI gets most of the time but leaves room for a backup.
         limit = left if i == len(live) - 1 else max(4.0, left * 0.6)
         t0 = time.time()
+        tally = _TALLY.get()
+        if tally is not None:
+            tally["ai"] += 1
         try:
             call = _call_claude if prov == "claude" else _call_gemini
             text = await asyncio.wait_for(call(model, system, question, images, kind, schema, max_tokens, t0), limit)
             LAT[kind].append(time.time() - t0)
             if i:
                 STATS["backup_used_" + model] += 1
+                if tally is not None:
+                    tally["backup"] = True
             return text
         except Exception as e:
             last = e
+            if tally is not None and isinstance(e, asyncio.TimeoutError):
+                tally["timeouts"] += 1
             code = _status(e)
             STATS["ai_error_" + ("timeout" if isinstance(e, asyncio.TimeoutError) else str(code or "network"))] += 1
             _log_ai_error(e)
@@ -512,7 +522,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.67"
+SERVER_VERSION = "0.69"
 
 
 @app.get("/health")
@@ -578,6 +588,8 @@ async def _ai_json(system: str, prompt: str, images, kind: str, schema: dict, va
             return text, data
         tries.append(text)
         STATS["json_retry"] += 1
+        if _TALLY.get() is not None and attempt < JSON_RETRIES:
+            _TALLY.get()["again"].append("its answer could not be read")
     # Every try was broken: keep the most complete one (a retry can come back worse than the first).
     if tries:
         text = max(tries, key=lambda t: ('"text"' in t or '"say"' in t, len(t)))
@@ -916,6 +928,7 @@ _BLACK_SAY = re.compile(r"\b(screen|picture|display|phone)\b[^.]{0,40}\b(is|look
 # The main button of a screen, for when the AI will not name one (see the black picture rule in next_step)
 _MAIN_BUTTON = re.compile(r"^(upload|save|done|next|ok|send|continue|finish|confirm|post|share|submit|install|allow|accept)$", re.I)
 # Watcher: instructions that need something pointed at. "Hold the camera still" or "do not tap anything yet" do not.
+_GESTURE_FIRST = re.compile(r"^\W*(swipe|scroll|pull)\b", re.I)   # the instruction starts with a gesture, not a tap
 _POINT_ACTION = re.compile(r"\b(tap|press|choose|select|type|open|turn|pick|slide|dinani|kandeni|sankhani|lembani)\b", re.I)
 # "Tap the video you want": the person chooses; ScreenGuide never points at one of their own items for them
 _YOUR_CHOICE = re.compile(r"\b(you want|you need|of your choice|your own)\b", re.I)
@@ -1145,6 +1158,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         user += "\nThe user pressed I'm stuck: the last instruction did not work. Suggest a different way (scroll, go back, or another button)."
     system = NEXT_SYSTEM.format(language=LANGS[lang]) + (SHOT_NOTE if image else "")
     t0 = time.time()
+    tally = {"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": t0 - STARTED}
+    _TALLY.set(tally)
     text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
     # A blocked (black) picture must never beat the screen words. Seen 1 and 2 Nov: Drive's Upload screen had Cancel and
     # Upload, the picture came back black, and the guide said "The screen is black" instead of "Tap Upload". Ask again
@@ -1156,6 +1171,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         image_blocked = True   # the picture shows nothing: never ask it where something is
         user += ("\nThe screen picture came back black only because this app blocks pictures. The screen is not black: "
                  "<screen_words> is what is really on it. Never say the screen is black.")
+        tally["again"].append("the screen picture was black")
         try:   # a second try that fails keeps the first answer (corrected just below): the step never fails because of it
             text, data = await _ai_json(NEXT_SYSTEM.format(language=LANGS[lang]), user, None, "step", NEXT_SCHEMA, _valid_next)
         except HTTPException:
@@ -1172,11 +1188,15 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     # Also a tap with no name at all (3 Nov: "tap the big round button" in the scanner, nothing pointed at).
     named = str(data.get("label") or "").strip() if isinstance(data, dict) else ""
     said = str(data.get("say") or "") if isinstance(data, dict) else ""
+    # A swipe or scroll first ("Swipe down from the top to open the quick settings panel") is not a button the screen hides:
+    # asking again only doubles the wait (#20, 3 Nov: 16 s for step 1).
     unpointed = (isinstance(data, dict) and not data.get("done") and data.get("x") is None and _POINT_ACTION.search(_NEGATED.sub("", said))
+                 and not _GESTURE_FIRST.match(said)
                  and ((named and not _match_label(named, labels)) or (not named and not _label_from_say(said, labels))))
     if (image and unpointed and not image_blocked and not _gallery(labels)[0] and not _YOUR_CHOICE.search(said)
             and not _BLACK_SAY.search(said)):
         STATS["point_from_picture_asked"] += 1
+        tally["again"].append("to find the button in the screen picture")
         ask = (("\u201c%s\u201d is not in <screen_words>: this app hides its words." % _safe(named, 40)) if named
                else "Nothing in <screen_words> is the thing to tap: this app hides its words.")
         try:   # only a better answer is taken; a failed try keeps the first one
@@ -1192,8 +1212,9 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     # Only on a screen whose buttons can clearly be read (3 or more): where an app hides its words (Google's scanner),
     # "not on this screen" would be wrong, and the picture rule above is the one that helps.
     if (not image and named and taps >= 3 and not data.get("done") and data.get("x") is None and not _match_label(named, labels)
-            and _POINT_ACTION.search(_NEGATED.sub("", str(data.get("say") or "")))):
+            and _POINT_ACTION.search(_NEGATED.sub("", str(data.get("say") or ""))) and not _GESTURE_FIRST.match(str(data.get("say") or ""))):
         STATS["missing_button_asked"] += 1
+        tally["again"].append("the button it named was not on the screen")
         try:   # only a better answer is taken; a failed try keeps the first one
             _, again = await _ai_json(system, user + "\n\u201c%s\u201d is not on this screen. Name the button from <screen_words> exactly as "
                                       "it is written, or say what to wait for." % _safe(named, 40), None, "step", NEXT_SCHEMA, _valid_next)
@@ -1283,7 +1304,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if need_picture:
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
-                        need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped)
+                        need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped, tally)
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
@@ -2582,7 +2603,7 @@ _RULE_TEXT = {
                     "Check that step {n} points at a button that is really on this screen."),
     "no_point": ("Could not point on step {n}", "ScreenGuide told them to tap something on step {n} but could not show where.",
                  "Name the exact button from the screen words, or ask the phone for a screen picture."),
-    "slow": ("Slow answer on step {n}", "The answer to step {n} took {secs} seconds. On a weak network people give up.",
+    "slow": ("Slow answer on step {n}", "The answer to step {n} took {secs} seconds. On a weak network people give up. {where}",
              "Send less, or make this kind of step faster."),
     "loop": ("Same instruction three times", "Steps {n0} to {n} said the same thing: the person may be going round in circles.",
              "Notice when the screen does not change, and suggest another way (scroll, go back, another button)."),
@@ -2641,7 +2662,7 @@ def _add_problem(s: dict, kind: str, n: int, **kw):
 
 
 def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, say, x, look, done, need_picture, is_gallery,
-                secs, ai_empty, lang, dev, image, tapped=False) -> int:
+                secs, ai_empty, lang, dev, image, tapped=False, tally=None) -> int:
     """Each guide step on a developer phone: kept (cleaned), checked by the rules. Returns how many problems so far,
     so the phone can flash red when the number goes up."""
     if not tester:
@@ -2662,6 +2683,9 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(told, 140, ours=True),
             "note": _clean_text(note, 100), "stuck": bool(stuck), "label": _clean_word(label) if label else None,
             "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1)}
+    if tally:
+        step.update(ai_calls=tally["ai"], again=tally["again"][:3], timeouts=tally["timeouts"], backup=tally["backup"],
+                    up=int(tally["up"]))
     s["steps"].append(step)
     # Help is pressed on the instruction the person already had: the step before this answer. Seen 1 Nov: Help on
     # "Tap Scan Document" was filed against the next answer, "Tap Create new", and the AI fixer chased the wrong step.
@@ -2678,7 +2702,7 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
             and _POINT_ACTION.search(_NEGATED.sub("", say))):
         _add_problem(s, "no_point", n)
     if secs > 10:
-        _add_problem(s, "slow", n, secs=int(secs))
+        _add_problem(s, "slow", n, secs=int(secs), where=_slow_where(step))
     if n >= 3 and len({_key(t["say"]) for t in s["steps"][-3:]}) == 1:
         _add_problem(s, "loop", n, n0=n - 2)
     if ai_empty:
@@ -2688,7 +2712,10 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     k = _key(say)
     if k and not stuck and not any(p["kind"] in ("repeat", "loop") and _key(p.get("note", "")) == k for p in s["problems"]):
         said = [t for t in s["steps"][:-1] if t["say"]]
-        back = next((t for t in reversed(said[:-1]) if _key(t["say"]) == k), None)
+        # Only when the screen is the same as then: a changed screen (a new video in the gallery after the picker's
+        # Done, 4 Nov) means the person moved forward and the same words are right again.
+        now = {_key(w) for w in step["screen"]}
+        back = next((t for t in reversed(said[:-1]) if _key(t["say"]) == k and {_key(w) for w in t["screen"]} == now), None)
         if said and _key(said[-1]["say"]) == k and tapped and not any(p["kind"] == "loop" and p["step"] == n for p in s["problems"]):
             _add_problem(s, "repeat", n, n0=said[-1]["n"], note=step["say"][:90])
         elif back and said and _key(said[-1]["say"]) != k and not note.strip():
@@ -2746,8 +2773,30 @@ def _valid_review(d) -> bool:
 def _rule_card(p: dict) -> dict:
     t, w, f = _RULE_TEXT[p["kind"]]
     v = dict(n=p["step"], note=p.get("note") or "…", secs=p.get("secs", ""), n0=p.get("n0", ""), detail=p.get("detail") or "…",
-             pic=p.get("pic", ""))
-    return {"step": p["step"], "kind": p["kind"], "title": t.format(**v), "what": w.format(**v), "fix": f.format(**v)}
+             pic=p.get("pic", ""), where=p.get("where", ""))
+    return {"step": p["step"], "kind": p["kind"], "title": t.format(**v), "what": w.format(**v).strip(), "fix": f.format(**v)}
+
+
+def _slow_where(st: dict) -> str:
+    """Where a slow step's time went: the AI, a second try, a backup, the network, or a server that had been asleep.
+    #20 (3 Nov): 41 s on the phone, 16 s on the server, and the AI fixer could not tell why, so it could not fix it."""
+    out = []
+    phone, server = st.get("phone_secs") or 0, st.get("secs") or 0
+    if phone - server >= 3:
+        up = st.get("up")
+        out.append("The phone waited %d seconds; the server's own part was %d seconds. The other %d seconds were %s." % (
+            phone, round(server), phone - round(server),
+            ("most likely the server waking up: it had started only %d seconds before this step (the free plan sleeps "
+             "after 15 quiet minutes, and every update restarts it)" % up) if up is not None and up < 180
+            else "the network between the phone and the server"))
+    calls = st.get("ai_calls") or 0
+    if calls > 1:
+        out.append("The server asked the AI %d times for this step (%s)." % (calls, "; ".join(st.get("again") or []) or "a backup"))
+    if st.get("timeouts"):
+        out.append("The main AI took too long, so %s." % ("a backup AI answered" if st.get("backup") else "the time ran out"))
+    elif calls == 1 and server > 10:
+        out.append("The AI took %d seconds for its one answer: the AI itself was slow." % round(server))
+    return " ".join(out)
 
 
 async def _watch_review_cards(s: dict, pics: list = ()) -> list:
@@ -2826,15 +2875,21 @@ def _short_screen(screen: list) -> str:
     return ", ".join(w + (" ×%d" % k if k > 1 else "") for w, k in out) or "(no words)"
 
 
+def _step_time(st: dict) -> str:
+    bits = (["the phone waited %ds" % st["phone_secs"]] if st.get("phone_secs") else []) + \
+           (["the AI was asked %d times" % st["ai_calls"]] if (st.get("ai_calls") or 0) > 1 else [])
+    return "s (%s)" % "; ".join(bits) if bits else "s"
+
+
 def _watch_issue(s: dict, c: dict) -> tuple:
     if s.get("kind") == "test":
         return _test_issue(s, c)
     title = "Guide problem: %s (%s)" % (c["title"][:70], s["goal"][:50] or "a guide")
     lines = []
     for st in s["steps"]:
-        lines.append("%s%d. said: %s | pointed at: %s%s | %ss%s%s" % (
+        lines.append("%s%d. said: %s | pointed at: %s%s | %s%s%s" % (
             "**→** " if st["n"] == c["step"] else "", st["n"], st["say"], st["label"] or "nothing",
-            " | (answer after Help)" if st["stuck"] else "", st["secs"], " | with a screen picture" if st["picture"] else "",
+            " | (answer after Help)" if st["stuck"] else "", "%s%s" % (st["secs"], _step_time(st)), " | with a screen picture" if st["picture"] else "",
             (" | **then the person pressed Help: “%s”**" % st["help_after"]) if st.get("help_after") else ""))
         lines.append("   screen: " + _short_screen(st["screen"]))
     shown = next((st for st in s["steps"] if st["n"] == c["step"]), s["steps"][-1] if s["steps"] else None)
@@ -2950,7 +3005,11 @@ async def watch_slow(body: WatchSlow, x_app_token: str = Header(default=""), x_i
         return {"watch": len(s["problems"]) if s and x_tester == "1" else 0}
     st = s["steps"][body.step - 1]
     st["phone_secs"] = secs
-    _add_problem(s, "slow", body.step, secs=secs)
+    old = next((p for p in s["problems"] if p["kind"] == "slow" and p["step"] == body.step), None)
+    if old:   # the server's own clock saw it first: keep one problem, with the time the person really waited
+        old.update(secs=max(old["secs"], secs), where=_slow_where(st))
+    else:
+        _add_problem(s, "slow", body.step, secs=secs, where=_slow_where(st))
     s["review"] = None
     return {"watch": len(s["problems"])}
 

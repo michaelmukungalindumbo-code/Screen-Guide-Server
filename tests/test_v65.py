@@ -46,7 +46,8 @@ step([J("Upload", "Tap “Upload”.")], UPLOAD, image="", h=H)
 assert run(main.watch_slow(main.WatchSlow(step=1, ms=20200), **H)) == {"watch": 1}
 s = main._sessions["dev65s"]
 assert [(p["kind"], p["step"], p["secs"]) for p in s["problems"]] == [("slow", 1, 20)] and s["steps"][0]["phone_secs"] == 20
-assert main._rule_card(s["problems"][0])["what"] == "The answer to step 1 took 20 seconds. On a weak network people give up."
+assert main._rule_card(s["problems"][0])["what"].startswith("The answer to step 1 took 20 seconds. On a weak network people give up. ")
+assert "The phone waited 20 seconds" in main._rule_card(s["problems"][0])["what"]   # v0.68: and where the time went
 assert run(main.watch_slow(main.WatchSlow(step=1, ms=25000), **H)) == {"watch": 1}          # once per step
 assert run(main.watch_slow(main.WatchSlow(step=2, ms=8000), **H)) == {"watch": 1}           # 8 s is not slow
 assert run(main.watch_slow(main.WatchSlow(step=99, ms=20000), **H)) == {"watch": 1}         # no such step
