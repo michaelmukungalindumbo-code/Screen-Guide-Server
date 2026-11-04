@@ -57,7 +57,7 @@ store = {}
 async def fake_upstash(cmd):
     if cmd[0] == "GET":
         return store.get(cmd[1])
-    assert cmd[0] == "SET" and cmd[3:] == ["EX", str(90 * 86400)], cmd
+    assert cmd[0] == "SET" and cmd[3:] == ["EX", 90 * 86400], cmd
     store[cmd[1]] = cmd[2]; return "OK"
 main._upstash = fake_upstash
 main.UPSTASH_URL, main.UPSTASH_TOKEN = "https://example.upstash.io", "t"

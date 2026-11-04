@@ -1853,7 +1853,7 @@ async def _counts_put(day: str, doc: dict):
         old = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 7200 - COUNTS_DAYS * 86400))
         await asyncio.to_thread(_store.kv_delete, "counts", old)
     elif UPSTASH_URL and UPSTASH_TOKEN:
-        await _upstash(["SET", "sg:counts:" + day, json.dumps(doc), "EX", str(COUNTS_DAYS * 86400)])
+        await _upstash(["SET", "sg:counts:" + day, json.dumps(doc), "EX", COUNTS_DAYS * 86400])
     else:
         _counts_mem[day] = doc
         for k in sorted(_counts_mem)[:-COUNTS_DAYS]:
