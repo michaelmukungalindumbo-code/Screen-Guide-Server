@@ -20,6 +20,10 @@ In the AI fixer's run, this repository is checked out in `server/`, next to the 
 1. Replay the screen from the issue in a new test first (`tests/test_vNN.py`, NN = the new server version), and run it to
    see it fail. Use the screen words exactly as the issue gives them; "…" stands for words that were removed.
 2. Fix the cause, for every screen like this one, not just this screen. Keep the change small.
+   A new rule that changes what users see (not watcher-only or test-phone-only changes) is **staged**: add it to
+   `STAGED` with the new `SERVER_VERSION`, run it only when `_staged("<name>", x_tester == "1")` is true, and call
+   `_fired("<name>")` when it changes an answer. Test phones get it at once, everyone after 24 quiet hours, and it
+   pauses itself if people press Help right after it far more than usual (the Launch Bay; see `tests/test_v71_launch.py`).
 3. Run `bash tests/run.sh`. Every test must pass.
 4. Bump `SERVER_VERSION` in `main.py` (0.57 becomes 0.58). If you change a prompt, bump `PROMPT_VERSION` too.
 5. Do not commit or push anything in `server/` yourself. A later step in the run sends your server changes as a pull

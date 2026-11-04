@@ -522,11 +522,15 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.70"
+SERVER_VERSION = "0.71"
 
 
 @app.get("/health")
 async def health():
+    try:
+        digest_soon()   # phones visit /health when ScreenGuide opens: on Monday mornings, the weekly users issue
+    except Exception as e:
+        log.warning("Weekly users issue check failed: %s", str(e)[:160])
     return {"ok": True}
 
 
@@ -1133,6 +1137,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         raise HTTPException(429, _limit_message(why, tier, "step-by-step help"))
 
     lang = body.lang if body.lang in LANGS else "en"
+    await _launch_load()   # when this server version went live, and which staged rules are paused
     # Untrusted text goes inside tags, cleaned so it cannot close a tag or hide characters.
     user = ("<goal>%s</goal>\n<already_told>%s</already_told>\n<screen_words>\n%s\n</screen_words>"
             % (_safe(goal, 300), _safe(" | ".join(history), 800) or "(nothing yet)",
@@ -1305,6 +1310,13 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
                         need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped, tally)
+    if x_tester != "1":   # users' phones only, kept across restarts; counting never breaks a step
+        try:
+            _count_step(install_id, labels, dev, body.stuck, time.time() - t0)
+            await _launch_step(install_id, body.stuck, tally)
+        except Exception as e:
+            STATS["count_failed"] += 1
+            log.warning("Step not counted: %s", str(e)[:160])
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep}
@@ -1498,6 +1510,11 @@ async def event(body: Event, x_app_token: str = Header(default=""), x_install_id
     elif ev in ("stop", "done"):
         _watch_end(install_id, ev, guide)
     STATS["%s:%s" % (ev, guide)] += 1
+    if x_tester != "1":
+        try:
+            _count_event(ev, guide)   # users' phones only, kept across restarts
+        except Exception as e:
+            log.warning("Event not counted: %s", str(e)[:160])
     log.info("EVENT %s %s", ev, guide)
     return {"ok": True}
 
@@ -1714,6 +1731,491 @@ async def _db(fn, *a):
     except Exception as e:
         log.warning("Account store error: %s", str(e)[:160])
         raise HTTPException(503, "Your account could not be reached. Please try again.")
+
+
+# ---- The Mother Ship's Performance deck: anonymous counts from users' phones (test phones are left out), per day,
+# kept across restarts. Counts only: guides started, finished and stopped, steps, Help presses and slow answers, by kind
+# of phone and server version, and each screen a guide went through (with its Help presses), named only by common
+# button names that many phones share ("Videos, Settings, Select more media"; every other word is left out). Never what people asked, never
+# their own words. Saved every 10 minutes to the database (DATABASE_URL) or to Upstash (UPSTASH_REDIS_REST_URL and
+# UPSTASH_REDIS_REST_TOKEN); with neither, kept in memory until the next restart.
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().strip("\"'").strip().rstrip("/")   # pasted with quotes: fine
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'").strip()
+COUNTS_DAYS = 90
+COUNTS_FLUSH_SECONDS = 600
+_counts = {}                 # day -> counts not saved yet
+_counts_mem = {}             # day -> saved counts, when there is no database and no Upstash
+_counts_state = {"saved_at": time.time(), "busy": False, "error": ""}
+_bg = set()                  # background saves in progress (kept so they are not dropped)
+
+
+def counts_kind() -> str:
+    return "database" if DATABASE_URL else "Upstash" if (UPSTASH_URL and UPSTASH_TOKEN) else "memory"
+
+
+def _bump(d: dict, path: tuple, n=1):
+    for k in path[:-1]:
+        d = d.setdefault(k, {})
+    d[path[-1]] = d.get(path[-1], 0) + n
+
+
+def _counts_merge(a: dict, b: dict) -> dict:
+    """a + b: numbers add up, lists of phones join (at most 20), words take the newest."""
+    out = dict(a)
+    for k, v in b.items():
+        if isinstance(v, dict):
+            out[k] = _counts_merge(out.get(k) or {}, v)
+        elif isinstance(v, list):
+            out[k] = (list(out.get(k) or []) + [x for x in v if x not in (out.get(k) or [])])[:20]
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = round((out.get(k) or 0) + v, 1)
+        else:
+            out[k] = v
+    return out
+
+
+def _screen_name(labels: list) -> tuple:
+    """(key, words): a screen by its common button names only. Numbers, times and anyone's own words are left out."""
+    words, seen = [], set()
+    for l in labels[:60]:
+        w = _clean_word(l)
+        if w != "…" and not re.search(r"\d", w) and w.lower() not in seen:
+            seen.add(w.lower()); words.append(w)
+    if not words:
+        return "none", "(no common button names)"
+    return _hash("screen:" + "|".join(sorted(seen)), 10), ", ".join(words[:12])
+
+
+def _count_step(install_id: str, labels: list, dev: str, stuck: bool, secs: float):
+    """One guide step on a user's phone (never a test phone: the caller checks)."""
+    d = _counts.setdefault(_today(), {})
+    kind = dev or "unknown phone"
+    _bump(d, ("steps",)); _bump(d, ("secs",), round(secs, 1))
+    if len(d.get("kinds", {})) < 50 or kind in d.get("kinds", {}):
+        _bump(d, ("kinds", kind, "steps"))
+    _bump(d, ("versions", SERVER_VERSION, "steps"))
+    if secs > 10:
+        _bump(d, ("slow",)); _bump(d, ("versions", SERVER_VERSION, "slow"))
+    if stuck:
+        _bump(d, ("help",)); _bump(d, ("versions", SERVER_VERSION, "help"))
+        if kind in d.get("kinds", {}):
+            _bump(d, ("kinds", kind, "help"))
+    key, words = _screen_name(labels)
+    screens = d.setdefault("screens", {})
+    if key in screens or len(screens) < 300:
+        sc = screens.setdefault(key, {"words": words})
+        sc["words"] = words
+        _bump(sc, ("steps",))
+        if stuck:
+            _bump(sc, ("help",))
+            ph, phones = _hash("count:" + install_id, 8), sc.setdefault("phones", [])
+            if ph not in phones and len(phones) < 20:
+                phones.append(ph)
+    _counts_soon()
+
+
+def _count_event(ev: str, guide: str):
+    if ev in ("start", "done", "stop"):
+        d = _counts.setdefault(_today(), {})
+        _bump(d, ("guides", ev))
+        _counts_soon()
+
+
+def _counts_soon():
+    if time.time() - _counts_state["saved_at"] >= COUNTS_FLUSH_SECONDS and not _counts_state["busy"]:
+        try:
+            t = asyncio.get_running_loop().create_task(counts_flush())
+            _bg.add(t); t.add_done_callback(_bg.discard)
+        except RuntimeError:
+            pass
+
+
+async def _upstash(cmd: list):
+    import httpx
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(UPSTASH_URL, headers={"Authorization": "Bearer " + UPSTASH_TOKEN}, json=cmd)
+        r.raise_for_status()
+        return r.json().get("result")
+
+
+async def _counts_get(day: str):
+    if DATABASE_URL:
+        return await asyncio.to_thread(_store.kv_get, "counts", day)
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        r = await _upstash(["GET", "sg:counts:" + day])
+        return json.loads(r) if r else None
+    return _counts_mem.get(day)
+
+
+async def _counts_put(day: str, doc: dict):
+    if DATABASE_URL:
+        await asyncio.to_thread(_store.kv_put, "counts", day, doc)
+        old = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 7200 - COUNTS_DAYS * 86400))
+        await asyncio.to_thread(_store.kv_delete, "counts", old)
+    elif UPSTASH_URL and UPSTASH_TOKEN:
+        await _upstash(["SET", "sg:counts:" + day, json.dumps(doc), "EX", COUNTS_DAYS * 86400])
+    else:
+        _counts_mem[day] = doc
+        for k in sorted(_counts_mem)[:-COUNTS_DAYS]:
+            _counts_mem.pop(k, None)
+
+
+async def counts_flush(force: bool = False):
+    """Saves the counts not saved yet. If saving fails, they are kept for the next try."""
+    global _counts
+    if _counts_state["busy"] or not _counts or (not force and time.time() - _counts_state["saved_at"] < COUNTS_FLUSH_SECONDS):
+        return
+    _counts_state["busy"] = True
+    if _launch_state["dirty"]:
+        await _launch_save()
+    pending, _counts = _counts, {}
+    _counts_state["saved_at"] = time.time()
+    try:
+        for day in sorted(pending):
+            try:
+                await _counts_put(day, _counts_merge(await _counts_get(day) or {}, pending[day]))
+                _counts_state["error"] = ""
+            except Exception as e:
+                _counts[day] = _counts_merge(pending[day], _counts.get(day, {}))
+                _counts_state["error"] = str(e)[:160]
+                STATS["counts_save_failed"] += 1
+                log.warning("Counts not saved (kept for the next try): %s", str(e)[:160])
+    finally:
+        _counts_state["busy"] = False
+
+
+async def counts_days(n: int = 7) -> list:
+    """[(day, counts)] for the last n days, newest first, including counts not saved yet."""
+    out = []
+    for i in range(n):
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 7200 - i * 86400))
+        try:
+            saved = await _counts_get(day) or {}
+        except Exception as e:
+            saved = {}; _counts_state["error"] = str(e)[:160]
+        out.append((day, _counts_merge(saved, _counts.get(day, {}))))
+    return out
+
+
+async def users_report_html(n: int = 7) -> str:
+    """The owner report's "Real users" part: each day, where people pressed Help most, and by kind of phone."""
+    days = await counts_days(n)
+    rows, screens, kinds = "", {}, {}
+    for day, d in days:
+        st, hp, g = d.get("steps", 0), d.get("help", 0), d.get("guides", {})
+        rows += ("<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%d</td><td>%s</td></tr>"
+                 % (day, g.get("start", 0), g.get("done", 0), g.get("stop", 0), st, hp, ("%.1f" % (100.0 * hp / st)) if st else "-",
+                    d.get("slow", 0), ("%.1f s" % (d.get("secs", 0) / st)) if st else "-"))
+        for k, v in (d.get("screens") or {}).items():
+            screens[k] = _counts_merge(screens.get(k, {}), v)
+        for k, v in (d.get("kinds") or {}).items():
+            kinds[k] = _counts_merge(kinds.get(k, {}), v)
+    top = sorted((v for v in screens.values() if v.get("help")), key=lambda v: (-len(v.get("phones") or []), -v.get("help", 0)))[:10]
+    top_rows = "".join("<tr><td>%d</td><td>%d</td><td>%d</td><td>%s</td></tr>" % (len(v.get("phones") or []), v.get("help", 0),
+                       v.get("steps", 0), html.escape(v.get("words", ""))) for v in top)
+    kind_rows = "".join("<tr><td>%s</td><td>%d</td><td>%d</td></tr>" % (html.escape(k), v.get("steps", 0), v.get("help", 0))
+                        for k, v in sorted(kinds.items(), key=lambda kv: -kv[1].get("steps", 0))[:15])
+    where = {"database": "the database (kept for %d days)" % COUNTS_DAYS, "Upstash": "Upstash (kept for %d days)" % COUNTS_DAYS,
+             "memory": "memory only, lost on restart: set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN, or DATABASE_URL"}[counts_kind()]
+    return ("<h3>Real users (test phones left out), last %d days</h3><p class='m'>Saved in %s.%s</p>"
+            "<table><tr><th>Day</th><th>Guides started</th><th>Finished</th><th>Stopped</th><th>Steps</th><th>Help</th>"
+            "<th>Help per 100 steps</th><th>Slow (over 10 s)</th><th>Average answer</th></tr>%s</table>"
+            "<h3>Where users pressed Help most</h3><p class='m'>Screens named by common button names only.</p>"
+            "<table><tr><th>Phones</th><th>Help</th><th>Steps</th><th>Screen</th></tr>%s</table>"
+            "<h3>By kind of phone</h3><table><tr><th>Phone</th><th>Steps</th><th>Help</th></tr>%s</table>"
+            % (n, where, (" <span style='color:#f88'>Last save failed: %s</span>" % html.escape(_counts_state["error"])) if _counts_state["error"] else "",
+               rows, top_rows or "<tr><td colspan=4>No Help presses yet</td></tr>", kind_rows or "<tr><td colspan=3>No steps yet</td></tr>"))
+
+
+# ---- The Mother Ship's Launch Bay (server). A new rule that changes what people see is "staged": on at once for test
+# phones, and for everyone only after its server version has been live for STAGE_HOURS. Any staged rule can be paused at
+# once without an update (PAUSED_RULES on Render, or Pause on the report page), and it pauses itself when people press
+# Help right after it far more often than usual. Its clock is kept with the counts (database or Upstash); in memory
+# only, it starts again whenever the server restarts.
+STAGED = {}            # rule name -> the server version that brought it, for example {"gallery_wait": "0.72"}
+STAGE_HOURS = 24
+PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
+AUTO_PAUSE_MIN = 20    # times a rule changed an answer on users' phones before it may pause itself
+_launch = {"live": {}, "paused": {}, "seen": {}, "users": {"steps": 0, "help": 0}, "digest": ""}
+_launch_state = {"loaded": False, "dirty": False}
+_last_rules = {}       # phone -> (when, the staged rules that changed its last answer)
+
+
+def _staged(name: str, tester: bool) -> bool:
+    """Is this staged rule on for this phone? (Every staged rule is listed in STAGED.)"""
+    ver = STAGED[name]
+    if name in PAUSED_RULES or "all" in PAUSED_RULES or name in _launch["paused"] or "all" in _launch["paused"]:
+        return False
+    if tester:
+        return True
+    since = _launch["live"].get(ver)
+    return since is not None and time.time() - since >= STAGE_HOURS * 3600
+
+
+def _fired(name: str):
+    """A staged rule changed this answer: Help pressed right after it counts against it."""
+    t = _TALLY.get()
+    if t is not None and name not in t.setdefault("rules", []):
+        t["rules"].append(name)
+
+
+async def _launch_get():
+    if DATABASE_URL:
+        return await asyncio.to_thread(_store.kv_get, "launch", "state")
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        r = await _upstash(["GET", "sg:launch:state"])
+        return json.loads(r) if r else None
+    return _counts_mem.get("launch")
+
+
+async def _launch_save():
+    doc = {k: _launch[k] for k in ("live", "paused", "seen", "users", "digest")}
+    try:
+        if DATABASE_URL:
+            await asyncio.to_thread(_store.kv_put, "launch", "state", doc)
+        elif UPSTASH_URL and UPSTASH_TOKEN:
+            await _upstash(["SET", "sg:launch:state", json.dumps(doc)])
+        else:
+            _counts_mem["launch"] = json.loads(json.dumps(doc))
+        _launch_state["dirty"] = False
+    except Exception as e:
+        _launch_state["dirty"] = True
+        log.warning("Launch Bay not saved (kept for the next try): %s", str(e)[:160])
+
+
+async def _launch_load():
+    if _launch_state["loaded"]:
+        return
+    _launch_state["loaded"] = True
+    try:
+        saved = await _launch_get() or {}
+        for k in ("live", "paused", "seen", "users"):
+            if isinstance(saved.get(k), dict):
+                _launch[k] = saved[k]
+        _launch["digest"] = str(saved.get("digest") or "")
+    except Exception as e:
+        log.warning("Launch Bay could not be read: %s", str(e)[:160])
+    if SERVER_VERSION not in _launch["live"]:
+        _launch["live"][SERVER_VERSION] = time.time()   # this version went live now
+        await _launch_save()
+
+
+async def _launch_step(install_id: str, stuck: bool, tally: dict):
+    """A step on a user's phone: Help right after a staged rule counts against it, and may pause it."""
+    now = time.time()
+    _launch["users"]["steps"] = _launch["users"].get("steps", 0) + 1
+    if stuck:
+        _launch["users"]["help"] = _launch["users"].get("help", 0) + 1
+    prev = _last_rules.pop(install_id, None)
+    day = _counts.setdefault(_today(), {})
+    if stuck and prev and now - prev[0] < 600:
+        for r in prev[1]:
+            seen = _launch["seen"].setdefault(r, {"fired": 0, "help_after": 0})
+            seen["help_after"] += 1
+            _bump(day, ("rules", r, "help_after"))
+            await _maybe_pause(r)
+    rules = [r for r in (tally or {}).get("rules") or [] if r in STAGED]
+    for r in rules:
+        _launch["seen"].setdefault(r, {"fired": 0, "help_after": 0})["fired"] += 1
+        _bump(day, ("rules", r, "fired"))
+    if rules and len(_last_rules) < 5000:
+        _last_rules[install_id] = (now, rules)
+    _launch_state["dirty"] = True
+
+
+async def _maybe_pause(rule: str):
+    s, u = _launch["seen"].get(rule) or {}, _launch["users"]
+    fired, after = s.get("fired", 0), s.get("help_after", 0)
+    base = u.get("help", 0) / u["steps"] if u.get("steps") else 0.0
+    rate = after / fired if fired else 0.0
+    if rule in _launch["paused"] or fired < AUTO_PAUSE_MIN or rate < 0.3 or rate < 2 * base:
+        return
+    why = ("people pressed Help right after it %d times in %d (%.0f%%), against %.0f%% of all steps"
+           % (after, fired, 100 * rate, 100 * base))
+    _launch["paused"][rule] = "Paused itself: " + why
+    STATS["rule_paused_itself"] += 1
+    log.warning("Launch Bay: rule %s paused itself: %s", rule, why)
+    await _launch_save()
+    if GITHUB_TOKEN:   # in the background: the person's step never waits for GitHub
+        t = asyncio.get_running_loop().create_task(_paused_issue(rule, why))
+        _bg.add(t); t.add_done_callback(_bg.discard)
+
+
+async def _paused_issue(rule: str, why: str):
+    try:
+        await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {
+            "title": "Launch Bay: rule “%s” paused itself" % rule,
+            "body": ("The server rule **%s** (server %s) was switched off for everyone except test phones, because %s.\n\n"
+                     "Nothing else changed. To look into it, reply here with `@claude`. To switch it back on, open the "
+                     "server report page and tap Resume next to it.\n\n**AI fixer:** find this rule in server/main.py "
+                     "(search for its name) and why it could make people need Help; replay it in a test before "
+                     "changing anything.\n\n<!-- launch-paused: %s -->"
+                     % (rule, STAGED.get(rule, "?"), why, rule))})
+    except Exception as e:
+        log.warning("Launch Bay issue not opened: %s", str(e)[:160])
+
+
+def launch_report_html(key: str) -> str:
+    """The report page's Launch Bay: when each server version went live, how the staged rules are doing, Pause/Resume."""
+    from urllib.parse import quote
+    k = quote(key, safe="")
+    vers = "".join("<tr><td>%s</td><td>%s</td></tr>" % (html.escape(v), time.strftime("%Y-%m-%d %H:%M", time.gmtime(t + 7200)))
+                   for v, t in sorted(_launch["live"].items(), key=lambda kv: -kv[1])[:6])
+    rows = ""
+    for r, ver in sorted(STAGED.items()):
+        s = _launch["seen"].get(r) or {}
+        paused = _launch["paused"].get(r) or ("Paused on Render (PAUSED_RULES)" if r in PAUSED_RULES or "all" in PAUSED_RULES else "")
+        state = paused or ("on for everyone" if _staged(r, False) else "test phones only for now")
+        act = ("<a href='/admin/pause?key=%s&rule=%s&on=0'>Resume</a>" if paused else "<a href='/admin/pause?key=%s&rule=%s&on=1'>Pause</a>") % (k, quote(r))
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%d</td><td>%s</td></tr>" % (
+            html.escape(r), html.escape(ver), html.escape(state), s.get("fired", 0), s.get("help_after", 0), act)
+    return ("<h3>Launch Bay</h3><p class='m'>New rules reach test phones at once and everyone after %d quiet hours. "
+            "A rule pauses itself if people press Help right after it far more than usual.</p>"
+            "<table><tr><th>Server version</th><th>Live since</th></tr>%s</table>"
+            "<table><tr><th>Staged rule</th><th>Version</th><th>State</th><th>Changed answers</th><th>Help right after</th><th></th></tr>%s</table>"
+            "<p><a href='/admin/pause?key=%s&rule=all&on=1'>Pause all staged rules</a> · "
+            "<a href='/admin/pause?key=%s&rule=all&on=0'>Undo pause all</a></p>"
+            % (STAGE_HOURS, vers or "<tr><td colspan=2>Not read yet</td></tr>", rows or "<tr><td colspan=6>No staged rules right now</td></tr>", k, k))
+
+
+@app.get("/admin/pause", response_class=HTMLResponse)
+async def admin_pause(key: str = "", rule: str = "", on: str = "1"):
+    """Pause (on=1) or resume (on=0) a staged rule, or all of them (rule=all), at once, without an update."""
+    _admin(key)
+    await _launch_load()
+    if rule != "all" and rule not in STAGED:
+        raise HTTPException(404, "There is no staged rule called that.")
+    if on == "1":
+        _launch["paused"][rule] = "Paused by the owner"
+    else:
+        _launch["paused"].pop(rule, None)
+        if rule != "all":
+            _launch["seen"].pop(rule, None)   # a fresh start for its automatic pause
+    await _launch_save()
+    from urllib.parse import quote
+    return _page("Launch Bay", "<p>%s <b>%s</b>.</p><p><a href='/admin/report?key=%s'>Back to the report</a></p>"
+                 % ("Paused" if on == "1" else "Resumed", html.escape("every staged rule" if rule == "all" else rule), quote(key, safe="")))
+
+
+# ---- The Mother Ship's weekly look at users (Performance -> Diagnostics and Innovation). Every Monday from 07:00
+# (Zambia time; at the first visit after that, when a phone opens ScreenGuide) one GitHub issue says where users got stuck in the last 7 days, compared with the week before, how each
+# server version did, and which staged rules paused. It has no fixer label: the AI fixer looks at a screen only when the
+# owner replies `@claude look at 2`. Nothing is sent in a week with fewer than DIGEST_MIN_STEPS steps.
+DIGEST_MIN_STEPS = 20
+_digest_state = {"busy": False, "week": "", "tried": 0.0}
+
+
+def _week_id() -> str:
+    return time.strftime("%G-W%V", time.gmtime(time.time() + 7200))
+
+
+def _sum_days(days: list) -> dict:
+    out = {}
+    for _, d in days:
+        out = _counts_merge(out, {k: v for k, v in d.items() if k != "screens"})
+        for k, v in (d.get("screens") or {}).items():
+            out.setdefault("screens", {})[k] = _counts_merge(out.get("screens", {}).get(k, {}), v)
+    return out
+
+
+def _phones_word(n: int) -> str:
+    return "1 phone" if n == 1 else "%d phones" % n if n < 20 else "20 or more phones"   # at most 20 are kept
+
+
+def _per100(d: dict) -> float:
+    return 100.0 * d.get("help", 0) / d["steps"] if d.get("steps") else 0.0
+
+
+def _short_day(day: str) -> str:
+    return "%d %s" % (int(day[8:]), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][int(day[5:7]) - 1])
+
+
+async def digest_text():
+    """(title, body) of this week's issue, or None when users did too little to say anything."""
+    days = await counts_days(15)
+    week, before = days[1:8], days[8:15]          # the 7 days up to yesterday, and the 7 before them
+    w, b = _sum_days(week), _sum_days(before)
+    if w.get("steps", 0) < DIGEST_MIN_STEPS:
+        return None
+    span = "%s to %s" % (_short_day(week[-1][0]), _short_day(week[0][0]))
+    g, gb = w.get("guides", {}), b.get("guides", {})
+    trend = ("" if not b.get("steps") else " (the week before: %.1f)" % _per100(b))
+    lines = ["**Users' phones, %s** (test phones left out). Counts only: no one's own words." % span, "",
+             "- Guides: %d started, %d finished, %d stopped%s." % (g.get("start", 0), g.get("done", 0), g.get("stop", 0),
+                 (" (the week before: %d started, %d finished)" % (gb.get("start", 0), gb.get("done", 0))) if b.get("steps") else ""),
+             "- Steps: %d. Help pressed: %d, which is **%.1f per 100 steps**%s." % (w["steps"], w.get("help", 0), _per100(w), trend),
+             "- Slow answers (over 10 seconds): %d. Average answer: %.1f seconds." % (w.get("slow", 0), w.get("secs", 0) / w["steps"]), ""]
+    vers = sorted(((v, d) for v, d in (w.get("versions") or {}).items() if d.get("steps", 0) >= 10),
+                  key=lambda vd: -_launch["live"].get(vd[0], 0))
+    if vers:
+        lines += ["**Each server version** (newest first): " + "; ".join("%s: %.1f Help per 100 steps (%d steps)" % (v, _per100(d), d["steps"])
+                                                                         for v, d in vers[:4]) + ".", ""]
+    top = sorted((v for v in (w.get("screens") or {}).values() if v.get("help")),
+                 key=lambda v: (-len(v.get("phones") or []), -v.get("help", 0)))[:5]
+    if top:
+        lines += ["**Where people pressed Help most** (screens named by common button names):"]
+        lines += ["%d. %s: Help %d times from %s, in %d steps." % (i + 1, v.get("words", "?"), v.get("help", 0),
+                  _phones_word(len(v.get("phones") or [])), v.get("steps", 0)) for i, v in enumerate(top)]
+        lines += ["", "To have the AI fixer look at one, reply `@claude look at 1` (or 2, 3 ...). It replays that screen in a test "
+                  "before changing anything, and nothing users see changes until you merge its pull request.",
+                  "", "**AI fixer:** these come from counts only (no pictures, no steps). For the screen you are asked about, "
+                  "replay it in a server test with its button names (other words as \u2026), find why people press Help there, "
+                  "and fix the cause as a staged rule (server/CLAUDE.md). If the cause is not clear, say what would help and stop."]
+    else:
+        lines += ["Nobody pressed Help this week."]
+    paused = {r: why for r, why in _launch["paused"].items() if r != "all"}
+    if paused:
+        lines += ["", "**Paused server rules:** " + "; ".join("%s (%s)" % (r, why) for r, why in paused.items())]
+    lines += ["", "<!-- users-week: %s -->" % _week_id()]
+    return "Users this week: where people got stuck (%s)" % span, "\n".join(lines)
+
+
+def digest_soon():
+    """Called often (every visit to /health): on Monday from 07:00 it sends this week's issue once."""
+    lt = time.gmtime(time.time() + 7200)
+    wk = _week_id()
+    if (lt.tm_wday != 0 or lt.tm_hour < 7 or _digest_state["busy"] or wk in (_digest_state["week"], _launch.get("digest"))
+            or time.time() - _digest_state["tried"] < 3600):
+        return
+    try:
+        t = asyncio.get_running_loop().create_task(send_digest(wk))
+        _bg.add(t); t.add_done_callback(_bg.discard)
+    except RuntimeError:
+        pass
+
+
+async def send_digest(wk: str):
+    _digest_state["busy"] = True
+    _digest_state["tried"] = time.time()
+    try:
+        await _launch_load()
+        if _launch.get("digest") == wk:
+            return
+        await counts_flush(force=True)
+        made = await digest_text()
+        if made and GITHUB_TOKEN:
+            marker = "<!-- users-week: %s -->" % wk
+            recent = await _github("GET", "/repos/%s/issues?state=all&per_page=30&sort=created&direction=desc" % AI_FIX_REPO, None)
+            if not any(marker in (i.get("body") or "") for i in recent or []):   # GitHub is the memory: never twice
+                await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": made[0], "body": made[1]})
+                STATS["users_week_issue"] += 1
+        _launch["digest"] = _digest_state["week"] = wk
+        await _launch_save()
+    except Exception as e:
+        log.warning("Weekly users issue not sent (tried again in an hour): %s", str(e)[:160])
+    finally:
+        _digest_state["busy"] = False
+
+
+async def _counts_on_shutdown():
+    await counts_flush(force=True)
+
+
+try:   # a restart or an update: save what is not saved yet (never stops the server from starting)
+    if hasattr(app, "on_event"):
+        app.on_event("shutdown")(_counts_on_shutdown)
+except Exception as e:
+    log.warning("Counts will not be saved on shutdown: %s", str(e)[:160])
 
 
 class GoogleIn(BaseModel):
@@ -3014,6 +3516,11 @@ async def watch_slow(body: WatchSlow, x_app_token: str = Header(default=""), x_i
     st = s["steps"][body.step - 1]
     st["phone_secs"] = secs
     old = next((p for p in s["problems"] if p["kind"] == "slow" and p["step"] == body.step), None)
+    # The free server was waking up (it had just started) and its own part was quick: a known cost of the free plan
+    # that the owner accepted on 4 Nov, not something to fix. The phone already says "Waking up the helper".
+    if not old and st.get("up") is not None and st["up"] < 180 and st.get("secs", 0) <= 10:
+        STATS["slow_waking_not_reported"] += 1
+        return {"watch": len(s["problems"])}
     if old:   # the server's own clock saw it first: keep one problem, with the time the person really waited
         old.update(secs=max(old["secs"], secs), where=_slow_where(st))
     else:
@@ -3428,7 +3935,7 @@ async def privacy():
 <h2>What is kept</h2>
 <ul>
 <li><b>Chats</b> are saved on your phone only. Incognito chats are not saved. You can delete saved chats in the app (menu, Past chats, Clear all) or by removing the app.</li>
-<li><b>Our server</b> does not save your questions, screen words or pictures on disk, apart from the shared and finished guides described above. It keeps counts (for example how many guides finished) in memory, and short answers to common questions for up to a week, so they do not cost money twice and still work when the AI service is down.</li>
+<li><b>Our server</b> does not save your questions, screen words or pictures on disk, apart from the shared and finished guides described above and these counts, kept for up to 90 days: how many guides started and finished, how often Help was pressed, how long answers took, by kind of phone (for example "Infinix phone, Android 14"), and, for each screen a guide went through, the names of its common buttons that appear on many phones (like Settings or Upload; never your own words). Test phones are not counted. It also keeps short answers to common questions for up to a week, so they do not cost money twice and still work when the AI service is down.</li>
 <li><b>Your account (optional).</b> If you sign in with Google, we keep your Google account number, name and email, your ScreenGuide settings, the tasks your phone has learned, and any Plus plan, so they come back on a new phone. Your chats are never sent to your account. Delete it any time in the app (menu, Your account, Delete my account) or use <a href="/account/delete">the account deletion page</a>.</li>
 <li><b>Help during a guide.</b> When you tap Help (?) during a guide, the words on that screen are kept in the server's memory, with numbers and email addresses removed, so we can fix the guide. They are deleted when the server restarts.</li>
 <li><b>Thumbs-down.</b> If you mark an answer as bad, that question and answer are kept in the server's memory, with numbers and email addresses removed, so we can improve the helper. They are deleted when the server restarts.</li>__SAMPLES__
@@ -3547,7 +4054,12 @@ async def admin_report(key: str = ""):
                                  html.escape("\n".join(d.get("trace", "").splitlines()[:14]))) for d in crashes[:20]))
     head = ("<h2>ScreenGuide report</h2><p class='m'>Since the server last started: %.1f hours ago. "
             "The free server restarts when idle, so these numbers reset. Screenshot this page each day.</p>" % hours)
-    body = health + head + spend + quality + (
+    try:
+        await _launch_load()
+        users = await users_report_html(7) + launch_report_html(key)
+    except Exception as e:
+        users = "<p style='color:#f88'>Real-user counts could not be read: %s</p>" % html.escape(str(e)[:160])
+    body = health + head + spend + users + quality + (
             "<h3>AI use</h3><table><tr><th>Kind</th><th>Calls</th><th>Tokens in</th><th>Tokens out</th><th>Average per call (in / out)</th><th>Cost</th></tr>%s</table>"
             "<p>Total AI cost: <b>%s</b>. Finished guides: <b>%d</b>. AI cost per finished guide: <b>%s</b>.</p>"
             "<p class='m'>Prices for claude-haiku-5-5 are built in. For another model, set PRICE_IN_PER_MILLION and PRICE_OUT_PER_MILLION on Render.</p>"

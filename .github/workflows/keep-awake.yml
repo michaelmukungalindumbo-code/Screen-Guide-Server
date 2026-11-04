@@ -1,10 +1,8 @@
-name: Keep the server awake
-# Render's free plan sleeps after 15 quiet minutes, and its first answer after that takes up to a minute.
-# This visits /health every 10 minutes from 06:00 to 22:00 Zambia time (04:00-20:00 UTC), when people use ScreenGuide.
-# That uses about 480 of Render's 750 free hours a month. To stop it: Actions > Keep the server awake > Disable workflow.
+name: Check the server
+# Opens /version once and prints how long the server took to answer (about 30 s means it was asleep) and which version is
+# live. Run it by hand: Actions > Check the server > Run workflow. It no longer runs on a timer: Render's staff say
+# keeping a free service awake is against their rules (4 Nov), and Render turned such visits away anyway.
 on:
-  schedule:
-    - cron: "*/10 4-19 * * *"
   workflow_dispatch:
 jobs:
   ping:

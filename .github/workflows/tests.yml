@@ -9,3 +9,13 @@ jobs:
         with: {python-version: "3.12"}
       - run: python -c "import ast; ast.parse(open('main.py').read())"
       - run: bash tests/run.sh
+  real:
+    # The same server with the real libraries from requirements.txt: catches what only breaks on Render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -q -r requirements.txt httpx
+      - run: python tests/real_start.py
+        env: {PYTHONPATH: ".", GEMINI_API_KEY: ci, APP_TOKEN: ci, ADMIN_KEY: ci}
