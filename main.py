@@ -527,6 +527,7 @@ SERVER_VERSION = "0.71"
 
 @app.get("/health")
 async def health():
+    digest_soon()   # visited every 10 minutes by the keep-awake service: on Monday mornings, the weekly users issue
     return {"ok": True}
 
 
@@ -1925,7 +1926,7 @@ STAGED = {}            # rule name -> the server version that brought it, for ex
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
 AUTO_PAUSE_MIN = 20    # times a rule changed an answer on users' phones before it may pause itself
-_launch = {"live": {}, "paused": {}, "seen": {}, "users": {"steps": 0, "help": 0}}
+_launch = {"live": {}, "paused": {}, "seen": {}, "users": {"steps": 0, "help": 0}, "digest": ""}
 _launch_state = {"loaded": False, "dirty": False}
 _last_rules = {}       # phone -> (when, the staged rules that changed its last answer)
 
@@ -1958,7 +1959,7 @@ async def _launch_get():
 
 
 async def _launch_save():
-    doc = {k: _launch[k] for k in ("live", "paused", "seen", "users")}
+    doc = {k: _launch[k] for k in ("live", "paused", "seen", "users", "digest")}
     try:
         if DATABASE_URL:
             await asyncio.to_thread(_store.kv_put, "launch", "state", doc)
@@ -1981,6 +1982,7 @@ async def _launch_load():
         for k in ("live", "paused", "seen", "users"):
             if isinstance(saved.get(k), dict):
                 _launch[k] = saved[k]
+        _launch["digest"] = str(saved.get("digest") or "")
     except Exception as e:
         log.warning("Launch Bay could not be read: %s", str(e)[:160])
     if SERVER_VERSION not in _launch["live"]:
@@ -2024,16 +2026,23 @@ async def _maybe_pause(rule: str):
     STATS["rule_paused_itself"] += 1
     log.warning("Launch Bay: rule %s paused itself: %s", rule, why)
     await _launch_save()
-    if GITHUB_TOKEN:
-        try:
-            await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {
-                "title": "Launch Bay: rule “%s” paused itself" % rule,
-                "body": ("The server rule **%s** (server %s) was switched off for everyone except test phones, because %s.\n\n"
-                         "Nothing else changed. To look into it, reply here with @claude. To switch it back on, open the "
-                         "server report page and tap Resume next to it.\n\n<!-- launch-paused: %s -->"
-                         % (rule, STAGED.get(rule, "?"), why, rule))})
-        except Exception as e:
-            log.warning("Launch Bay issue not opened: %s", str(e)[:160])
+    if GITHUB_TOKEN:   # in the background: the person's step never waits for GitHub
+        t = asyncio.get_running_loop().create_task(_paused_issue(rule, why))
+        _bg.add(t); t.add_done_callback(_bg.discard)
+
+
+async def _paused_issue(rule: str, why: str):
+    try:
+        await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {
+            "title": "Launch Bay: rule “%s” paused itself" % rule,
+            "body": ("The server rule **%s** (server %s) was switched off for everyone except test phones, because %s.\n\n"
+                     "Nothing else changed. To look into it, reply here with `@claude`. To switch it back on, open the "
+                     "server report page and tap Resume next to it.\n\n**AI fixer:** find this rule in server/main.py "
+                     "(search for its name) and why it could make people need Help; replay it in a test before "
+                     "changing anything.\n\n<!-- launch-paused: %s -->"
+                     % (rule, STAGED.get(rule, "?"), why, rule))})
+    except Exception as e:
+        log.warning("Launch Bay issue not opened: %s", str(e)[:160])
 
 
 def launch_report_html(key: str) -> str:
@@ -2076,6 +2085,116 @@ async def admin_pause(key: str = "", rule: str = "", on: str = "1"):
     from urllib.parse import quote
     return _page("Launch Bay", "<p>%s <b>%s</b>.</p><p><a href='/admin/report?key=%s'>Back to the report</a></p>"
                  % ("Paused" if on == "1" else "Resumed", html.escape("every staged rule" if rule == "all" else rule), quote(key, safe="")))
+
+
+# ---- The Mother Ship's weekly look at users (Performance -> Diagnostics and Innovation). Every Monday from 07:00
+# (Zambia time) one GitHub issue says where users got stuck in the last 7 days, compared with the week before, how each
+# server version did, and which staged rules paused. It has no fixer label: the AI fixer looks at a screen only when the
+# owner replies `@claude look at 2`. Nothing is sent in a week with fewer than DIGEST_MIN_STEPS steps.
+DIGEST_MIN_STEPS = 20
+_digest_state = {"busy": False, "week": "", "tried": 0.0}
+
+
+def _week_id() -> str:
+    return time.strftime("%G-W%V", time.gmtime(time.time() + 7200))
+
+
+def _sum_days(days: list) -> dict:
+    out = {}
+    for _, d in days:
+        out = _counts_merge(out, {k: v for k, v in d.items() if k != "screens"})
+        for k, v in (d.get("screens") or {}).items():
+            out.setdefault("screens", {})[k] = _counts_merge(out.get("screens", {}).get(k, {}), v)
+    return out
+
+
+def _phones_word(n: int) -> str:
+    return "1 phone" if n == 1 else "%d phones" % n if n < 20 else "20 or more phones"   # at most 20 are kept
+
+
+def _per100(d: dict) -> float:
+    return 100.0 * d.get("help", 0) / d["steps"] if d.get("steps") else 0.0
+
+
+def _short_day(day: str) -> str:
+    return "%d %s" % (int(day[8:]), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][int(day[5:7]) - 1])
+
+
+async def digest_text():
+    """(title, body) of this week's issue, or None when users did too little to say anything."""
+    days = await counts_days(15)
+    week, before = days[1:8], days[8:15]          # the 7 days up to yesterday, and the 7 before them
+    w, b = _sum_days(week), _sum_days(before)
+    if w.get("steps", 0) < DIGEST_MIN_STEPS:
+        return None
+    span = "%s to %s" % (_short_day(week[-1][0]), _short_day(week[0][0]))
+    g, gb = w.get("guides", {}), b.get("guides", {})
+    trend = ("" if not b.get("steps") else " (the week before: %.1f)" % _per100(b))
+    lines = ["**Users' phones, %s** (test phones left out). Counts only: no one's own words." % span, "",
+             "- Guides: %d started, %d finished, %d stopped%s." % (g.get("start", 0), g.get("done", 0), g.get("stop", 0),
+                 (" (the week before: %d started, %d finished)" % (gb.get("start", 0), gb.get("done", 0))) if b.get("steps") else ""),
+             "- Steps: %d. Help pressed: %d, which is **%.1f per 100 steps**%s." % (w["steps"], w.get("help", 0), _per100(w), trend),
+             "- Slow answers (over 10 seconds): %d. Average answer: %.1f seconds." % (w.get("slow", 0), w.get("secs", 0) / w["steps"]), ""]
+    vers = sorted(((v, d) for v, d in (w.get("versions") or {}).items() if d.get("steps", 0) >= 10),
+                  key=lambda vd: -_launch["live"].get(vd[0], 0))
+    if vers:
+        lines += ["**Each server version** (newest first): " + "; ".join("%s: %.1f Help per 100 steps (%d steps)" % (v, _per100(d), d["steps"])
+                                                                         for v, d in vers[:4]) + ".", ""]
+    top = sorted((v for v in (w.get("screens") or {}).values() if v.get("help")),
+                 key=lambda v: (-len(v.get("phones") or []), -v.get("help", 0)))[:5]
+    if top:
+        lines += ["**Where people pressed Help most** (screens named by common button names):"]
+        lines += ["%d. %s: Help %d times from %s, in %d steps." % (i + 1, v.get("words", "?"), v.get("help", 0),
+                  _phones_word(len(v.get("phones") or [])), v.get("steps", 0)) for i, v in enumerate(top)]
+        lines += ["", "To have the AI fixer look at one, reply `@claude look at 1` (or 2, 3 ...). It replays that screen in a test "
+                  "before changing anything, and nothing users see changes until you merge its pull request.",
+                  "", "**AI fixer:** these come from counts only (no pictures, no steps). For the screen you are asked about, "
+                  "replay it in a server test with its button names (other words as \u2026), find why people press Help there, "
+                  "and fix the cause as a staged rule (server/CLAUDE.md). If the cause is not clear, say what would help and stop."]
+    else:
+        lines += ["Nobody pressed Help this week."]
+    paused = {r: why for r, why in _launch["paused"].items() if r != "all"}
+    if paused:
+        lines += ["", "**Paused server rules:** " + "; ".join("%s (%s)" % (r, why) for r, why in paused.items())]
+    lines += ["", "<!-- users-week: %s -->" % _week_id()]
+    return "Users this week: where people got stuck (%s)" % span, "\n".join(lines)
+
+
+def digest_soon():
+    """Called often (every visit to /health): on Monday from 07:00 it sends this week's issue once."""
+    lt = time.gmtime(time.time() + 7200)
+    wk = _week_id()
+    if (lt.tm_wday != 0 or lt.tm_hour < 7 or _digest_state["busy"] or wk in (_digest_state["week"], _launch.get("digest"))
+            or time.time() - _digest_state["tried"] < 3600):
+        return
+    try:
+        t = asyncio.get_running_loop().create_task(send_digest(wk))
+        _bg.add(t); t.add_done_callback(_bg.discard)
+    except RuntimeError:
+        pass
+
+
+async def send_digest(wk: str):
+    _digest_state["busy"] = True
+    _digest_state["tried"] = time.time()
+    try:
+        await _launch_load()
+        if _launch.get("digest") == wk:
+            return
+        await counts_flush(force=True)
+        made = await digest_text()
+        if made and GITHUB_TOKEN:
+            marker = "<!-- users-week: %s -->" % wk
+            recent = await _github("GET", "/repos/%s/issues?state=all&per_page=30&sort=created&direction=desc" % AI_FIX_REPO, None)
+            if not any(marker in (i.get("body") or "") for i in recent or []):   # GitHub is the memory: never twice
+                await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, {"title": made[0], "body": made[1]})
+                STATS["users_week_issue"] += 1
+        _launch["digest"] = _digest_state["week"] = wk
+        await _launch_save()
+    except Exception as e:
+        log.warning("Weekly users issue not sent (tried again in an hour): %s", str(e)[:160])
+    finally:
+        _digest_state["busy"] = False
 
 
 async def _counts_on_shutdown():

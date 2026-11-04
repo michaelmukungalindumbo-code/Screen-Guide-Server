@@ -76,7 +76,9 @@ main._launch["seen"]["test_rule"] = {"fired": 20, "help_after": 4}   # 20%: unde
 run(main._maybe_pause("test_rule"))
 assert "test_rule" not in main._launch["paused"] and not issues
 main._launch["seen"]["test_rule"] = {"fired": 20, "help_after": 10}  # 50%, ten times normal
-run(main._maybe_pause("test_rule"))
+async def pause_and_wait():
+    await main._maybe_pause("test_rule"); await asyncio.sleep(0.05)   # the GitHub issue is sent in the background
+run(pause_and_wait())
 assert main._launch["paused"]["test_rule"].startswith("Paused itself: people pressed Help right after it 10 times in 20 (50%)")
 assert not main._staged("test_rule", False) and len(issues) == 1
 assert issues[0][2]["title"] == "Launch Bay: rule “test_rule” paused itself" and "@claude" in issues[0][2]["body"], issues
