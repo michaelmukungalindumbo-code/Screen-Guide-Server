@@ -522,7 +522,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.72"
+SERVER_VERSION = "0.73"
 
 
 @app.get("/health")
@@ -1269,6 +1269,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             label, say = None, _PICK_FILE.get(lang, _PICK_FILE["en"])
     if label and _EXITISH.match(label) and _MAKING.search(goal):
         fwd = next((_plain(l) for l in labels if _FORWARD.match(_plain(l)) and not l.rstrip().lower().endswith("[text]")), None)
+        # 4 Nov, YouTube's Shorts editor: Next is plain words inside a tappable box ([text]), so "Tap Exit editor" stayed
+        # and sent the upload backwards. The phone rings the tappable box around such words.
+        if not fwd and _staged("forward_from_text", x_tester == "1"):
+            fwd = next((_plain(l) for l in labels if _FORWARD.match(_plain(l))), None)
+            if fwd:
+                _fired("forward_from_text")
         if fwd:
             STATS["kept_going_forward"] += 1
             label, say = fwd, _TAP_WORD.get(lang, _TAP_WORD["en"]) % fwd
@@ -1974,7 +1980,9 @@ async def users_report_html(n: int = 7) -> str:
 # once without an update (PAUSED_RULES on Render, or Pause on the report page), and it pauses itself when people press
 # Help right after it far more often than usual. Its clock is kept with the counts (database or Upstash); in memory
 # only, it starts again whenever the server restarts.
-STAGED = {}            # rule name -> the server version that brought it, for example {"gallery_wait": "0.72"}
+STAGED = {              # rule name -> the server version that brought it
+    "forward_from_text": "0.73",   # an upload going backwards ("Exit editor") uses a Next shown as plain words
+}
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
 AUTO_PAUSE_MIN = 20    # times a rule changed an answer on users' phones before it may pause itself

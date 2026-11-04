@@ -103,5 +103,8 @@ assert main._launch["live"][main.SERVER_VERSION] == live_before and "test_rule" 
 page = main.launch_report_html("k")
 assert "test_rule" in page and "Paused itself" in page and "/admin/pause?key=k&rule=test_rule&on=0" in page, page
 assert main.STAGED.pop("test_rule")
+assert "test_rule" not in main.launch_report_html("k")
+real = dict(main.STAGED); main.STAGED.clear()                         # v0.73: real staged rules exist now
 assert "No staged rules right now" in main.launch_report_html("k")
+main.STAGED.update(real)
 print("launch bay ok")
