@@ -36,8 +36,17 @@ r = step("Scan Document", SCAN, DRIVE + ["1 upload complete [text]"], tapped=Tru
 assert kinds() == ["repeat"] and r["watch"] == 1, kinds()
 card = main._rule_card(main._sessions["dev58"]["problems"][0])
 assert card["title"] == "Step 2 repeated step 1" and "“Tap “Scan Document” to start scanning your paper.” again" in card["what"], card
+main.PAUSED_RULES = {"loop_breaker"}                             # 0.78: the loop breaker steps in here (just below)
 step("Scan Document", SCAN, DRIVE, tapped=True)
 assert kinds() == ["repeat", "loop"], kinds()                    # three in a row is the old "loop"; no second "repeat"
+main.PAUSED_RULES = set()
+# 0.78, the loop breaker: tapped twice and nothing changed, so it is not said a third time; the watcher says why
+HL = dict(H, x_install_id="dev58l")
+run(main.event(main.Event(event="start", guide="ai"), **HL))
+step("Scan Document", SCAN, DRIVE, h=HL)
+step("Scan Document", SCAN, DRIVE + ["1 upload complete [text]"], tapped=True, h=HL)
+r = step("Scan Document", SCAN, DRIVE, tapped=True, h=HL)
+assert kinds("dev58l") == ["repeat", "circles"] and r["say"] == main._NOT_SURE, (kinds("dev58l"), r)
 
 # It also counts when the instruction comes back after other steps (the scanner's own screens in between)
 H2 = dict(H, x_install_id="dev58b")
