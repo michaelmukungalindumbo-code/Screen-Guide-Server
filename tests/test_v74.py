@@ -34,7 +34,7 @@ assert "backwards" not in kinds("w3"), kinds("w3")
 start("w4"); step("w4", ["Back [tap]", "Display [tap]"], "Back", "Tap “Back”.", goal="Turn on dark mode"); assert kinds("w4") == []
 
 # The AI review checks every step against the goal (prompt version 54)
-assert "Check every step against the goal" in main.REVIEW_SYSTEM and main.PROMPT_VERSION == "54"
+assert "Check every step against the goal" in main.REVIEW_SYSTEM and main.PROMPT_VERSION >= "54"   # 55 since 0.78
 
 # A guide the server forgot (it restarted): the phone is told, instead of seeing nothing at all
 assert run(main.watch_review(**H("never-seen"))) == {"problems": [], "lost": True}
