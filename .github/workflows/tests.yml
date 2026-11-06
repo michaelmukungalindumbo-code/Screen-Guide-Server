@@ -19,3 +19,17 @@ jobs:
       - run: pip install -q -r requirements.txt httpx
       - run: python tests/real_start.py
         env: {PYTHONPATH: ".", GEMINI_API_KEY: ci, APP_TOKEN: ci, ADMIN_KEY: ci}
+  real-ai:
+    # Real conversations from the owner's phone tests, asked to the real AI (tests/real_ai_check.py, cases in
+    # tests/real_ai_cases.json). A wrong answer blocks the update, so Render does not deploy it. A few cents a run.
+    # Needs the ANTHROPIC_API_KEY secret; without it, it warns and does not block. Not on every branch push: on pull
+    # requests and on main (main is what Render deploys).
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -q -r requirements.txt httpx
+      - run: python tests/real_ai_check.py
+        env: {PYTHONPATH: ".", ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}"}

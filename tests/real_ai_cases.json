@@ -1,0 +1,74 @@
+{
+  "about": "Real conversations from the owner's phone tests, asked to the real AI before every server update (tests/real_ai_check.py). Each check is about the words of the answer, goal and plan together, in lower case. all: every group must have at least one of its words. none: none of these may appear. kind: guide or answer, when it matters. Add a case for every chat that went wrong.",
+  "cases": [
+    {
+      "name": "6 Nov: WhatsApp, then the chat background means WhatsApp's",
+      "history": ["User: How do I set up WhatsApp on a new phone?",
+                  "Helper: WhatsApp is already on your phone. To set it up, open it, agree to the terms, type your phone number and the code they send you."],
+      "question": "How do I change the background display in the chat",
+      "all": [["whatsapp"], ["theme", "wallpaper", "background"]],
+      "none": ["customize screenguide", "agree and continue", "phone number"]
+    },
+    {
+      "name": "6 Nov: the correction goes back to WhatsApp's chat background, not to setting up WhatsApp",
+      "history": ["User: How do I set up WhatsApp on a new phone?",
+                  "Helper: WhatsApp is already on your phone. To set it up, open it, agree to the terms, type your phone number and the code they send you.",
+                  "User: How do I change the background display in the chat",
+                  "Helper: To change the chat background, open the ScreenGuide menu and pick Customize ScreenGuide, then Chat background."],
+      "question": "What do you mean screen guide, did I ask you anything about screen guide in the first message in this chat?",
+      "all": [["whatsapp"], ["theme", "wallpaper", "background"]],
+      "none": ["agree and continue", "type your phone number", "enter your phone number"]
+    },
+    {
+      "name": "6 Nov: wallpaper, right after WhatsApp's chat background",
+      "history": ["User: How do I change the background display in the chat on WhatsApp",
+                  "Helper: In WhatsApp, open Settings, then Chats, then Default chat theme, and pick a wallpaper or colour."],
+      "question": "How do I use my own photo for it?",
+      "all": [["whatsapp"], ["photo", "gallery", "picture"]],
+      "none": ["customize screenguide"]
+    },
+    {
+      "name": "6 Nov: ScreenGuide's chat background, named",
+      "history": [],
+      "question": "How do I change the background display in screen guide",
+      "kind": "guide",
+      "all": [["screenguide"], ["background"]],
+      "none": ["whatsapp"]
+    },
+    {
+      "name": "6 Nov: log out, right after asking about ScreenGuide",
+      "history": ["User: How do I change the background display in screen guide",
+                  "Helper: You can change the chat background in ScreenGuide from its menu. Tap Show me and I will point to each step."],
+      "question": "How do I logout",
+      "all": [["screenguide"], ["sign out", "your account", "log out"]],
+      "none": ["whatsapp"]
+    },
+    {
+      "name": "WhatsApp's chat background, named",
+      "history": [],
+      "question": "How do I change my WhatsApp chat background?",
+      "all": [["whatsapp"], ["theme", "wallpaper", "background"]],
+      "none": ["customize screenguide"]
+    },
+    {
+      "name": "5 Nov: CapCut is not on the phone",
+      "history": [],
+      "question": "How do I use capcut",
+      "apps": ["Chrome", "Gmail", "Messages", "Phone", "Photos", "Play Store", "Settings", "WhatsApp", "YouTube"],
+      "all": [["capcut"], ["install", "play store"]]
+    },
+    {
+      "name": "Money is never a guide on the screen",
+      "history": [],
+      "question": "How do I send money on mobile money",
+      "kind": "answer"
+    },
+    {
+      "name": "A plain phone task is a guide",
+      "history": [],
+      "question": "how do I turn on wifi",
+      "kind": "guide",
+      "all": [["wi-fi", "wifi"]]
+    }
+  ]
+}
