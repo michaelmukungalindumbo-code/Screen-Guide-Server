@@ -540,7 +540,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.82"
+SERVER_VERSION = "0.83"
 
 
 @app.get("/health")
@@ -1221,6 +1221,32 @@ def _type_step(goal: str, labels: list, label, say: str):
 _MONEY_WORDS = re.compile(r"\b(money|momo|bank|wallet|loan|cash|pay|kwacha|airtel|mtn|zamtel)\b", re.I)
 
 
+# ---- An app that is not on the screen (#40, 6 Nov): "Swipe up to see all your apps" while the phone's own Search box
+# was right there, and the person pressed Help: "why didn't you just tell me to search". Typing one short app name is
+# quicker and surer than looking through every app.
+_ALL_APPS_SAY = re.compile(r"\b(?:swipe|scroll)\s+up\b.{0,40}?\ball\s+(?:of\s+)?(?:your\s+|the\s+)?apps\b|\bapp\s+(?:list|drawer)\b", re.I)
+_APP_SEARCH = re.compile(r"^search(?:\s+(?:apps|your phone|phone|apps and more))?$", re.I)
+_APP_NAME = r"([A-Z][\w&'+-]*(?:\s+[A-Z][\w&'+-]*){0,2})(?:\s+app)?"
+_APP_FROM_SAY = (re.compile(r"^\W*(?:the\s+)?" + _APP_NAME + r"\s+is\s+not\s+(?:on|in|visible)\b"),
+                 re.compile(r"\b(?:find|open)\s+(?:the\s+)?" + _APP_NAME + r"(?=\s*[.,!?]|\s+(?:and|then)\b|\s*$)"))
+_APP_FROM_GOAL = re.compile(r"\b(?:[Ww]ith|[Oo]pen|[Uu]sing|[Ii]n)\s+(?:the\s+)?" + _APP_NAME + r"(?=\s*[.,!?]|\s+(?:and|to|then)\b|\s*$)")
+
+
+def _search_for_app(goal: str, labels: list, label, say: str):
+    """(label, say) to tap the phone's Search box and type the app's name, when the AI said to swipe up through all
+    the apps and that Search box is on the screen; else None. English only: no checked Nyanja or Bemba words yet."""
+    if label or not _ALL_APPS_SAY.search(say):
+        return None
+    box = next((_plain(l) for l in labels if l.rstrip().lower().endswith("[tap]") and _APP_SEARCH.match(_plain(l))), None)
+    if not box or _MONEY_WORDS.search(goal) or RISKY.search(goal):
+        return None
+    m = next((m for m in (rx.search(say) for rx in _APP_FROM_SAY) if m), None) or _APP_FROM_GOAL.search(goal)
+    name = m.group(1).strip() if m else ""
+    if name and (_MONEY_WORDS.search(name) or RISKY.search(name) or _key(name) in ("home", "search", "swipe")):
+        return None
+    return box, "Tap “%s”, then type %s." % (box, name or "the app’s name")
+
+
 # ---- The loop breaker (5 Nov, the owner chose it). Every bad test had the same shape: the same instruction again and
 # again, and Help (YouTube's editor, WhatsApp Business, the Play Store's search box). Whatever the app, ScreenGuide
 # notices, tries another way once with the stronger AI told what did not work, and then says it is not sure.
@@ -1443,6 +1469,11 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     told_last = _last_told(history)
     label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last,
                               video_first=not asked and _staged("video_before_plus", x_tester == "1"))
+    found = _search_for_app(goal, labels, label, say) if lang == "en" and not data.get("done") else None
+    if found and _staged("search_for_app", x_tester == "1"):
+        STATS["search_for_app"] += 1
+        _fired("search_for_app")
+        label, say = found
     done = bool(data.get("done"))
     plain_all = [_plain(l) for l in labels]
     low_words = [p.lower() for p in plain_all]
@@ -2213,6 +2244,7 @@ STAGED = {              # rule name -> the server version that brought it
     "type_in_open_box": "0.78",    # on a text box that is open ([typing]), the step says what to type, not to tap it again
     "longer_app_name": "0.78",     # "WhatsApp Business" is never matched to "WhatsApp" on the screen
     "loop_breaker": "0.78",        # going round in circles: another way with the stronger AI, then honest
+    "search_for_app": "0.83",      # an app not on the screen: tap the phone's Search box and type its name, not swipe up
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
