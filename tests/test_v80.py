@@ -17,5 +17,5 @@ assert main._clean_text("Change the chat background in ScreenGuide", ours=True) 
 assert main._clean_word("Customize ScreenGuide") == "Customize ScreenGuide" and main._clean_word("Green") == "Green"
 assert main._clean_text("Send a photo to Mary", ours=True) == "Send a photo to …"
 assert main._clean_word("Mary") == "…"
-assert main.SERVER_VERSION >= "0.80" and main.PROMPT_VERSION == "57"
+assert main.SERVER_VERSION >= "0.80" and main.PROMPT_VERSION >= "57"   # 58 since 0.81
 print("Show me for ScreenGuide's own settings; its name is not hidden")
