@@ -50,7 +50,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "57"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "58"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -296,9 +296,10 @@ What you are (always say the same thing):
 - So never say you cannot show them, never apologise for being able to show them, and never ask them to describe their screen for a phone task. Tell them to tap Show me.
 - In this chat itself you only see what they type, plus any picture they attach.
 - Do not suggest other helper or chat apps unless the user clearly asks which app to install for a job.
-- ScreenGuide's own settings are in its menu: the three dots at the top of this chat. "Customize ScreenGuide" has Your name, Language, Speak the steps, Speaking speed, Size of the step card, How I explain, Colours (light or dark), Chat background (the colour behind this chat) and Vibrate on each step. "Settings and permissions" has Smart guide, Screen pictures, Scam guard, the Read button and Explain error messages. For a question about changing ScreenGuide itself, use kind "guide": Show me points at each step inside ScreenGuide. Name ScreenGuide and the setting in the goal, for example goal "Change the chat background in ScreenGuide" with plan: Tap the three dots at the top | Tap Customize ScreenGuide | Tap Chat background | Choose a colour.
+- ScreenGuide's own menu is the three dots at the top of this chat. It has: "Your account" (Sign in with Google, Sign out, Delete my account), Chats, Learn your phone, Teach a task, Incognito, Your plan, "Customize ScreenGuide", "Settings and permissions", Stay safe from scams and About ScreenGuide. "Customize ScreenGuide" has Your name, Language, Speak the steps, Speaking speed, Size of the step card, How I explain, Colours (light or dark), Chat background (a colour, or Your photo from the gallery) and Vibrate on each step. "Settings and permissions" has Smart guide, Screen pictures, Scam guard, the Read button and Explain error messages. For a question about changing ScreenGuide itself, use kind "guide": Show me points at each step inside ScreenGuide. Name ScreenGuide and the setting in the goal, for example goal "Change the chat background in ScreenGuide" with plan: Tap the three dots at the top | Tap Customize ScreenGuide | Tap Chat background | Choose a colour.
 
 How to answer:
+- A short follow-up that names no app ("how do I log out?", "and the colour?") is about the app or topic of <conversation> just before it. Ask which app only when <conversation> does not say. Your text, goal and plan are always about the same app.
 - Answer in {language}. If you are not confident in that language, answer in very simple English and say so in one short sentence.
 - Be brief: at most 60 words, unless the user asks for more. Short, simple sentences. No jargon.
 - Do not end every answer with the same warning. Mention that menu names can differ between phones at most once in a conversation, and only when you give steps.
@@ -534,7 +535,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.80"
+SERVER_VERSION = "0.81"
 
 
 @app.get("/health")
@@ -655,6 +656,17 @@ async def _answer(question: str, lang: str, images: list[str], history: list[str
     text, data = await _ai_json(system, prompt, images or None, kind, ASK_SCHEMA, _valid_ask)
     if not text:
         raise HTTPException(502, "Sorry, I could not answer that.")
+    # 6 Nov: "How do I logout", right after a question about ScreenGuide: the words said "the steps inside ScreenGuide"
+    # and the steps opened WhatsApp. When the words and the steps are about different apps, ask once more.
+    if isinstance(data, dict) and data.get("kind") == "guide" and _mixed_apps(str(data.get("text") or ""), str(data.get("goal") or ""), data.get("plan")):
+        STATS["mixed_apps_asked"] += 1
+        try:   # only a readable second answer is taken; a failed try keeps the first one
+            t2, d2 = await _ai_json(system, prompt + "\nYour words were about ScreenGuide itself, but your goal or plan opened another app. "
+                                    "Make the text, goal and plan about the same app.", images or None, kind, ASK_SCHEMA, _valid_ask)
+            if t2 and isinstance(d2, dict) and str(d2.get("text") or "").strip():
+                text, data = t2, d2
+        except HTTPException:
+            STATS["second_try_failed"] += 1
     kind, out = "answer", text
     if isinstance(data, dict) and isinstance(data.get("text"), str) and data["text"].strip():
         out = data["text"].strip()
@@ -746,6 +758,20 @@ MONEY = re.compile(r"\b(mobile money|momo|airtel money|zamtel kwacha|kwacha|send
 
 
 VAGUE = re.compile(r"\b(it|this|that|them|there)\b", re.I)
+
+
+_ABOUT_US = re.compile(r"\b(?:in|inside|within|of)\s+ScreenGuide\b|\bScreenGuide['\u2019]s\b", re.I)
+_OPENS = re.compile(r"^\W*(?:open|launch|start|go to)\s+(?:the\s+)?(.+?)(?:\s+app)?\s*[.!]?$", re.I)
+
+
+def _mixed_apps(text: str, goal: str, plan) -> bool:
+    """The words or the goal are about ScreenGuide itself, but the first step opens another app."""
+    first = str(plan[0]) if isinstance(plan, list) and plan else ""
+    m = _OPENS.match(first)
+    opens = m.group(1) if m else ""
+    if not opens or "screenguide" in _key(opens):
+        return False
+    return bool(_ABOUT_US.search(text)) or "screenguide" in _key(goal)
 
 
 def _goal_context(goal: str, question: str, history: list) -> str:
