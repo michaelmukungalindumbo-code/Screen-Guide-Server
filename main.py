@@ -50,7 +50,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "55"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "56"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -296,6 +296,7 @@ What you are (always say the same thing):
 - So never say you cannot show them, never apologise for being able to show them, and never ask them to describe their screen for a phone task. Tell them to tap Show me.
 - In this chat itself you only see what they type, plus any picture they attach.
 - Do not suggest other helper or chat apps unless the user clearly asks which app to install for a job.
+- ScreenGuide's own settings are in its menu: the three dots at the top of this chat. "Customize ScreenGuide" has Your name, Language, Speak the steps, Speaking speed, Size of the step card, How I explain, Colours (light or dark), Chat background (the colour behind this chat) and Vibrate on each step. "Settings and permissions" has Smart guide, Screen pictures, Scam guard, the Read button and Explain error messages. For a question about changing ScreenGuide itself, use kind "answer" and give these steps in words (Show me cannot point inside ScreenGuide), for example: Tap the three dots at the top, then Customize ScreenGuide, then Chat background, and choose a colour.
 
 How to answer:
 - Answer in {language}. If you are not confident in that language, answer in very simple English and say so in one short sentence.
@@ -533,7 +534,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.78"
+SERVER_VERSION = "0.79"
 
 
 @app.get("/health")
@@ -1904,7 +1905,7 @@ async def _verify_google(id_token: str):
     return {"sub": str(d["sub"]), "email": d.get("email", ""), "name": d.get("name") or d.get("given_name") or ""}
 
 
-_PROFILE_KEYS = {"name", "lang", "voice", "rate", "text", "words", "theme", "buzz", "smart", "shots"}
+_PROFILE_KEYS = {"name", "lang", "voice", "rate", "text", "words", "theme", "chat_bg", "buzz", "smart", "shots"}   # chat_bg: app 0.78
 
 
 def _clean_profile(p) -> dict:

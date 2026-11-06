@@ -56,5 +56,5 @@ main._launch["live"][main.STAGED["type_in_open_box"]] -= 25 * 3600
 r = step(OPEN, None, "Tap the search bar at the top.", tester=False, i="user78t")
 assert r["say"] == "Type “CapCut”.", r
 assert main._launch["seen"]["type_in_open_box"]["fired"] == 1
-assert main.SERVER_VERSION >= "0.78" and main.PROMPT_VERSION == "55"
+assert main.SERVER_VERSION >= "0.78" and main.PROMPT_VERSION >= "55"   # 56 since 0.79
 print("an open box gets what to type, not another tap")
