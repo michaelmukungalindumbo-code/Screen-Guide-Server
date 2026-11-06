@@ -540,7 +540,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.82"
+SERVER_VERSION = "0.83"
 
 
 @app.get("/health")
@@ -1201,6 +1201,32 @@ _GOAL_FIND = re.compile(r"^\s*(?:install|download|get|find|search for|look for)\
                         r"(?:from|on|in)\s+(?:the\s+)?(?:play store|palm store|app store|google play)\b", re.I)
 
 
+# #39, 6 Nov: the list of all apps was open with a Search box at the top, and the app was out of sight. "Swipe up to see
+# all your apps" with nothing pointed at left the person stuck. Searching finds any app on any launcher.
+_ALL_APPS_SAY = re.compile(r"\b(all (your |the )?apps|app drawer|apps? list|list of apps)\b", re.I)
+_APP_SEARCH = re.compile(r"^(search|search apps?|search your apps|search (your )?phone( and more)?)\W*$", re.I)
+_NOT_HERE_NAME = re.compile(r"^\W*(.{2,30}?) is not (visible )?on (this|the) screen", re.I)
+
+
+def _search_for_app(labels: list, ai_label, say: str, lang: str):
+    """(label, say) pointing at the screen's Search box when the AI said to swipe for an app that is not on the screen,
+    else None."""
+    if not _ALL_APPS_SAY.search(say):
+        return None
+    box = next((_plain(l) for l in labels if _APP_SEARCH.match(_plain(l)) and not l.rstrip().lower().endswith("[text]")), None)
+    if not box:
+        return None
+    app = _plain(str(ai_label or "")).strip(" “”\"'")
+    if not app or _match_label(app, labels):
+        m = _NOT_HERE_NAME.match(say)
+        app = m.group(1).strip(" “”\"'") if m else ""
+    if not app or _match_label(app, labels) or RISKY.search(app) or MONEY.search(app) or _MONEY_WORDS.search(app):
+        return None
+    if lang != "en":   # no checked Nyanja or Bemba words for "then type": the tap alone
+        return box, _TAP_WORD.get(lang, _TAP_WORD["en"]) % box
+    return box, "%s is not on this screen. Tap “%s”, then type %s." % (app, box, app)
+
+
 def _type_step(goal: str, labels: list, label, say: str):
     """(label, say) when a text box is open and the AI asked them to tap a box again, else None. English only: there
     are no checked Nyanja or Bemba words for this yet."""
@@ -1464,6 +1490,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             STATS["plus_named"] += 1
             label = plus
             say = _one_action(say, True)
+    if not done and not label and not (image and data.get("x") is not None) and _staged("search_for_app", x_tester == "1"):
+        found = _search_for_app(labels, data.get("label"), say, lang)
+        if found:
+            STATS["search_for_app"] += 1
+            _fired("search_for_app")
+            label, say = found
     # Android's file list: the person picks their own file. Old steps ("Tap the + button, then Upload") do not apply.
     if not done and sum(1 for w in low_words if w in _FILE_PICKER) >= 3 and re.search(r"\b(upload|attach|send|share)\b", goal, re.I):
         if not _FILE_WORDS.search(say) and not (label and label.lower() in _FILE_PICKER):
@@ -2213,6 +2245,7 @@ STAGED = {              # rule name -> the server version that brought it
     "type_in_open_box": "0.78",    # on a text box that is open ([typing]), the step says what to type, not to tap it again
     "longer_app_name": "0.78",     # "WhatsApp Business" is never matched to "WhatsApp" on the screen
     "loop_breaker": "0.78",        # going round in circles: another way with the stronger AI, then honest
+    "search_for_app": "0.83",      # an app not on a screen with a Search box: point at Search, not "swipe up"
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
