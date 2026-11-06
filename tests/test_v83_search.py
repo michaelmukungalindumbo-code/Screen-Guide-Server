@@ -53,6 +53,22 @@ assert "type" not in r["say"].lower(), r
 r = step(HOME, SWIPE, lang="ny", i="dev83h")
 assert r["label"] is None, r
 
+# From the other fixer run (#39, the same screen): the AI named nothing and only said it in words
+r = step(HOME, "Drive is not on this screen. Swipe up to see all your apps.", i="dev83i")
+assert r["label"] == "Search" and r["say"] == "Tap “Search”, then type Drive.", r
+# A home screen whose box is called "Search apps"
+r = step(["Phone [tap]", "Messages [tap]", "Camera [tap]", "Search apps [tap]"], "Swipe up to see all your apps, then find Drive.", i="dev83j")
+assert r["label"] == "Search apps" and r["say"] == "Tap “Search apps”, then type Drive.", r
+# The same list with no Search box: the swipe stays
+r = step(HOME[:-1], SWIPE, i="dev83k")
+assert r["label"] is None and "swipe up" in r["say"].lower(), r
+# A swipe that has nothing to do with finding an app is left alone
+r = step(HOME, "Swipe up to see more settings.", goal="Turn on Bluetooth", i="dev83l")
+assert r["label"] is None and "swipe up" in r["say"].lower(), r
+# Never searching for a mobile money app
+r = step(HOME, "MTN MoMo is not on this screen. Swipe up to see all your apps.", goal="Send money with MTN MoMo", i="dev83m")
+assert r["label"] != "Search" and "type" not in r["say"].lower(), r
+
 # Staged: users' phones get it only after 24 quiet hours
 main._launch["live"].pop(main.STAGED["search_for_app"], None)
 r = step(HOME, SWIPE, tester="0", i="user83")
