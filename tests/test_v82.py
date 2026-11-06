@@ -52,5 +52,29 @@ r = step("Change my WhatsApp number", "Change phone number", "Tap “Change phon
 assert r["label"] == "Change phone number", r
 r = step("Log out of WhatsApp", "Log out", "Tap “Log out”.")
 assert r["label"] == "Log out", r
+# 4. The stronger AI (Sonnet 5.5) refuses thinking "disabled" and names "between_tools" (6 Nov, the first real-AI check).
+# Dropping the setting left it thinking before every answer; the server now uses the setting the service named.
+class Err(Exception):
+    def __init__(self, msg): super().__init__(msg); self.status_code = 400
+SONNET_SAYS = ("Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'To turn thinking "
+               "off on this model, send \"thinking\": {\"type\": \"between_tools\"} instead of {\"type\": \"disabled\"}.'}}")
+class Refuses(Msgs):
+    async def create(self, **kw):
+        if kw.get("extra_body", {}).get("thinking") == {"type": "disabled"}:
+            self.calls.append(kw); raise Err(SONNET_SAYS)
+        return await super().create(**kw)
+main._feat.clear()
+main._strong_chat_day.clear()   # part 1 used up the day's limit
+main._claude_client = Client([])
+main._claude_client.messages = Refuses([A("In WhatsApp, open Settings.")] * 3)
+main._TALLY.set(None)
+run(main._answer("And the colour?", "en", [], HIST))
+calls = main._claude_client.messages.calls
+assert calls[0]["model"] == main.STRONG_MODEL and calls[0]["extra_body"]["thinking"] == {"type": "disabled"}
+assert calls[1]["extra_body"]["thinking"] == {"type": "between_tools"}, calls[1].get("extra_body")
+assert calls[1]["extra_body"]["output_config"]["effort"] == "low"
+run(main._answer("And the colour?", "en", [], HIST))   # remembered: no refused call the second time
+assert len(calls) == 3 and calls[2]["extra_body"]["thinking"] == {"type": "between_tools"}
+assert main._feats("claude-haiku-5-5")["thinking"] is True   # the fast AI keeps "disabled"
 assert main.SERVER_VERSION >= "0.82" and main.PROMPT_VERSION >= "59"
 print("follow-ups by the stronger AI; 'the chat' is the app talked about; no account change nobody asked for")

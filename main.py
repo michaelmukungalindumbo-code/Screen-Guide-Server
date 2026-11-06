@@ -170,7 +170,9 @@ def _drop(msg: str, f: dict, has_schema: bool) -> bool:
     if "effort" in m and f["effort"]:
         f["effort"] = False
     elif "thinking" in m and f["thinking"]:
-        f["thinking"] = False
+        # Sonnet 5.5 refuses "disabled" and names "between_tools" as its way to think nothing up front. Dropping the
+        # setting instead would leave it on its default, thinking first: slower, dearer, and it can cut answers off.
+        f["thinking"] = "between_tools" if "between_tools" in m and f["thinking"] is True else False
     elif has_schema and f["schema"] and any(w in m for w in ("format", "schema", "output_config", "json")):
         f["schema"] = False
     elif "output_config" in m and f["effort"]:
@@ -196,7 +198,7 @@ async def _call_claude(model, system, question, images, kind, schema, max_tokens
         # cheap and never cut off (thinking counts toward max_tokens).
         body, oc = {}, {}
         if f["thinking"]:
-            body["thinking"] = {"type": "disabled"}
+            body["thinking"] = {"type": "disabled" if f["thinking"] is True else f["thinking"]}
         if f["effort"]:
             oc["effort"] = "low"
         if schema and f["schema"]:   # structured outputs: the reply always matches the schema
