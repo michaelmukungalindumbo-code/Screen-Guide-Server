@@ -29,6 +29,13 @@ In the AI fixer's run, this repository is checked out in `server/`, next to the 
 5. Do not commit or push anything in `server/` yourself. A later step in the run sends your server changes as a pull
    request. Write its title on the first line of `media/server-fix.md`, then a short plain-English description.
 
+## Chat answers and the real AI (learned 6 Nov)
+
+The tests above use a pretend AI, so they cannot show how the real AI answers. A prompt change that fixed one chat broke
+another, and only a phone test showed it. So for every chat that went wrong, also add the conversation to
+`tests/real_ai_cases.json` (what a right answer must and must not say). GitHub's `real-ai` check asks the real AI all of
+them before an update reaches Render, and a wrong answer blocks it.
+
 ## When you cannot reproduce a problem (learned 4 Nov)
 
 - Do not stop at "probably the phone", "probably Android" or "probably the network". Check our own side first: replay

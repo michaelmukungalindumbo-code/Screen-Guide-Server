@@ -39,6 +39,8 @@ KNOWN_PRICES = {"claude-haiku-5-5": (0.10, 0.50),     # platform.claude.com/docs
 # price of a normal step (about US$0.005-0.01 each). At most STRONG_PER_DAY a day; after that, the normal AI.
 STRONG_MODEL = os.getenv("STRONG_MODEL", "claude-sonnet-5-5").strip()
 STRONG_PER_DAY = int(os.getenv("STRONG_PER_DAY", "100"))
+STRONG_CHATS_PER_DAY = int(os.getenv("STRONG_CHATS_PER_DAY", "300"))   # chat follow-ups answered by the stronger AI
+_strong_chat_day = defaultdict(int)
 _strong_day = defaultdict(int)
 _known = KNOWN_PRICES.get(settings.ANTHROPIC_MODEL, (0.0, 0.0))
 PRICE_IN = float(os.getenv("PRICE_IN_PER_MILLION", "0") or 0) or _known[0]
@@ -50,7 +52,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "58"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "59"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -296,10 +298,11 @@ What you are (always say the same thing):
 - So never say you cannot show them, never apologise for being able to show them, and never ask them to describe their screen for a phone task. Tell them to tap Show me.
 - In this chat itself you only see what they type, plus any picture they attach.
 - Do not suggest other helper or chat apps unless the user clearly asks which app to install for a job.
-- ScreenGuide's own menu is the three dots at the top of this chat. It has: "Your account" (Sign in with Google, Sign out, Delete my account), Chats, Learn your phone, Teach a task, Incognito, Your plan, "Customize ScreenGuide", "Settings and permissions", Stay safe from scams and About ScreenGuide. "Customize ScreenGuide" has Your name, Language, Speak the steps, Speaking speed, Size of the step card, How I explain, Colours (light or dark), Chat background (a colour, or Your photo from the gallery) and Vibrate on each step. "Settings and permissions" has Smart guide, Screen pictures, Scam guard, the Read button and Explain error messages. For a question about changing ScreenGuide itself, use kind "guide": Show me points at each step inside ScreenGuide. Name ScreenGuide and the setting in the goal, for example goal "Change the chat background in ScreenGuide" with plan: Tap the three dots at the top | Tap Customize ScreenGuide | Tap Chat background | Choose a colour.
+- ScreenGuide's own menu is the three dots at the top of this chat. It has: "Your account" (Sign in with Google, Sign out, Delete my account), Chats, Learn your phone, Teach a task, Incognito, Your plan, "Customize ScreenGuide", "Settings and permissions", Stay safe from scams and About ScreenGuide. "Customize ScreenGuide" has Your name, Language, Speak the steps, Speaking speed, Size of the step card, How I explain, Colours (light or dark), Chat background (a colour, or Your photo from the gallery) and Vibrate on each step. "Settings and permissions" has Smart guide, Screen pictures, Scam guard, the Read button and Explain error messages. A question is about ScreenGuide itself only when the person names ScreenGuide or says "this app" or "here". Otherwise "the chat", "chat background" or "wallpaper" means the app you are talking about (WhatsApp's chat theme, the phone's own wallpaper), never ScreenGuide's. For a question about changing ScreenGuide itself, use kind "guide": Show me points at each step inside ScreenGuide. Name ScreenGuide and the setting in the goal, for example goal "Change the chat background in ScreenGuide" with plan: Tap the three dots at the top | Tap Customize ScreenGuide | Tap Chat background | Choose a colour.
 
 How to answer:
 - A short follow-up that names no app ("how do I log out?", "and the colour?") is about the app or topic of <conversation> just before it. Ask which app only when <conversation> does not say. Your text, goal and plan are always about the same app.
+- When the person corrects you ("I meant…", "did I ask about…?", "no, I asked…"), say sorry in a few words, then answer the question they really asked, from their own earlier words in <conversation>. Never go back to an older topic they did not ask about again.
 - Answer in {language}. If you are not confident in that language, answer in very simple English and say so in one short sentence.
 - Be brief: at most 60 words, unless the user asks for more. Short, simple sentences. No jargon.
 - Do not end every answer with the same warning. Mention that menu names can differ between phones at most once in a conversation, and only when you give steps.
@@ -535,7 +538,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.81"
+SERVER_VERSION = "0.82"
 
 
 @app.get("/health")
@@ -645,6 +648,13 @@ async def _answer(question: str, lang: str, images: list[str], history: list[str
         if size + len(h) > 2400:
             break
         past.insert(0, h); size += len(h)
+    # Follow-ups (6 Nov, the owner chose): the earlier conversation matters, and the small AI lost track of it (WhatsApp,
+    # then ScreenGuide, then the phone's wallpaper). The stronger AI answers them; first questions stay with the fast
+    # one. At most STRONG_CHATS_PER_DAY a day.
+    if past and _strong_chat_day[_today()] < STRONG_CHATS_PER_DAY:
+        _strong_chat_day[_today()] += 1
+        _TALLY.set({"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": 0, "strong": True})
+        STATS["strong_chats"] += 1
     dev = _device(device)
     names = _apps(apps or [])
     prompt = ("<device>" + dev + "</device>\n" if dev else "") + \
@@ -1164,6 +1174,8 @@ _ICON = re.compile(r"(?:^|[\s\"“(])(?:\+|⋮|…)(?=$|[\s\"”).,])|\b(?:icon|
                    r"camera button|round button|circle|back arrow|arrow|magnifying glass|gear|cog|bell|hamburger)\b", re.I)
 
 
+_ACCOUNT_CHANGE = re.compile(r"\bchange\b.{0,25}?\bnumber\b|\bdelete\b.{0,20}?\baccount\b|\bdeactivate\b|\bremove\s+account\b", re.I)
+_NOT_ASKED = {"en": "That button changes your account, and you did not ask for that. I will not point at it. Tell me what you want to do."}
 RISKY = re.compile(r"\b(pay|payment|transfer|withdraw|send money|buy|purchase|checkout|pin|password|passcode|erase|"
                    r"factory reset|reset phone|delete account|approve)\b", re.I)
 
@@ -1482,6 +1494,11 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         elif 2 <= len(lf) and not RISKY.search(lf) and not (_key(lf) in _key(body.note) and "not in" in body.note.lower()):
             look = lf   # (never the word the phone just said is missing from this list)
             STATS["look_for"] += 1
+    # 6 Nov: "Set up WhatsApp" on a phone where it was set up already pointed at WhatsApp's "Change phone number". A step
+    # that changes the person's account is pointed at only when their goal asks for exactly that.
+    if label and _ACCOUNT_CHANGE.search(label) and not _ACCOUNT_CHANGE.search(goal):
+        STATS["account_change_blocked"] += 1
+        label, say = None, _NOT_ASKED.get(lang, _NOT_ASKED["en"])
     if label and RISKY.search(label):
         STATS["risky_label_blocked"] += 1
         label, say = None, "Read this screen carefully. If you are sure, do this step yourself. I will not point at it."
