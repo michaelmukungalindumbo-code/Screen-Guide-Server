@@ -69,7 +69,7 @@ r = step(GAL, None, WANT, i="dev83b")
 assert r["say"] == WANT, r
 
 # Staged (the Launch Bay): users' phones get it once 0.83 has been live for 24 hours; test phones at once
-assert main.STAGED["after_plus"] == "0.83"
+assert main.STAGED["after_plus"] == "0.84"   # 0.83 never went live alone: it reaches Render inside 0.84
 def round_trip(i, tester):
     main._loops.pop(i, None)
     step(GAL, None, WANT, i=i, tester=tester)
