@@ -930,6 +930,26 @@ def _key(s: str) -> str:
     return re.sub(r"[^0-9a-z]", "", _plain(s).lower())
 
 
+# v0.84 (the owner, 7 Nov: "What happens when you are using YouTube, and then an ad pops up?"): another app's ad that
+# covers the screen, from its own words. A "Sponsored" post in a feed does not cover it. The app has the same rules (AdScreen).
+_AD_SKIP = re.compile(r"^(skip ads?|skip ads? in \d+.*|skip in \d+.*|close ad|close advertisement|close the ad)$", re.I)
+_AD_COVER = re.compile(r"^(visit advertiser|ad\s*[\u00b7\u2022\u2027:]\s*\d.*|ad\s+\d+\s+of\s+\d+.*|.*will play after (the )?ads?|"
+                       r"your video will (play|begin) after (the )?ads?|advertisement|why this ad\??|adchoices|ad choices)$", re.I)
+
+
+def _ad_covers(labels: list[str]) -> bool:
+    return any(_AD_SKIP.match(_plain(l)) or _AD_COVER.match(_plain(l)) for l in labels)
+
+
+def _ad_skip(labels: list[str]):
+    """The ad's own way out, once it can be tapped ("Skip ad", "Close ad"; YouTube's plain "Skip" on an ad), or None."""
+    words = [_plain(l) for l in labels]
+    s = next((w for w in words if _AD_SKIP.match(w) and not re.search(r"\bin \d+", w, re.I)), None)
+    if s is None and _ad_covers(labels):
+        s = next((w for w in words if w.lower() == "skip"), None)
+    return s
+
+
 def _match_label(label, labels: list[str], apps: bool = False):
     """The screen word the AI meant, without its tag. The AI may drop the tag, change case or add quotes.
     apps: the staged rule "longer_app_name" (see _OTHER_APP)."""
@@ -1768,6 +1788,17 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["risky_label_blocked"] += 1
         label, say = None, "Read this screen carefully. If you are sure, do this step yourself. I will not point at it."
         image = ""   # and no picture point at it either
+    # The owner (7 Nov): an ad pops up in YouTube. The AI is told never to point at ads; this makes sure: on an ad that covers
+    # the screen, only its own "Skip ad" or "Close ad" is rung, never Install, Learn more or Visit advertiser.
+    if not done and _ad_covers(labels) and _staged("ad_buttons", x_tester == "1"):
+        skip = _ad_skip(labels)
+        if label != skip:
+            STATS["ad_button_blocked"] += 1
+            _fired("ad_buttons")
+            label, look = skip, None
+            say = ("This is an ad. Wait a few seconds for \u201cSkip ad\u201d, or for the ad to end. Do not tap anything else on it."
+                   if not skip else "This is an ad. Tap \u201c%s\u201d to go on." % ("Close ad" if skip.lower().startswith("close") else "Skip ad"))
+        image = ""   # no picture point on an ad either
     x = _fraction(data.get("x")) if image and not label else None
     y = _fraction(data.get("y")) if image and not label else None
     if x is None or y is None:
@@ -2615,6 +2646,7 @@ STAGED = {              # rule name -> the server version that brought it
     "after_plus": "0.84",          # back on a gallery from its "+": the "+" is not offered again; a new video is rung
     "known_screens": "0.84",       # an answer people followed on this screen for this goal is given again without the AI
     "missing_button_picture": "0.84",  # a button still not on the screen after asking again: said so, and a picture next
+    "ad_buttons": "0.84",          # on another app's ad that covers the screen, only its "Skip ad" or "Close ad" is rung
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
