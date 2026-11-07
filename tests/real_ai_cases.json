@@ -69,6 +69,14 @@
       "question": "how do I turn on wifi",
       "kind": "guide",
       "all": [["wi-fi", "wifi"]]
+    },
+    {
+      "name": "7 Nov: Safe folder is part of the Files app, never an app to install (the owner: a new user can think it is an app)",
+      "history": [],
+      "question": "How do I open the Safe Folder app?",
+      "apps": ["Chrome", "Files", "Photos", "Play Store", "Settings", "WhatsApp"],
+      "all": [["files"]],
+      "none": ["install safe folder", "download safe folder", "search for safe folder", "safe folder app from the play store"]
     }
   ]
 }

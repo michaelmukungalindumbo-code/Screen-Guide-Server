@@ -10,9 +10,9 @@ import logging
 import re
 import secrets
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -52,7 +52,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "59"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "60"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -355,6 +355,15 @@ def _take(minute: deque, day: deque, glob: deque, per_minute: int, per_day: int,
     return ""
 
 
+def _give_back(minute: deque, day: deque, glob: deque) -> None:
+    """v0.84 (the owner's test, 7 Nov, no AI credit): the helper could not answer, so the question or step is not counted.
+    Each failed "Try again" used one of the day's free questions, and an outage used up a person's whole day."""
+    for q in (minute, day, glob):
+        if q:
+            q.pop()
+    STATS["given_back"] += 1
+
+
 def _limit_message(why: str, tier: str, what: str) -> str:
     STATS["limit_" + why] += 1
     if why == "minute":
@@ -369,11 +378,11 @@ def _limit_message(why: str, tier: str, what: str) -> str:
 
 def _allow(install_id: str, tier: str = "free") -> str:
     return _take(_minute[install_id], _day[install_id], _global,
-                 settings.PER_INSTALL_PER_MINUTE, LIMITS[tier][0], settings.GLOBAL_PER_DAY)
+                 settings.PER_INSTALL_PER_MINUTE, LIMITS[tier][0] + _ad_bonus(install_id)[0], settings.GLOBAL_PER_DAY)
 
 
 def _left(install_id: str, tier: str) -> int:
-    return max(0, LIMITS[tier][0] - len(_day[install_id]))
+    return max(0, LIMITS[tier][0] + _ad_bonus(install_id)[0] - len(_day[install_id]))
 
 
 # ---- Access codes: printed or sent by SMS, sold to organisations. No database needed: each code carries
@@ -540,7 +549,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.82"
+SERVER_VERSION = "0.84"
 
 
 @app.get("/health")
@@ -753,6 +762,8 @@ async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: st
         old = stale() if e.status_code in (502, 503, 504) else None
         if old:
             return old
+        if e.status_code >= 500:
+            _give_back(_minute[install_id], _day[install_id], _global)
         raise
     partial = r.pop("_partial", False)
     if LOG_SAMPLES:
@@ -886,6 +897,8 @@ Rules:
 - Keep moving forward. In an editor or a form that belongs to the goal (after choosing a video, writing a post), the next tap is usually Next, Done, Upload, Post or Save. Point at back, close, exit or cancel only when the person is clearly in the wrong place.
 - If the goal is to check or see something and the screen already shows the answer, say what it shows in a few words, use label null and set done true. Never point at a switch just to show its state: a tap would change it.
 - <user_note> may say what the person just did on the phone (scrolled the list, typed in a box). Use it to understand the new screen.
+- <path> is where the person has been in this guide, oldest first. Use it to understand where they are going; never send them back along it unless they are in the wrong place.
+- <often> is what other people tapped on this same screen, and how many times. Use it only if it fits the goal and is in <screen_words>.
 - <device> tells you the phone maker and whether it is a phone or a tablet. Menu names and places differ by maker. On a tablet, an app's main buttons are often in a list down the side instead of a bar at the bottom.
 - After a scan is uploaded, Drive shows its file list again, with the new "Scanned" PDF files in it. That means the upload is finished: set done true. Never say "wait, it is uploading" twice in a row.
 - In the camera, some buttons appear only when it sees something (Scan for a document, a link for a QR code). If the goal needs one and it is not in <screen_words>, use label null and say: Hold the camera still over the paper. Opening the camera does not finish the goal."""
@@ -901,7 +914,7 @@ _s_global = deque()
 
 def _allow_step(install_id: str, tier: str = "free") -> str:
     return _take(_s_minute[install_id], _s_day[install_id], _s_global,
-                 settings.STEP_PER_INSTALL_PER_MINUTE, LIMITS[tier][1], settings.STEP_GLOBAL_PER_DAY)
+                 settings.STEP_PER_INSTALL_PER_MINUTE, LIMITS[tier][1] + _ad_bonus(install_id)[1], settings.STEP_GLOBAL_PER_DAY)
 
 
 _TAG = re.compile(r"\s*\[(switch|tap|text|selected|typing)\]\s*$", re.I)
@@ -915,6 +928,26 @@ def _plain(s: str) -> str:
 
 def _key(s: str) -> str:
     return re.sub(r"[^0-9a-z]", "", _plain(s).lower())
+
+
+# v0.84 (the owner, 7 Nov: "What happens when you are using YouTube, and then an ad pops up?"): another app's ad that
+# covers the screen, from its own words. A "Sponsored" post in a feed does not cover it. The app has the same rules (AdScreen).
+_AD_SKIP = re.compile(r"^(skip ads?|skip ads? in \d+.*|skip in \d+.*|close ad|close advertisement|close the ad)$", re.I)
+_AD_COVER = re.compile(r"^(visit advertiser|ad\s*[\u00b7\u2022\u2027:]\s*\d.*|ad\s+\d+\s+of\s+\d+.*|.*will play after (the )?ads?|"
+                       r"your video will (play|begin) after (the )?ads?|advertisement|why this ad\??|adchoices|ad choices)$", re.I)
+
+
+def _ad_covers(labels: list[str]) -> bool:
+    return any(_AD_SKIP.match(_plain(l)) or _AD_COVER.match(_plain(l)) for l in labels)
+
+
+def _ad_skip(labels: list[str]):
+    """The ad's own way out, once it can be tapped ("Skip ad", "Close ad"; YouTube's plain "Skip" on an ad), or None."""
+    words = [_plain(l) for l in labels]
+    s = next((w for w in words if _AD_SKIP.match(w) and not re.search(r"\bin \d+", w, re.I)), None)
+    if s is None and _ad_covers(labels):
+        s = next((w for w in words if w.lower() == "skip"), None)
+    return s
 
 
 def _match_label(label, labels: list[str], apps: bool = False):
@@ -1100,14 +1133,14 @@ def _last_told(history: list) -> str:
 
 
 def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = "",
-                 video_first: bool = False):
+                 video_first: bool = False, back=None):
     """On a picker of the person's own videos or photos, in any app, they choose; the AI only says how. Seen on a
     phone: it pointed at YouTube's "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds
     videos YouTube cannot see yet. One shows: ring it. No video shows: ring the "+". Several: no ring.
     explain: the person asked for help (I don't understand, I can't find it). The ring rules stay, but they get an
     explanation instead of the sentence they already heard: the AI's own words when safe, else a plain one.
-    video_first: the staged rule "video_before_plus" (see _plus_second)."""
-    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang, video_first)
+    video_first: the staged rule "video_before_plus" (see _plus_second). back: the staged rule "after_plus"."""
+    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang, video_first, back)
     if tmpl is None:
         return label, say
     if not explain:
@@ -1128,8 +1161,9 @@ def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: b
     return lbl, ex["en"].format(eg=eg) + (_EXPLAIN_MORE["en"].format(plus=plus) if plus else "")
 
 
-def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_first: bool = False):
-    """(label, sentence, kind, plus, items), or a None sentence when this is not a choosing moment in a gallery."""
+def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_first: bool = False, back=None):
+    """(label, sentence, kind, plus, items), or a None sentence when this is not a choosing moment in a gallery.
+    back: the staged rule "after_plus" (see _plus_back): fingerprints of the items there before they went to the "+"."""
     is_gallery, videos, photos, more = _gallery(labels)
     if not is_gallery:
         return label, None, "", "", []
@@ -1151,6 +1185,19 @@ def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_fir
     t = _PICK[kind].get(lang, _PICK[kind]["en"])
     plus = "+" if more and (re.search(r"more media", more, re.I) or more.strip() == "+") else "“%s”" % more if more else ""
     STATS["gallery_fixed"] += 1
+    if back is not None and more and items:   # they have been through the "+" already: not offered again
+        STATS["gallery_after_plus"] += 1
+        _fired("after_plus")
+        old = Counter(back)
+        new = []
+        for i in items:
+            if old[_fp(i)] > 0:
+                old[_fp(i)] -= 1
+            else:
+                new.append(i)
+        if len(new) == 1 or len(items) == 1:   # the one they just added, or the only one
+            return (new or items)[0], t["one"], kind, "", items
+        return None, t["many"], kind, "", items
     if len(items) == 1:
         return items[0], t["one_more" if more else "one"].format(plus=plus), kind, plus, items
     if kind == "video" and not videos and more:
@@ -1162,6 +1209,36 @@ def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_fir
 # said "Tap your video, or tap Select more media if it is not here", but rang the "+", which sent them straight back to
 # the picker. When the "+" is only the second choice ("…, or tap + if…"), the ring follows the first: their video.
 _OR = re.compile(r",?\s+\b(?:or|kapena|nangu)\b\s+", re.I)
+
+
+# 6 Nov, issue 41: on YouTube's gallery the person tapped the "+", went through Android's photo picker, tapped Done, and
+# came back to the same gallery, where "Tap the video you want, or tap + if it is not here." came again, word for word,
+# twice. Once they have been through the "+" (the gallery, then another picker, then the same gallery again), it is not
+# offered again on that gallery, and a video that was not there before is the one to ring.
+def _plus_back(st: dict, labels: list, sig: frozenset):
+    """Fingerprints of the gallery's items from before they went through its "+", or None. Remembers the gallery in
+    the loop breaker's state (fingerprints only, in memory, for this guide)."""
+    is_gallery, videos, photos, more = _gallery(labels)
+    if not is_gallery or not more:
+        return None
+    at = st.get("plus_at")
+    if not at or not _similar(at["sig"], sig):
+        if not st.get("plus_used"):
+            st["plus_at"] = {"sig": sig, "items": [_fp(i) for i in videos + photos]}
+        return None
+    prev = st["last"][-1] if st["last"] else None
+    if prev and prev.get("gal") and not _similar(prev["sig"], at["sig"]):
+        st["plus_used"] = True   # the gallery, another picker, and now the gallery again
+    return at["items"] if st.get("plus_used") else None
+
+
+# The phone's own photo picker, between the two visits to the gallery. Its items' words are not always photo-like (the
+# issue's own words for it were only "Photos" and "Done"), so a screen with a Done/Add button counts too.
+_PICK_DONE = re.compile(r"^(?:done|add|select)$", re.I)
+
+
+def _picker_done(labels: list) -> bool:
+    return any(_PICK_DONE.match(_plain(l)) and l.rstrip().lower().endswith("[tap]") for l in labels)
 
 
 def _plus_second(label, say: str, more) -> bool:
@@ -1221,6 +1298,32 @@ def _type_step(goal: str, labels: list, label, say: str):
 _MONEY_WORDS = re.compile(r"\b(money|momo|bank|wallet|loan|cash|pay|kwacha|airtel|mtn|zamtel)\b", re.I)
 
 
+# ---- An app that is not on the screen (#40, 6 Nov): "Swipe up to see all your apps" while the phone's own Search box
+# was right there, and the person pressed Help: "why didn't you just tell me to search". Typing one short app name is
+# quicker and surer than looking through every app.
+_ALL_APPS_SAY = re.compile(r"\b(?:swipe|scroll)\s+up\b.{0,40}?\ball\s+(?:of\s+)?(?:your\s+|the\s+)?apps\b|\bapp\s+(?:list|drawer)\b", re.I)
+_APP_SEARCH = re.compile(r"^search(?:\s+(?:apps|your phone|phone|apps and more))?$", re.I)
+_APP_NAME = r"([A-Z][\w&'+-]*(?:\s+[A-Z][\w&'+-]*){0,2})(?:\s+app)?"
+_APP_FROM_SAY = (re.compile(r"^\W*(?:the\s+)?" + _APP_NAME + r"\s+is\s+not\s+(?:on|in|visible)\b"),
+                 re.compile(r"\b(?:find|open)\s+(?:the\s+)?" + _APP_NAME + r"(?=\s*[.,!?]|\s+(?:and|then)\b|\s*$)"))
+_APP_FROM_GOAL = re.compile(r"\b(?:[Ww]ith|[Oo]pen|[Uu]sing|[Ii]n)\s+(?:the\s+)?" + _APP_NAME + r"(?=\s*[.,!?]|\s+(?:and|to|then)\b|\s*$)")
+
+
+def _search_for_app(goal: str, labels: list, label, say: str):
+    """(label, say) to tap the phone's Search box and type the app's name, when the AI said to swipe up through all
+    the apps and that Search box is on the screen; else None. English only: no checked Nyanja or Bemba words yet."""
+    if label or not _ALL_APPS_SAY.search(say):
+        return None
+    box = next((_plain(l) for l in labels if l.rstrip().lower().endswith("[tap]") and _APP_SEARCH.match(_plain(l))), None)
+    if not box or _MONEY_WORDS.search(goal) or RISKY.search(goal):
+        return None
+    m = next((m for m in (rx.search(say) for rx in _APP_FROM_SAY) if m), None) or _APP_FROM_GOAL.search(goal)
+    name = m.group(1).strip() if m else ""
+    if name and (_MONEY_WORDS.search(name) or RISKY.search(name) or _key(name) in ("home", "search", "swipe")):
+        return None
+    return box, "Tap “%s”, then type %s." % (box, name or "the app’s name")
+
+
 # ---- The loop breaker (5 Nov, the owner chose it). Every bad test had the same shape: the same instruction again and
 # again, and Help (YouTube's editor, WhatsApp Business, the Play Store's search box). Whatever the app, ScreenGuide
 # notices, tries another way once with the stronger AI told what did not work, and then says it is not sure.
@@ -1241,6 +1344,149 @@ def _screen_sig(labels: list) -> frozenset:
 
 def _similar(a, b) -> bool:
     return bool(a and b) and len(a & b) / max(len(a), len(b)) >= 0.8
+
+
+# ---- v0.84 Known screens (the owner's choice, 7 Nov): an answer people followed is given again without the AI ----
+# When the person taps what a step pointed at, that answer worked on that screen for that goal. The next time anyone is on
+# the same screen with the same goal, it comes at once and free, and every rule after the AI still checks it. Help right
+# after it counts against it. Kept: hashes of the screen's shape (its common button names; personal words are "…"), common
+# button names, and instructions whose names are all common button names. Never what people asked, never phone ids.
+KNOWN_MAX = int(os.getenv("KNOWN_MAX", "1500"))            # answers kept (the least used go first)
+KNOWN_PHONES = max(1, int(os.getenv("KNOWN_PHONES", "2")))  # different phones that followed it before users get it
+KNOWN_FLUSH_SECONDS = 600
+_known = {"k": {}, "s": {}}   # k: goal + screen -> answer; s: screen -> {button: times followed}
+_known_state = {"loaded": False, "dirty": False, "busy": False, "saved_at": time.time()}
+_known_pending = {}           # phone -> the last answer it got, kept until the next step says whether it was followed
+
+
+def _known_keys(lang: str, goal: str, labels: list) -> tuple:
+    shape = json.dumps(sorted({_clean_label(l) for l in labels if _key(l)}), ensure_ascii=False)
+    skey = _hash("known-screen|%s|%s" % (lang, shape), 16)
+    return _hash("known|%s|%s" % (_key(goal), skey), 16), skey
+
+
+def _known_say(say: str, label: str, lang: str) -> str:
+    """The words to keep: the AI's own, if every name in them (a capital inside a sentence) is a common button name or the
+    button itself; else a plain "Tap “X”." (a person's name must never be kept)."""
+    ok = len(say) <= 160
+    for sentence in re.split(r"(?<=[.!?])\s+", say):
+        words = re.findall(r"[^\W\d_][\w'’&-]*", sentence)
+        for w in words[1:]:
+            if w[:1].isupper() and w.lower() not in label.lower() and _clean_word(w) == "…":
+                ok = False
+    return say if ok else (_TAP_WORD.get(lang, _TAP_WORD["en"]) % label)
+
+
+def _known_note(install_id: str, kkey: str, skey: str, label, say: str, finished: bool, lang: str):
+    """The answer this phone just got: kept for a while, learned only if the next step says they followed it."""
+    _known_pending.pop(install_id, None)
+    if not label or finished or not say or _clean_word(label) == "…" or RISKY.search(label):
+        return
+    _known_pending[install_id] = (kkey, skey, _plain(label), _known_say(say, _plain(label), lang), time.time())
+    if len(_known_pending) > 5000:
+        for k in sorted(_known_pending, key=lambda i: _known_pending[i][4])[:1000]:
+            _known_pending.pop(k, None)
+
+
+def _known_settle(install_id: str, followed: bool, stuck: bool):
+    """The next step came: did they follow the last answer (learn it), or press Help (count it against it)?"""
+    p = _known_pending.pop(install_id, None)
+    if not p or time.time() - p[4] > 600:
+        return
+    kkey, skey, label, say, _ = p
+    e = _known["k"].get(kkey)
+    if stuck:
+        if e and _key(e["l"]) == _key(label):
+            e["b"] += 1; _known_state["dirty"] = True; STATS["known_bad"] += 1
+        return
+    if not followed:
+        return
+    phone = _hash("known-phone|" + install_id, 8)
+    if not e or _key(e["l"]) != _key(label):
+        e = _known["k"][kkey] = {"l": label, "y": say, "g": 0, "b": 0, "u": [], "t": 0}
+    e["g"] += 1; e["t"] = time.time(); e["y"] = say
+    if phone not in e["u"]:
+        e["u"] = (e["u"] + [phone])[-5:]
+    s = _known["s"].setdefault(skey, {"t": 0, "n": {}})
+    s["n"][label] = s["n"].get(label, 0) + 1; s["t"] = time.time()
+    STATS["known_learned"] += 1
+    _known_state["dirty"] = True
+    for kind in ("k", "s"):
+        if len(_known[kind]) > KNOWN_MAX:
+            for k in sorted(_known[kind], key=lambda i: _known[kind][i]["t"])[: len(_known[kind]) - KNOWN_MAX]:
+                _known[kind].pop(k, None)
+
+
+def _known_answer(kkey: str, labels: list, tester: bool):
+    """(label, say) that people followed on this screen for this goal, if its button is here; else None."""
+    e = _known["k"].get(kkey)
+    if not e or e["b"] >= e["g"] or len(e["u"]) < (1 if tester else KNOWN_PHONES):
+        return None
+    here = _match_label(e["l"], labels)
+    if not here:
+        return None
+    e["t"] = time.time()
+    return _plain(here), e["y"]
+
+
+def _often(skey: str, labels: list, tester: bool) -> list:
+    """What people tapped on this screen (for any goal), most first: a hint for the AI, never an order."""
+    s = _known["s"].get(skey)
+    if not s:
+        return []
+    least = 1 if tester else KNOWN_PHONES
+    return [(l, n) for l, n in sorted(s["n"].items(), key=lambda kv: -kv[1]) if n >= least and _match_label(l, labels)][:3]
+
+
+def _trail(path: list) -> list:
+    """v0.84 breadcrumbs: the screens of this guide so far, in common button names only, the same name not twice in a row."""
+    out = []
+    for p in [str(x).strip()[:40] for x in (path or []) if str(x).strip()][-6:]:
+        w = _clean_word(p)
+        if w != "…" and (not out or _key(out[-1]) != _key(w)):
+            out.append(w)
+    return out[-5:]
+
+
+async def _known_load():
+    if _known_state["loaded"]:
+        return
+    _known_state["loaded"] = True
+    try:
+        if DATABASE_URL:
+            saved = await asyncio.to_thread(_store.kv_get, "known", "state")
+        elif UPSTASH_URL and UPSTASH_TOKEN:
+            r = await _upstash(["GET", "sg:known:state"])
+            saved = json.loads(r) if r else None
+        else:
+            saved = _counts_mem.get("known")
+        for k in ("k", "s"):
+            if isinstance(saved, dict) and isinstance(saved.get(k), dict):
+                _known[k] = saved[k]
+    except Exception as e:
+        log.warning("Known screens could not be read: %s", str(e)[:160])
+
+
+async def _known_save(force: bool = False):
+    if not _known_state["dirty"] or _known_state["busy"]:
+        return
+    if not force and time.time() - _known_state["saved_at"] < KNOWN_FLUSH_SECONDS:
+        return
+    _known_state["busy"] = True
+    doc = {"k": _known["k"], "s": _known["s"]}
+    try:
+        if DATABASE_URL:
+            await asyncio.to_thread(_store.kv_put, "known", "state", doc)
+        elif UPSTASH_URL and UPSTASH_TOKEN:
+            await _upstash(["SET", "sg:known:state", json.dumps(doc)])
+        else:
+            _counts_mem["known"] = json.loads(json.dumps(doc))
+        _known_state["dirty"] = False
+    except Exception as e:
+        log.warning("Known screens not saved (kept for the next try): %s", str(e)[:160])
+    finally:
+        _known_state["saved_at"] = time.time()
+        _known_state["busy"] = False
 
 
 def _loop_state(install_id: str, goal: str, stuck: bool, tapped: bool, sig: frozenset) -> dict:
@@ -1284,6 +1530,8 @@ class Next(BaseModel):
     level: str = ""
     device: str = ""
     tapped: bool = False   # developer phones: the person tapped what the last step pointed at (for the watcher only)
+    followed: bool = False   # v0.84, every phone: the person tapped what the last step pointed at (known screens)
+    path: list[str] = []     # v0.84: the screens of this guide so far, oldest first (app names and screen titles)
 
 
 @app.post("/next")
@@ -1329,6 +1577,18 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         user += "\nThe user asked for help: their words are in <user_note>. Answer what they said, then give the next tap. If they say nothing happened, suggest a different way (scroll, go back, or another button)."
     elif body.stuck:
         user += "\nThe user pressed I'm stuck: the last instruction did not work. Suggest a different way (scroll, go back, or another button)."
+    # v0.84 breadcrumbs: where the person has been in this guide, in common button names only (personal words left out)
+    trail = _trail(body.path)
+    if trail:
+        user += "\n<path>" + _safe(" > ".join(trail), 240) + "</path>"
+    # v0.84 known screens: did the last answer work (they tapped what it pointed at)? What worked on this screen before?
+    await _known_load()
+    kkey, skey = _known_keys(lang, goal, labels)
+    _known_settle(install_id, body.followed, body.stuck)
+    known_on = _staged("known_screens", x_tester == "1")
+    often = _often(skey, labels, x_tester == "1") if known_on else []
+    if often:
+        user += "\n<often>" + _safe(", ".join("\u201c%s\u201d (%d)" % (l, n) for l, n in often), 240) + "</often>"
     system = NEXT_SYSTEM.format(language=LANGS[lang]) + (SHOT_NOTE if image else "")
     t0 = time.time()
     tally = {"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": t0 - STARTED}
@@ -1357,15 +1617,29 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             _strong_day[_today()] += 1
             tally["strong"] = True
             STATS["strong_steps"] += 1
+    known = None
+    if not honest and known_on and not body.stuck and not body.note.strip() and not image and not breaking:
+        known = _known_answer(kkey, labels, x_tester == "1")
     if honest:   # no AI this time: it already had its second chance
         text, data = "", {"label": None, "say": _NOT_SURE, "done": False, "x": None, "y": None, "look_for": None}
+    elif known:   # v0.84: people followed this answer here before: no AI, instant and free. Every rule below still applies.
+        text, data = "", {"label": known[0], "say": known[1], "done": False, "x": None, "y": None, "look_for": None}
+        STATS["known_used"] += 1
+        tally["known"] = True
+        _fired("known_screens")
     else:
-        text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
+        try:
+            text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
+        except HTTPException as e:
+            if e.status_code >= 500:   # v0.84: the helper could not answer: this step is not counted
+                _give_back(_s_minute[install_id], _s_day[install_id], _s_global)
+            raise
     # A blocked (black) picture must never beat the screen words. Seen 1 and 2 Nov: Drive's Upload screen had Cancel and
     # Upload, the picture came back black, and the guide said "The screen is black" instead of "Tap Upload". Ask again
     # with the words only, telling the AI why the picture was black. Any app that blocks pictures gets the same help.
     taps = sum(1 for l in labels if l.rstrip().lower().endswith(("[tap]", "[switch]")))
     image_blocked = False
+    still_missing = ""   # v0.84: the button the AI named is not on this screen, even after asking again
     if image and taps >= 2 and isinstance(data, dict) and _BLACK_SAY.search(str(data.get("say") or "")):
         STATS["black_picture_ignored"] += 1
         image_blocked = True   # the picture shows nothing: never ask it where something is
@@ -1423,6 +1697,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         if isinstance(again, dict) and _match_label(again.get("label"), labels):
             STATS["missing_button_fixed"] += 1
             data = again
+        elif isinstance(again, dict) and _staged("missing_button_picture", x_tester == "1"):
+            still_missing = named   # asked twice, both times a button that is not here (a failed second try keeps the first)
     ai_empty = not isinstance(data, dict) or not data
     data = data if isinstance(data, dict) else {}
     apps_rule = _staged("longer_app_name", x_tester == "1")
@@ -1441,8 +1717,15 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if not asked:
         say = _one_action(say, bool(label))
     told_last = _last_told(history)
+    back = _plus_back(loop, labels, sig)
     label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last,
-                              video_first=not asked and _staged("video_before_plus", x_tester == "1"))
+                              video_first=not asked and _staged("video_before_plus", x_tester == "1"),
+                              back=back if not asked and _staged("after_plus", x_tester == "1") else None)
+    found = _search_for_app(goal, labels, label, say) if lang == "en" and not data.get("done") else None
+    if found and _staged("search_for_app", x_tester == "1"):
+        STATS["search_for_app"] += 1
+        _fired("search_for_app")
+        label, say = found
     done = bool(data.get("done"))
     plain_all = [_plain(l) for l in labels]
     low_words = [p.lower() for p in plain_all]
@@ -1505,6 +1788,17 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["risky_label_blocked"] += 1
         label, say = None, "Read this screen carefully. If you are sure, do this step yourself. I will not point at it."
         image = ""   # and no picture point at it either
+    # The owner (7 Nov): an ad pops up in YouTube. The AI is told never to point at ads; this makes sure: on an ad that covers
+    # the screen, only its own "Skip ad" or "Close ad" is rung, never Install, Learn more or Visit advertiser.
+    if not done and _ad_covers(labels) and _staged("ad_buttons", x_tester == "1"):
+        skip = _ad_skip(labels)
+        if label != skip:
+            STATS["ad_button_blocked"] += 1
+            _fired("ad_buttons")
+            label, look = skip, None
+            say = ("This is an ad. Wait a few seconds for \u201cSkip ad\u201d, or for the ad to end. Do not tap anything else on it."
+                   if not skip else "This is an ad. Tap \u201c%s\u201d to go on." % ("Close ad" if skip.lower().startswith("close") else "Skip ad"))
+        image = ""   # no picture point on an ad either
     x = _fraction(data.get("x")) if image and not label else None
     y = _fraction(data.get("y")) if image and not label else None
     if x is None or y is None:
@@ -1519,7 +1813,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         _fired("loop_breaker")
         loop["broken"] += 1
     loop["last"] = (loop["last"] + [{"label": _fp(label) if label else 0, "say": _fp(say), "sig": sig, "stuck": bool(body.stuck),
-                                     "acted": False}])[-3:]
+                                     "acted": False, "gal": _gallery(labels)[0] or _picker_done(labels)}])[-3:]
     if body.stuck:
         # Where people get stuck is what most needs fixing. Kept in memory only, numbers and emails removed.
         _stuck.append({"t": time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 7200)), "goal": _scrub(goal, 100),
@@ -1528,8 +1822,17 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if LOG_SAMPLES:
         _samples.append({"t": time.strftime("%H:%M", time.gmtime(time.time() + 7200)), "kind": "step", "v": PROMPT_VERSION,
                          "ms": int((time.time() - t0) * 1000), "q": _scrub(goal), "a": _scrub("%s -> %s" % (label or "-", say))})
+    # #41 step 10 (7 Nov): YouTube's editor, whose way on has no words. "Tap “Done”" with nothing pointed at, even after
+    # asking again. Never tell people to tap what is not on the screen: say so, and look at a picture next (if allowed).
+    missing_pic = bool(still_missing and not label and x is None and not look and not done and say != _NOT_SURE
+                       and _key(still_missing) in _key(say))
+    if missing_pic and lang == "en":   # no new Nyanja or Bemba words: there, only the picture
+        STATS["missing_button_picture"] += 1
+        _fired("missing_button_picture")
+        say = ("I can\u2019t see \u201c%s\u201d on this screen. Look for a button with no words, often an arrow or a tick at the "
+               "top right, and tap it." % _plain(still_missing)[:40])
     # An icon with no name: ask the phone for a picture so the next answer can point at it (only if the person agreed).
-    need_picture = bool(not label and x is None and not image and not look and not is_gallery and not done and _ICON.search(say))
+    need_picture = bool(not label and x is None and not image and not look and not is_gallery and not done and (_ICON.search(say) or missing_pic))
     if need_picture:
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
@@ -1547,6 +1850,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             STATS["count_failed"] += 1
             log.warning("Step not counted: %s", str(e)[:160])
     wstep = len(_sessions[install_id]["steps"]) if x_tester == "1" and install_id in _sessions else 0
+    _known_note(install_id, kkey, skey, label, say, done or honest or say == _NOT_SURE, lang)   # kept if they follow it
+    await _known_save()
     return {"label": label, "say": say, "done": done, "x": x, "y": y,
             "look_for": None if (label or x is not None) else look, "need_picture": need_picture, "watch": watch, "watch_step": wstep,
             "strong": bool(tally.get("strong"))}   # the stronger AI answered (after Help): the test strip shows it
@@ -1658,7 +1963,131 @@ async def redeem(body: Redeem, x_app_token: str = Header(default=""), x_install_
 async def plan(x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_pass: str = Header(default="")):
     install_id = _check(x_app_token, x_install_id)
     tier, expires = plan_of(x_pass, install_id)
-    return {"plan": tier, "expires": expires, "left": _left(install_id, tier), "per_day": LIMITS[tier][0]}
+    return {"plan": tier, "expires": expires, "left": _left(install_id, tier), "per_day": LIMITS[tier][0] + _ad_bonus(install_id)[0],
+            "ads": _ads_status(install_id, tier)}
+
+
+# ---- v0.84 Rewarded ads (the owner's choice, 7 Nov) ----
+# A free user who has used today's help may choose to watch a short ad, inside ScreenGuide only (never during a guide or on
+# top of another app: Google's rule). Each ad adds ADS_ASK questions and ADS_STEPS guided steps for 24 hours, up to
+# ADS_PER_DAY ads. Google tells this server itself when an ad was watched (server-side verification: a signed message that
+# cannot be made up). While ScreenGuide shows Google's test ads only, ADS_TEST_CLAIMS lets the app's own "watched" count;
+# set it to 0 on Render once the real AdMob ads and their callback URL (/ads/ssv) are set up.
+ADS_PER_DAY = int(os.getenv("ADS_PER_DAY", "3"))
+ADS_ASK = int(os.getenv("ADS_ASK", "5"))
+ADS_STEPS = int(os.getenv("ADS_STEPS", "20"))
+ADS_TEST_CLAIMS = os.getenv("ADS_TEST_CLAIMS", "1").strip() == "1"
+ADS_KEYS_URL = "https://www.gstatic.com/admob/reward/verifier-keys.json"
+_ads = defaultdict(deque)     # phone -> when each ad was watched (the last 24 hours)
+_ads_seen = {}                # Google's transaction ids already counted: a callback can come twice
+_ads_keys = {"at": 0.0, "keys": {}}
+
+
+def _ads_today(install_id: str) -> int:
+    q = _ads.get(install_id)
+    if not q:
+        return 0
+    _prune(q, 86400, time.time())
+    return len(q)
+
+
+def _ad_bonus(install_id: str) -> tuple:
+    """(more questions, more guided steps) from the ads this phone watched in the last 24 hours."""
+    n = _ads_today(install_id)
+    return n * ADS_ASK, n * ADS_STEPS
+
+
+def _ads_status(install_id: str, tier: str) -> dict:
+    on = tier == "free" and ADS_PER_DAY > 0
+    return {"on": on, "left": max(0, ADS_PER_DAY - _ads_today(install_id)) if on else 0, "ask": ADS_ASK, "steps": ADS_STEPS}
+
+
+def _ads_credit(install_id: str, tx: str) -> bool:
+    now = time.time()
+    if tx:
+        if tx in _ads_seen:
+            return False
+        _ads_seen[tx] = now
+        if len(_ads_seen) > 5000:
+            for k in [k for k, t in _ads_seen.items() if now - t > 2 * 86400]:
+                _ads_seen.pop(k, None)
+    if _ads_today(install_id) >= ADS_PER_DAY:
+        STATS["ads_over_limit"] += 1
+        return False
+    _ads[install_id].append(now)
+    STATS["ads_rewarded"] += 1
+    return True
+
+
+async def _ads_keys_get(force: bool = False) -> dict:
+    if not force and _ads_keys["keys"] and time.time() - _ads_keys["at"] < 86400:
+        return _ads_keys["keys"]
+    import httpx
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(ADS_KEYS_URL)
+    keys = {str(k.get("keyId")): k.get("pem") for k in r.json().get("keys", []) if isinstance(k, dict) and k.get("pem")}
+    if keys:
+        _ads_keys.update(at=time.time(), keys=keys)
+    return keys or _ads_keys["keys"]
+
+
+def _ads_verify(query: str, keys: dict):
+    """Google's reward message, as a dict, if its signature is right; else None. Google signs the query string up to
+    "&signature=" (signature and key_id always come last), with ECDSA P-256 and SHA-256."""
+    from urllib.parse import parse_qsl
+    i = query.find("&signature=")
+    if i <= 0:
+        return None
+    rest = dict(parse_qsl(query[i + 1:], keep_blank_values=True))
+    pem, sig = keys.get(rest.get("key_id", "")), rest.get("signature", "")
+    if not pem or not sig:
+        return None
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        serialization.load_pem_public_key(pem.encode()).verify(
+            base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)), query[:i].encode(), ec.ECDSA(hashes.SHA256()))
+    except Exception:
+        return None
+    return dict(parse_qsl(query[:i], keep_blank_values=True))
+
+
+@app.get("/ads/ssv")
+async def ads_ssv(request: Request):
+    """AdMob's server-side verification callback: the phone in user_id watched one rewarded ad."""
+    query = request.url.query
+    if "signature=" not in query:
+        return {"ok": True}   # AdMob checking the address, or a visitor: nothing to count
+    msg = None
+    try:
+        msg = _ads_verify(query, await _ads_keys_get())
+        if msg is None:   # Google may have changed its keys: fetch them once more
+            msg = _ads_verify(query, await _ads_keys_get(force=True))
+    except Exception as e:
+        log.warning("Ad reward not checked: %s", str(e)[:160])
+    if msg is None:
+        STATS["ads_bad_signature"] += 1
+        raise HTTPException(403, "Bad signature.")
+    install_id = str(msg.get("user_id", "")).strip()[:64]
+    if install_id:
+        _ads_credit(install_id, str(msg.get("transaction_id", ""))[:80])
+    return {"ok": True}
+
+
+class AdClaim(BaseModel):
+    nonce: str = ""   # one per ad shown, so the same ad never counts twice
+
+
+@app.post("/ads/claim")
+async def ads_claim(body: AdClaim, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""),
+                    x_pass: str = Header(default="")):
+    """The phone says an ad was watched. Counted only while ScreenGuide shows test ads (ADS_TEST_CLAIMS); with real ads,
+    only Google's own message (/ads/ssv) counts. Either way it answers how much help is left."""
+    install_id = _check(x_app_token, x_install_id)
+    tier, _ = plan_of(x_pass, install_id)
+    if tier == "free" and ADS_TEST_CLAIMS and str(body.nonce).strip():
+        _ads_credit(install_id, "claim:" + _hash(install_id + "|" + str(body.nonce)[:64], 16))
+    return {"left": _left(install_id, tier), "ads": _ads_status(install_id, tier)}
 
 
 # ---- Guides kept on the server: edit guides.json on GitHub and every phone gets the change, no new app needed ----
@@ -2213,6 +2642,11 @@ STAGED = {              # rule name -> the server version that brought it
     "type_in_open_box": "0.78",    # on a text box that is open ([typing]), the step says what to type, not to tap it again
     "longer_app_name": "0.78",     # "WhatsApp Business" is never matched to "WhatsApp" on the screen
     "loop_breaker": "0.78",        # going round in circles: another way with the stronger AI, then honest
+    "search_for_app": "0.84",      # an app not on the screen: tap the phone's Search box and type its name, not swipe up
+    "after_plus": "0.84",          # back on a gallery from its "+": the "+" is not offered again; a new video is rung
+    "known_screens": "0.84",       # an answer people followed on this screen for this goal is given again without the AI
+    "missing_button_picture": "0.84",  # a button still not on the screen after asking again: said so, and a picture next
+    "ad_buttons": "0.84",          # on another app's ad that covers the screen, only its "Skip ad" or "Close ad" is rung
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
@@ -2627,11 +3061,15 @@ async def read_screen(body: ReadIn, x_app_token: str = Header(default=""), x_ins
     text = ""
     try:
         text = (await _complete(READ_SYSTEM.format(language=LANGS[lang]), user, None, "read", max_tokens=500)).strip()
-    except HTTPException:
+    except HTTPException as e:
+        if e.status_code >= 500:
+            _give_back(_minute[install_id], _day[install_id], _global)
         raise
     except Exception:
+        _give_back(_minute[install_id], _day[install_id], _global)
         raise HTTPException(503, "Sorry, the helper is busy. Please try again.")
     if not text:
+        _give_back(_minute[install_id], _day[install_id], _global)
         raise HTTPException(502, "Sorry, I could not read that. Please try again.")
     return {"text": text[:900], "left": _left(install_id, tier)}
 
