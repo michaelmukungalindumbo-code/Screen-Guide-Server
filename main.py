@@ -355,6 +355,15 @@ def _take(minute: deque, day: deque, glob: deque, per_minute: int, per_day: int,
     return ""
 
 
+def _give_back(minute: deque, day: deque, glob: deque) -> None:
+    """v0.84 (the owner's test, 7 Nov, no AI credit): the helper could not answer, so the question or step is not counted.
+    Each failed "Try again" used one of the day's free questions, and an outage used up a person's whole day."""
+    for q in (minute, day, glob):
+        if q:
+            q.pop()
+    STATS["given_back"] += 1
+
+
 def _limit_message(why: str, tier: str, what: str) -> str:
     STATS["limit_" + why] += 1
     if why == "minute":
@@ -753,6 +762,8 @@ async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: st
         old = stale() if e.status_code in (502, 503, 504) else None
         if old:
             return old
+        if e.status_code >= 500:
+            _give_back(_minute[install_id], _day[install_id], _global)
         raise
     partial = r.pop("_partial", False)
     if LOG_SAMPLES:
@@ -1597,7 +1608,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         tally["known"] = True
         _fired("known_screens")
     else:
-        text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
+        try:
+            text, data = await _ai_json(system, user, [image] if image else None, "step+picture" if image else "step", NEXT_SCHEMA, _valid_next)
+        except HTTPException as e:
+            if e.status_code >= 500:   # v0.84: the helper could not answer: this step is not counted
+                _give_back(_s_minute[install_id], _s_day[install_id], _s_global)
+            raise
     # A blocked (black) picture must never beat the screen words. Seen 1 and 2 Nov: Drive's Upload screen had Cancel and
     # Upload, the picture came back black, and the guide said "The screen is black" instead of "Tap Upload". Ask again
     # with the words only, telling the AI why the picture was black. Any app that blocks pictures gets the same help.
@@ -3000,11 +3016,15 @@ async def read_screen(body: ReadIn, x_app_token: str = Header(default=""), x_ins
     text = ""
     try:
         text = (await _complete(READ_SYSTEM.format(language=LANGS[lang]), user, None, "read", max_tokens=500)).strip()
-    except HTTPException:
+    except HTTPException as e:
+        if e.status_code >= 500:
+            _give_back(_minute[install_id], _day[install_id], _global)
         raise
     except Exception:
+        _give_back(_minute[install_id], _day[install_id], _global)
         raise HTTPException(503, "Sorry, the helper is busy. Please try again.")
     if not text:
+        _give_back(_minute[install_id], _day[install_id], _global)
         raise HTTPException(502, "Sorry, I could not read that. Please try again.")
     return {"text": text[:900], "left": _left(install_id, tier)}
 
