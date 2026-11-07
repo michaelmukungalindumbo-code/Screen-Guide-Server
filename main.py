@@ -1619,6 +1619,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     # with the words only, telling the AI why the picture was black. Any app that blocks pictures gets the same help.
     taps = sum(1 for l in labels if l.rstrip().lower().endswith(("[tap]", "[switch]")))
     image_blocked = False
+    still_missing = ""   # v0.84: the button the AI named is not on this screen, even after asking again
     if image and taps >= 2 and isinstance(data, dict) and _BLACK_SAY.search(str(data.get("say") or "")):
         STATS["black_picture_ignored"] += 1
         image_blocked = True   # the picture shows nothing: never ask it where something is
@@ -1676,6 +1677,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         if isinstance(again, dict) and _match_label(again.get("label"), labels):
             STATS["missing_button_fixed"] += 1
             data = again
+        elif isinstance(again, dict) and _staged("missing_button_picture", x_tester == "1"):
+            still_missing = named   # asked twice, both times a button that is not here (a failed second try keeps the first)
     ai_empty = not isinstance(data, dict) or not data
     data = data if isinstance(data, dict) else {}
     apps_rule = _staged("longer_app_name", x_tester == "1")
@@ -1788,8 +1791,17 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if LOG_SAMPLES:
         _samples.append({"t": time.strftime("%H:%M", time.gmtime(time.time() + 7200)), "kind": "step", "v": PROMPT_VERSION,
                          "ms": int((time.time() - t0) * 1000), "q": _scrub(goal), "a": _scrub("%s -> %s" % (label or "-", say))})
+    # #41 step 10 (7 Nov): YouTube's editor, whose way on has no words. "Tap “Done”" with nothing pointed at, even after
+    # asking again. Never tell people to tap what is not on the screen: say so, and look at a picture next (if allowed).
+    missing_pic = bool(still_missing and not label and x is None and not look and not done and say != _NOT_SURE
+                       and _key(still_missing) in _key(say))
+    if missing_pic and lang == "en":   # no new Nyanja or Bemba words: there, only the picture
+        STATS["missing_button_picture"] += 1
+        _fired("missing_button_picture")
+        say = ("I can\u2019t see \u201c%s\u201d on this screen. Look for a button with no words, often an arrow or a tick at the "
+               "top right, and tap it." % _plain(still_missing)[:40])
     # An icon with no name: ask the phone for a picture so the next answer can point at it (only if the person agreed).
-    need_picture = bool(not label and x is None and not image and not look and not is_gallery and not done and _ICON.search(say))
+    need_picture = bool(not label and x is None and not image and not look and not is_gallery and not done and (_ICON.search(say) or missing_pic))
     if need_picture:
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
@@ -2602,6 +2614,7 @@ STAGED = {              # rule name -> the server version that brought it
     "search_for_app": "0.84",      # an app not on the screen: tap the phone's Search box and type its name, not swipe up
     "after_plus": "0.84",          # back on a gallery from its "+": the "+" is not offered again; a new video is rung
     "known_screens": "0.84",       # an answer people followed on this screen for this goal is given again without the AI
+    "missing_button_picture": "0.84",  # a button still not on the screen after asking again: said so, and a picture next
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
