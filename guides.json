@@ -141,7 +141,8 @@
      "Battery and device care",
      "Battery & performance",
      "Battery and performance",
-     "Power management"
+     "Power management",
+     "Device care"
     ],
     "say": {
      "en": "Tap the glowing row.",
@@ -157,7 +158,8 @@
      "Power Saving Mode",
      "Power saving",
      "Power saver",
-     "Battery saving mode"
+     "Battery saving mode",
+     "Power mode"
     ],
     "say": {
      "en": "Tap the glowing row.",
@@ -172,7 +174,8 @@
      "Battery saver",
      "Power saving mode",
      "Power saving",
-     "Turn on now"
+     "Turn on now",
+     "Medium power saving"
     ],
     "toggle": true,
     "titles": [
