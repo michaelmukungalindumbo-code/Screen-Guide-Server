@@ -550,7 +550,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.85"
+SERVER_VERSION = "0.86"
 
 
 @app.get("/health")
@@ -666,8 +666,35 @@ def _part_of(question: str):
     return None
 
 
+# "Task prediction" (the owner, 10 Nov): which AI answers depends on how hard the question is. Only the finished question
+# is looked at, with plain rules (no AI, no cost): something is wrong, a choice between things, a long question, or
+# several things at once are hard; "How do I turn on Wi-Fi?" is easy.
+_HARD_WRONG = re.compile(r"\b(why|not working|isn'?t working|doesn'?t work|does not work|won'?t|can'?t|cannot|could not|couldn'?t|unable|"
+                         r"errors?|problems?|fail(s|ed|ing)?|keeps?|stuck|stopped|refus\w+|"
+                         r"not (sending|opening|loading|charging|connecting|showing|receiving|coming|ringing))\b")
+_HARD_CHOICE = re.compile(r"\bdifference between\b|\bwhich (one |app )?is (better|best)\b|\b(better|should i)\b.*\bor\b|\bversus\b|\bvs\b")
+_HARD_SEVERAL = re.compile(r"\b(and then|then|after that|as well as|at the same time)\b")
+
+
+def _hard(question: str) -> str:
+    """Why this question is hard ("something is wrong", "a choice", "long", "several things at once"), or "" when easy."""
+    q = " ".join(str(question or "").lower().replace("\u2019", "'").split())
+    words = re.findall(r"[a-z0-9']+", q)
+    if len(words) < 4:
+        return ""
+    if _HARD_WRONG.search(q):
+        return "something is wrong"
+    if _HARD_CHOICE.search(q):
+        return "a choice"
+    if len(words) >= 22:
+        return "long"
+    if _HARD_SEVERAL.search(q) or q.count(" and ") >= 2:
+        return "several things at once"
+    return ""
+
+
 async def _answer(question: str, lang: str, images: list[str], history: list[str], kind: str = "ask", device: str = "",
-                  apps: list | None = None) -> dict:
+                  apps: list | None = None, tester: bool = False) -> dict:
     """One chat turn. Shared by the app and the self-test page."""
     # The app keeps the chat and sends recent turns, so the helper "remembers". Newest turns are kept first,
     # up to about 2,400 characters (a sliding window), so long chats never grow the bill.
@@ -679,10 +706,21 @@ async def _answer(question: str, lang: str, images: list[str], history: list[str
     # Follow-ups (6 Nov, the owner chose): the earlier conversation matters, and the small AI lost track of it (WhatsApp,
     # then ScreenGuide, then the phone's wallpaper). The stronger AI answers them; first questions stay with the fast
     # one. At most STRONG_CHATS_PER_DAY a day.
-    if past and _strong_chat_day[_today()] < STRONG_CHATS_PER_DAY:
+    # 0.86: and a first question that is hard (_hard), staged as "hard_first". Each AI's use is counted.
+    hard = "" if past else _hard(question)
+    if hard and not _staged("hard_first", tester):
+        hard = ""
+    if (past or hard) and _strong_chat_day[_today()] < STRONG_CHATS_PER_DAY:
         _strong_chat_day[_today()] += 1
         _TALLY.set({"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": 0, "strong": True})
         STATS["strong_chats"] += 1
+        STATS["chat_strong"] += 1
+        if hard:
+            STATS["chat_hard_first"] += 1
+            STATS["chat_hard_" + hard.replace(" ", "_")] += 1
+            _fired("hard_first")
+    else:
+        STATS["chat_fast"] += 1
     dev = _device(device)
     names = _apps(apps or [])
     part = _part_of(question)
@@ -736,7 +774,8 @@ async def _answer(question: str, lang: str, images: list[str], history: list[str
 
 
 @app.post("/ask")
-async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_pass: str = Header(default="")):
+async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_pass: str = Header(default=""),
+              x_tester: str = Header(default="")):
     install_id = _check(x_app_token, x_install_id)
     tier, _ = plan_of(x_pass, install_id)
     question = body.question.strip()
@@ -778,7 +817,7 @@ async def ask(body: Ask, x_app_token: str = Header(default=""), x_install_id: st
     STATS["questions_" + tier] += 1
     t0 = time.time()
     try:
-        r = await _answer(question, lang, images, body.history, device=body.device, apps=apps)
+        r = await _answer(question, lang, images, body.history, device=body.device, apps=apps, tester=x_tester == "1")
     except HTTPException as e:
         old = stale() if e.status_code in (502, 503, 504) else None
         if old:
@@ -2667,6 +2706,7 @@ STAGED = {              # rule name -> the server version that brought it
     "after_plus": "0.85",          # back on a gallery from its "+": the "+" is not offered again; a new video is rung
     "known_screens": "0.85",       # an answer people followed on this screen for this goal is given again without the AI
     "missing_button_picture": "0.85",  # a button still not on the screen after asking again: said so, and a picture next
+    "hard_first": "0.86",          # a first question that is hard goes to the stronger AI (task prediction); easy ones stay fast
     "ad_buttons": "0.85",          # on another app's ad that covers the screen, only its "Skip ad" or "Close ad" is rung
 }
 STAGE_HOURS = 24
