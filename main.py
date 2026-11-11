@@ -550,7 +550,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.86"
+SERVER_VERSION = "0.87"
 
 
 @app.get("/health")
@@ -1594,6 +1594,44 @@ class Next(BaseModel):
     path: list[str] = []     # v0.84: the screens of this guide so far, oldest first (app names and screen titles)
 
 
+# 0.87 (the owner's phone, 11 Nov, twice: "This issue keeps appearing"): Drive's camera and scan pages share no words at
+# all, and the guide stopped dead with "I cannot read the words in this app". A screen that cannot be read is no longer
+# the end: the helper says so, and says what people usually tap there when the goal and the way there make it clear.
+# It never points (label, x, y are always empty), never calls the task done, and never guesses in money tasks.
+BLIND_PLAIN = ("I can\u2019t see this screen: this app does not share its words. Do this step yourself, and I will carry on "
+               "when the screen changes.")
+BLIND_NOTE = ("\nScreenGuide cannot read this screen: the app does not share its words, so there are no screen words and "
+              "nothing can be pointed at. label, x and y must be null and done must be false. In say: first tell the person in a "
+              "few words that you cannot see this screen. Then, only if <goal>, <already_told> and <path> make it clear which "
+              "screen of which well-known app this is, say in one short sentence what people usually do or tap there to go on, "
+              "with the button's usual name and where it usually is. If it is not clear, tell them to do this step themselves "
+              "and that you will carry on when the screen changes. Never guess on a money, PIN or password screen.")
+
+
+async def _blind_step(goal: str, history: list, body, lang: str, install_id: str) -> dict:
+    STATS["blind_steps"] += 1
+    tally = {"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": time.time() - STARTED}
+    _TALLY.set(tally)
+    _fired("blind_step")
+    say = ""
+    if not MONEY.search(goal):
+        user = "<goal>%s</goal>\n<already_told>%s</already_told>" % (_safe(goal, 300), _safe(" | ".join(history), 800) or "(nothing yet)")
+        trail = _trail(body.path)
+        if trail:
+            user += "\n<path>" + _safe(" > ".join(trail), 240) + "</path>"
+        dev = _device(body.device)
+        if dev:
+            user += "\n<device>" + dev + "</device>"
+        try:
+            _, data = await _ai_json(NEXT_SYSTEM.format(language=LANGS[lang]), user + BLIND_NOTE, None, "step", NEXT_SCHEMA, _valid_next)
+            if _valid_next(data):
+                say = str(data["say"]).strip()[:300]
+        except HTTPException:
+            STATS["blind_step_failed"] += 1
+    return {"label": None, "say": say or BLIND_PLAIN, "done": False, "x": None, "y": None, "look_for": None, "need_picture": False,
+            "watch": 0, "watch_step": 0, "strong": False}
+
+
 @app.post("/next")
 async def next_step(body: Next, x_app_token: str = Header(default=""), x_install_id: str = Header(default=""), x_pass: str = Header(default=""),
                     x_tester: str = Header(default="")):
@@ -1603,8 +1641,13 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     labels = [l.strip()[:60] for l in body.labels if l.strip()][:80]
     history = [h.strip()[:120] for h in body.history][-6:]
     image = body.image if isinstance(body.image, str) and 0 < len(body.image) <= 600_000 else ""
-    if not goal or not (labels or image):
+    if not goal:
         raise HTTPException(400, "Nothing to work with.")
+    blind = not labels and not image   # 0.87: a screen that shares no words (see BLIND_NOTE)
+    if blind:
+        await _launch_load()
+        if not _staged("blind_step", x_tester == "1"):
+            raise HTTPException(400, "Nothing to work with.")
     if _over_budget():
         STATS["budget_stop"] += 1
         raise HTTPException(503, "The helper is resting until tomorrow. Quick tasks still work.")
@@ -1614,6 +1657,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
 
     lang = body.lang if body.lang in LANGS else "en"
     await _launch_load()   # when this server version went live, and which staged rules are paused
+    if blind:
+        return await _blind_step(goal, history, body, lang, install_id)
     # Untrusted text goes inside tags, cleaned so it cannot close a tag or hide characters.
     user = ("<goal>%s</goal>\n<already_told>%s</already_told>\n<screen_words>\n%s\n</screen_words>"
             % (_safe(goal, 300), _safe(" | ".join(history), 800) or "(nothing yet)",
@@ -2706,6 +2751,7 @@ STAGED = {              # rule name -> the server version that brought it
     "after_plus": "0.85",          # back on a gallery from its "+": the "+" is not offered again; a new video is rung
     "known_screens": "0.85",       # an answer people followed on this screen for this goal is given again without the AI
     "missing_button_picture": "0.85",  # a button still not on the screen after asking again: said so, and a picture next
+    "blind_step": "0.87",          # a screen that shares no words: said so, with what people usually tap there; never pointed at
     "hard_first": "0.86",          # a first question that is hard goes to the stronger AI (task prediction); easy ones stay fast
     "ad_buttons": "0.85",          # on another app's ad that covers the screen, only its "Skip ad" or "Close ad" is rung
 }
