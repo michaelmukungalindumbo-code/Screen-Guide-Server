@@ -550,7 +550,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.87"
+SERVER_VERSION = "0.88"
 
 
 @app.get("/health")
@@ -1592,6 +1592,7 @@ class Next(BaseModel):
     tapped: bool = False   # developer phones: the person tapped what the last step pointed at (for the watcher only)
     followed: bool = False   # v0.84, every phone: the person tapped what the last step pointed at (known screens)
     path: list[str] = []     # v0.84: the screens of this guide so far, oldest first (app names and screen titles)
+    blind: int = 0           # v0.88: how many screens with no words have come in a row in this guide (1: the first)
 
 
 # 0.87 (the owner's phone, 11 Nov, twice: "This issue keeps appearing"): Drive's camera and scan pages share no words at
@@ -1622,6 +1623,15 @@ async def _blind_step(goal: str, history: list, body, lang: str, install_id: str
         dev = _device(body.device)
         if dev:
             user += "\n<device>" + dev + "</device>"
+        # 0.88 (the owner's test of 0.113): the page after the photo got the camera page's instruction again
+        row = max(0, min(int(body.blind or 0), 9))
+        if row:
+            user += "\n<unseen_screens_in_a_row>%d</unseen_screens_in_a_row>" % row
+        if row >= 2:
+            user += ("\nThis is not the first unseen screen: the person did what you last said in <already_told>, and a NEW screen "
+                     "has opened that you cannot see either. Give the instruction for the screen that usually comes AFTER the one "
+                     "you last spoke about (after a camera's round button in a scan: the page to check the picture, with Next or "
+                     "Save at the bottom right). Never repeat the instruction you gave for the screen before.")
         try:
             _, data = await _ai_json(NEXT_SYSTEM.format(language=LANGS[lang]), user + BLIND_NOTE, None, "step", NEXT_SCHEMA, _valid_next)
             if _valid_next(data):
