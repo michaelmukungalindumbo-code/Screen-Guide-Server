@@ -11,3 +11,7 @@ class FastAPI:
     def middleware(self, *a, **k): return lambda f: f
     def exception_handler(self, *a, **k): return lambda f: f
     routes = []
+class Request:   # v0.84 (/ads/ssv reads the raw query string): tests build one with the query they want
+    def __init__(self, query=""):
+        class _U: pass
+        self.url = _U(); self.url.query = query

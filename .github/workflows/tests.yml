@@ -8,6 +8,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
       - run: python -c "import ast; ast.parse(open('main.py').read())"
+      - run: pip install -q cryptography   # v0.84: the ads test checks a real Google-style signature
       - run: bash tests/run.sh
   real:
     # The same server with the real libraries from requirements.txt: catches what only breaks on Render

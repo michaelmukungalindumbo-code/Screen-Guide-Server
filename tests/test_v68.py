@@ -25,6 +25,7 @@ def kinds(): return [p["kind"] for p in main._sessions["dev68"]["problems"]]
 SAY = "Tap the video you want, or tap + if it is not here."
 GAL = ["Video [selected]", "Short [tap]", "Live [tap]", "Post [tap]", "Close [tap]", "Upload from gallery [text]", "Videos [tap]",
        "Settings [tap]", "Select more media [tap]", "0:13 [tap]", "0:09 [tap]", "0:14 [tap]"]
+main.PAUSED_RULES = {"after_plus"}   # 0.83: back from the "+", the guide no longer says SAY (checked at the end)
 run(main.event(main.Event(event="start", guide="ai"), **H))
 step(None, SAY, GAL)
 step("Done", "Tap Done to finish choosing your video.", ["… [tap]", "Photos [text]", "Done [tap]"], tapped=True)
@@ -35,4 +36,14 @@ assert "repeat" not in kinds(), kinds()
 step("Done", "Tap Done to finish choosing your video.", ["Done [tap]"], tapped=True)
 step(None, SAY, GAL)
 assert "repeat" in kinds(), kinds()
+
+# 0.83 ("after_plus", issue 41): the same trip with the rule on. Back from the "+", the "+" is not offered again, and the
+# new video (0:21) gets the ring, instead of the same sentence.
+main.PAUSED_RULES = set()
+H["x_install_id"] = "dev68b"
+run(main.event(main.Event(event="start", guide="ai"), **H))
+step(None, SAY, GAL)
+step("Done", "Tap Done to finish choosing your video.", ["… [tap]", "Photos [text]", "Done [tap]"], tapped=True)
+r = step(None, SAY, GAL[:9] + ["0:13 [tap]", "0:21 [tap]", "0:09 [tap]", "0:14 [tap]"])
+assert r["label"] == "0:21" and r["say"] == "Tap your video.", r
 print("ok", kinds())
