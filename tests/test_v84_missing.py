@@ -45,5 +45,5 @@ assert r["say"] == "Tap “Done” to finish picking your video.", r    # not ye
 main._launch["live"][main.STAGED["missing_button_picture"]] = time.time() - 25 * 3600
 r, calls = step(EDITOR, [DONE, DONE], i="user84m2", tester=False)
 assert r["say"].startswith("I can’t see “Done”") and r["need_picture"] is True, r
-assert main.STAGED["missing_button_picture"] == "0.84"
+assert main.STAGED["missing_button_picture"] == "0.85"
 print("a button that is not on the screen is never the instruction: said so, and a picture looked at next")

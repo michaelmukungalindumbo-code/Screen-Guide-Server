@@ -105,6 +105,6 @@ main._known["k"].clear(); main._known["s"].clear(); main._known_state["loaded"] 
 run(main._known_load())
 assert main._known == saved and main._known["k"]
 
-assert main.STAGED["known_screens"] == "0.84" and main.SERVER_VERSION >= "0.84" and main.PROMPT_VERSION >= "60"
+assert main.STAGED["known_screens"] == "0.85" and main.SERVER_VERSION >= "0.84" and main.PROMPT_VERSION >= "60"
 assert "<path> is where the person has been" in main.NEXT_SYSTEM and "<often> is what other people tapped" in main.NEXT_SYSTEM
 print("an answer people followed comes again without the AI; what they tapped is a hint; where they have been goes with it")

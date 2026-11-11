@@ -46,5 +46,5 @@ assert r["label"] == "Install", r                                      # not yet
 main._launch["live"][main.STAGED["ad_buttons"]] = time.time() - 25 * 3600
 r = step(AD, [J("Install", "Tap “Install”.")], i="user84o2", tester=False)
 assert r["label"] is None and r["say"].startswith("This is an ad."), r
-assert main.STAGED["ad_buttons"] == "0.84"
+assert main.STAGED["ad_buttons"] == "0.85"
 print("on an ad that covers the screen, only its own Skip ad or Close ad is ever rung")
