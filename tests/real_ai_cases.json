@@ -77,6 +77,22 @@
       "apps": ["Chrome", "Files", "Photos", "Play Store", "Settings", "WhatsApp"],
       "all": [["files"]],
       "none": ["install safe folder", "download safe folder", "search for safe folder", "safe folder app from the play store"]
+    },
+    {
+      "name": "11 Nov: ECZ results online are not in the Past Papers app (the owner: these mistakes are really demotivating)",
+      "history": [],
+      "question": "How do I check my ECZ results online?",
+      "apps": ["Chrome", "Files", "Past Papers ZM", "Photos", "Play Store", "Settings", "WhatsApp", "YouTube"],
+      "all": [["chrome", "browser", "website"]],
+      "none": ["past papers zm app", "on the past papers", "in the past papers", "open past papers", "results option"]
+    },
+    {
+      "name": "11 Nov: applying for a job online is done in the browser, not in an app picked by its name",
+      "history": [],
+      "question": "How do I apply for a teaching job online?",
+      "apps": ["Chrome", "Docs", "Past Papers ZM", "Phone Master", "Play Store", "Settings", "WhatsApp"],
+      "all": [["chrome", "browser", "website"]],
+      "none": ["past papers", "phone master"]
     }
   ]
 }
