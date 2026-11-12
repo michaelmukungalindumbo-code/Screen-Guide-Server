@@ -553,7 +553,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.92"
+SERVER_VERSION = "0.93"
 
 
 @app.get("/health")
@@ -1217,14 +1217,15 @@ def _last_told(history: list) -> str:
 
 
 def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = "",
-                 video_first: bool = False, back=None):
+                 video_first: bool = False, back=None, tab_rule: bool = False):
     """On a picker of the person's own videos or photos, in any app, they choose; the AI only says how. Seen on a
     phone: it pointed at YouTube's "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds
     videos YouTube cannot see yet. One shows: ring it. No video shows: ring the "+". Several: no ring.
     explain: the person asked for help (I don't understand, I can't find it). The ring rules stay, but they get an
     explanation instead of the sentence they already heard: the AI's own words when safe, else a plain one.
-    video_first: the staged rule "video_before_plus" (see _plus_second). back: the staged rule "after_plus"."""
-    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang, video_first, back)
+    video_first: the staged rule "video_before_plus" (see _plus_second). back: the staged rule "after_plus".
+    tab_rule: the staged rule "chosen_tab" (see _chosen_tab)."""
+    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang, video_first, back, tab_rule)
     if tmpl is None:
         return label, say
     if not explain:
@@ -1245,13 +1246,36 @@ def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: b
     return lbl, ex["en"].format(eg=eg) + (_EXPLAIN_MORE["en"].format(plus=plus) if plus else "")
 
 
-def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_first: bool = False, back=None):
+# #79 (12 Nov, change request "remove this step"): on YouTube's gallery, with the person's videos already showing, the
+# guide said "Tap “Video” to choose what kind of upload you want." Video was already the chosen tab (Video | Short |
+# Live | Post), so that step did nothing. On a gallery, a tab that is already chosen is never a step: they choose
+# their video instead. "Video" (or "Photo") alone is such a tab when the goal is that kind and that kind is showing.
+_MODE_TAB = re.compile(r"^(?:video|photo)$", re.I)
+
+
+def _chosen_tab(label, labels: list, kind: str, items: list) -> bool:
+    if not label:
+        return False
+    if any(_plain(l) == label and l.rstrip().lower().endswith("[selected]") for l in labels):
+        return True
+    return bool(_MODE_TAB.match(label) and label.lower() == kind and items)
+
+
+def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_first: bool = False, back=None,
+                  tab_rule: bool = False):
     """(label, sentence, kind, plus, items), or a None sentence when this is not a choosing moment in a gallery.
     back: the staged rule "after_plus" (see _plus_back): fingerprints of the items there before they went to the "+"."""
     is_gallery, videos, photos, more = _gallery(labels)
     if not is_gallery:
         return label, None, "", "", []
     leaving = bool(label and _LEAVE.match(label)) or bool(not label and _LEAVE_SAY.search(say))
+    if tab_rule and not leaving:
+        k = "video" if re.search(r"video|vidiyo", goal, re.I) else "photo" if re.search(r"photo|picture|image|selfie|chithunzi|cikope", goal, re.I) \
+            else ("video" if videos else "photo")
+        if _chosen_tab(label, labels, k, videos if k == "video" else photos):
+            STATS["chosen_tab_skipped"] += 1
+            _fired("chosen_tab")
+            leaving = True   # not a way forward: the choosing sentence below replaces it
     second = video_first and _plus_second(label, say, more)
     if second:
         _fired("video_before_plus")
@@ -1868,7 +1892,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     back = _plus_back(loop, labels, sig)
     label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last,
                               video_first=not asked and _staged("video_before_plus", x_tester == "1"),
-                              back=back if not asked and _staged("after_plus", x_tester == "1") else None)
+                              back=back if not asked and _staged("after_plus", x_tester == "1") else None,
+                              tab_rule=_staged("chosen_tab", x_tester == "1"))
     found = _search_for_app(goal, labels, label, say) if lang == "en" and not data.get("done") else None
     if found and _staged("search_for_app", x_tester == "1"):
         STATS["search_for_app"] += 1
@@ -2798,6 +2823,7 @@ STAGED = {              # rule name -> the server version that brought it
     "blind_step": "0.87",          # a screen that shares no words: said so, with what people usually tap there; never pointed at
     "hard_first": "0.86",          # a first question that is hard goes to the stronger AI (task prediction); easy ones stay fast
     "ad_buttons": "0.85",          # on another app's ad that covers the screen, only its "Skip ad" or "Close ad" is rung
+    "chosen_tab": "0.93",          # on a gallery, never "Tap Video" when Video is already the chosen tab: they pick their video
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
