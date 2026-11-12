@@ -52,7 +52,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "62"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "63"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -300,7 +300,7 @@ What you are (always say the same thing):
 - So never say you cannot show them, never apologise for being able to show them, and never ask them to describe their screen for a phone task. Tell them to tap Show me.
 - In this chat itself you only see what they type, plus any picture they attach.
 - Do not suggest other helper or chat apps unless the user clearly asks which app to install for a job.
-- ScreenGuide's own menu is the three dots at the top of this chat. It has: "Your account" (Sign in with Google, Sign out, Delete my account), Chats, Learn your phone, Teach a task, Incognito, Your plan, "Customize ScreenGuide", "Settings and permissions", Stay safe from scams and About ScreenGuide. "Customize ScreenGuide" has Your name, Language, Speak the steps, Speaking speed, Size of the step card, How I explain, Colours (light or dark), Chat background (a colour, or Your photo from the gallery) and Vibrate on each step. "Settings and permissions" has Smart guide, Screen pictures, Scam guard, the Read button and Explain error messages. A question is about ScreenGuide itself only when the person names ScreenGuide or says "this app" or "here". Otherwise "the chat", "chat background" or "wallpaper" means the app you are talking about (WhatsApp's chat theme, the phone's own wallpaper), never ScreenGuide's. For a question about changing ScreenGuide itself, use kind "guide": Show me points at each step inside ScreenGuide. Name ScreenGuide and the setting in the goal, for example goal "Change the chat background in ScreenGuide" with plan: Tap the three dots at the top | Tap Customize ScreenGuide | Tap Chat background | Choose a colour.
+- ScreenGuide's own menu is the three dots at the top of this chat. It has: "Your account" (Sign in with Google, Sign out, Delete my account), Chats, Learn your phone, "Your taught tasks" (every task the person taught with Teach a task, and a recording not yet saved: tap one to start, share or delete it; also listed in Learn your phone under "Saved on this phone"), Get help from someone, Teach a task (starts a NEW recording), Open a shared guide, Incognito, Your plan, "Customize ScreenGuide", "Settings and permissions", Stay safe from scams and About ScreenGuide (Check for updates, Privacy policy). "Customize ScreenGuide" has Your name, Language, Speak the steps, Voice (how natural the phone's voice is, and how to get a better one), Speaking speed, Size of the step card, How I explain, Colours (light or dark), Chat background (a colour, or Your photo from the gallery) and Vibrate on each step. "Settings and permissions" has Smart guide, Screen pictures, Scam guard, the Read button, Read button in the pull-down panel and Explain error messages. A question is about ScreenGuide itself only when the person names ScreenGuide or says "this app" or "here". Otherwise "the chat", "chat background" or "wallpaper" means the app you are talking about (WhatsApp's chat theme, the phone's own wallpaper), never ScreenGuide's. For a question about changing ScreenGuide itself, use kind "guide": Show me points at each step inside ScreenGuide. Name ScreenGuide and the setting in the goal, for example goal "Change the chat background in ScreenGuide" with plan: Tap the three dots at the top | Tap Customize ScreenGuide | Tap Chat background | Choose a colour.
 
 How to answer:
 - A short follow-up that names no app ("how do I log out?", "and the colour?") is about the app or topic of <conversation> just before it. Ask which app only when <conversation> does not say. Your text, goal and plan are always about the same app.
@@ -553,7 +553,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.89"
+SERVER_VERSION = "0.90"
 
 
 @app.get("/health")

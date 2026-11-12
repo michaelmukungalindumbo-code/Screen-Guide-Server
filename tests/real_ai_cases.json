@@ -93,6 +93,14 @@
       "apps": ["Chrome", "Docs", "Past Papers ZM", "Phone Master", "Play Store", "Settings", "WhatsApp"],
       "all": [["chrome", "browser", "website"]],
       "none": ["past papers", "phone master"]
+    },
+    {
+      "name": "12 Nov: where Teach a task recordings are (not: start a new one)",
+      "history": [],
+      "question": "Where can I find my teach a task recordings in ScreenGuide?",
+      "apps": ["Chrome", "Drive", "Files", "Play Store", "Settings", "WhatsApp"],
+      "all": [["your taught tasks"]],
+      "none": ["files app", "gallery", "google drive"]
     }
   ]
 }
