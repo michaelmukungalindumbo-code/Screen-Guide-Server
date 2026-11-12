@@ -93,6 +93,38 @@
       "apps": ["Chrome", "Docs", "Past Papers ZM", "Phone Master", "Play Store", "Settings", "WhatsApp"],
       "all": [["chrome", "browser", "website"]],
       "none": ["past papers", "phone master"]
+    },
+    {
+      "name": "12 Nov: where Teach a task recordings are (not: start a new one)",
+      "history": [],
+      "question": "Where can I find my teach a task recordings in ScreenGuide?",
+      "apps": ["Chrome", "Drive", "Files", "Play Store", "Settings", "WhatsApp"],
+      "all": [["your taught tasks"]],
+      "none": ["files app", "gallery", "google drive"]
+    },
+    {
+      "name": "12 Nov: a general question is answered (the owner: ScreenGuide should answer general questions too)",
+      "history": [],
+      "question": "What is photosynthesis?",
+      "kind": "answer",
+      "all": [["sunlight", "light"], ["plant", "leaves", "leaf"]],
+      "none": ["only help with phone", "can only help", "show me"]
+    },
+    {
+      "name": "12 Nov: a general question about farming is answered, simply",
+      "history": [],
+      "question": "When should I plant maize?",
+      "kind": "answer",
+      "all": [["rain", "rainy", "rains"]],
+      "none": ["only help with phone", "can only help", "show me"]
+    },
+    {
+      "name": "12 Nov: a health question is answered with a clinic, never as a phone task",
+      "history": [],
+      "question": "My child has a high fever, what should I do?",
+      "kind": "answer",
+      "all": [["clinic", "doctor", "nurse", "hospital"]],
+      "none": ["only help with phone", "can only help", "show me"]
     }
   ]
 }

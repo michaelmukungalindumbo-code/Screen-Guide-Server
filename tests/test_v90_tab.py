@@ -34,7 +34,7 @@ assert r["label"] == "Short", r
 r = step(["Video [tap]", "Short [tap]", "Live [tap]"], "Video", SAID)
 assert r["label"] == "Video", r
 
-# Staged (the Launch Bay): users' phones only after 0.90 has been live for 24 hours
+# Staged (the Launch Bay): users' phones only after 0.93 has been live for 24 hours (the AI fixer wrote 0.90; it went live after 0.92)
 main._launch["live"][main.STAGED["chosen_tab"]] = main.time.time()
 r = step(["Video [selected]"] + REST, "Video", SAID, tester=False, i="user90")
 assert r["label"] == "Video", r
@@ -42,5 +42,5 @@ main._launch["live"][main.STAGED["chosen_tab"]] -= 25 * 3600
 r = step(["Video [selected]"] + REST, "Video", SAID, tester=False, i="user90b")
 assert r["label"] != "Video", r
 assert main._launch["seen"]["chosen_tab"]["fired"] >= 1
-assert main.SERVER_VERSION >= "0.90"
+assert main.SERVER_VERSION >= "0.93"
 print("a tab that is already chosen is never a step on a gallery")
