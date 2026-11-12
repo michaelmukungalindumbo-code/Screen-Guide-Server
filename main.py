@@ -52,7 +52,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "64"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "65"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -553,7 +553,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.93"
+SERVER_VERSION = "0.94"
 
 
 @app.get("/health")
@@ -951,6 +951,8 @@ Rules:
 - Typing is hard for these people. Prefer tapping and scrolling to items they can see or that are surely further down the list. Use a search box only when the item is deep inside menus.
 - On a search page whose box already has text, they are searching: point at the result that fits the goal. If no result fits yet, use label null and say: Keep typing. Never say they are in the wrong place while they search.
 - Never say they have reached a page (for example "Look at the bar on the Storage page") unless that page's own words are in <screen_words>.
+- When you tell them what the screen shows (a list, an amount, a result), copy each name and number exactly as it is in <screen_words>, and keep each number with the name just before it: the first item of a list is the first one in <screen_words>. Never mix one item's number with another item's name. If you are not sure which goes with which, say "Look at the list" and do not name any.
+- Never call a row or button “go back” unless its name says so (Navigate up, Back, the arrow): a row named Settings inside an app opens that app's own settings, it does not go back.
 - On a gallery of the person's own photos or videos (words like Upload from gallery, All albums, Recents, or video lengths like 0:14), they choose their own. If only one video shows, its length is the label and say: Tap your video. Otherwise use label null and say: Tap the video you want to upload. Never point at an album menu (Videos, All albums, Recents). A + tile, often named Select more media, adds videos the app cannot see yet: mention it, for example: Tap your video, or tap + if it is not here.
 - If the thing to tap is an icon with no word in the list (a +, a pencil, three dots, a paperclip, a microphone), use label null and name the icon simply, for example: Tap the + button. The phone may then send a picture of the screen so you can point at it.
 - Android sometimes asks for permission (Allow, While using the app, Only this time, Allow all, Select photos and videos, Don't allow). If the goal needs it, point at the answer that lets it work: Allow, While using the app, or Allow all for photos and videos (with Select photos the app sees only some of them later). Say why in a few words, for example: Tap "Allow all" so YouTube can see your videos. If the goal does not need it, point at Don't allow.
