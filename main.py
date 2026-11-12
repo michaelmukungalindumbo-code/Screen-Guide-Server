@@ -553,7 +553,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.91"
+SERVER_VERSION = "0.92"
 
 
 @app.get("/health")
@@ -1186,6 +1186,27 @@ _EXPLAIN_MORE = {"en": " If yours is not here, tap {plus}."}
 _ALBUM_SAY = re.compile(r"\b(?:all albums|albums|recents)\b|\btap\s+[\"“]?videos\b", re.I)
 
 
+# 0.92 (the owner's phone, 12 Nov, "Open my Safe folder"): the last step was a tap on the very thing the goal names, and the
+# screen it opened shares almost no words (a lock screen: a PIN pad, a pattern). They got there. The guide said "Tap
+# Navigate up to go back", then "Tap Safe folder" again, round and round. It is done; they enter their PIN themselves.
+_TOLD_TAP = re.compile(r"^Tap \u201c([^\u201d]{2,40})\u201d", re.I)
+_LOCK_WORDS = {"navigate up", "back", "close", "cancel", "use fingerprint", "fingerprint", "forgot pin", "forgot pattern",
+               "forgot password", "emergency call", "ok", "done", "delete", "more options"}
+
+
+def _arrived_locked(goal: str, told: str, labels: list) -> str:
+    """The name they just tapped, when it is what the goal names and the new screen is near-empty, else ""."""
+    m = _TOLD_TAP.match(str(told or "").strip())
+    if not m:
+        return ""
+    name = m.group(1).strip()
+    if _key(name) not in _key(goal):
+        return ""
+    words = [re.sub(r"\s*\[\w+\]$", "", str(l)).strip().lower() for l in labels]
+    real = [w for w in words if w and w not in _LOCK_WORDS and not re.fullmatch(r"[\d\W]+", w)]
+    return name if len(real) == 0 else ""
+
+
 def _last_told(history: list) -> str:
     """The last instruction the person heard. In the Help chat the phone adds "User said: …" and "Told: …" lines."""
     for h in reversed(history):
@@ -1707,6 +1728,15 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     often = _often(skey, labels, x_tester == "1") if known_on else []
     if often:
         user += "\n<often>" + _safe(", ".join("\u201c%s\u201d (%d)" % (l, n) for l, n in often), 240) + "</often>"
+    # 0.92: a tap on what the goal names opened a locked, near-empty screen: they got there (no AI needed)
+    locked = _arrived_locked(goal, _last_told(history), labels) if not body.stuck else ""
+    if locked and _staged("locked_arrival", x_tester == "1"):
+        STATS["locked_arrival"] += 1
+        _TALLY.set({"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": time.time() - STARTED})
+        _fired("locked_arrival")
+        return {"label": None, "say": "You are in \u201c%s\u201d. If it asks for your PIN, pattern or password, enter it yourself: "
+                "I never help with those." % _safe(locked, 40), "done": True, "x": None, "y": None, "look_for": None,
+                "need_picture": False, "watch": 0, "watch_step": 0, "strong": False}
     system = NEXT_SYSTEM.format(language=LANGS[lang]) + (SHOT_NOTE if image else "")
     t0 = time.time()
     tally = {"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": t0 - STARTED}
@@ -2764,6 +2794,7 @@ STAGED = {              # rule name -> the server version that brought it
     "after_plus": "0.85",          # back on a gallery from its "+": the "+" is not offered again; a new video is rung
     "known_screens": "0.85",       # an answer people followed on this screen for this goal is given again without the AI
     "missing_button_picture": "0.85",  # a button still not on the screen after asking again: said so, and a picture next
+    "locked_arrival": "0.92",      # a tap on what the goal names opened a locked, near-empty screen: done, never "go back"
     "blind_step": "0.87",          # a screen that shares no words: said so, with what people usually tap there; never pointed at
     "hard_first": "0.86",          # a first question that is hard goes to the stronger AI (task prediction); easy ones stay fast
     "ad_buttons": "0.85",          # on another app's ad that covers the screen, only its "Skip ad" or "Close ad" is rung
