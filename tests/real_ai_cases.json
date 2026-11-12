@@ -125,6 +125,24 @@
       "kind": "answer",
       "all": [["clinic", "doctor", "nurse", "hospital"]],
       "none": ["only help with phone", "can only help", "show me"]
+    },
+    {
+      "name": "13 Nov: Show me after a picture of an app's error: Retry in that app, never Wi-Fi (the phone is online)",
+      "history": ["User: \ud83d\udcce How do I resolve this",
+                  "Helper: This is an error inside the web app you were using, not a problem with your phone. Try these: tap Retry on the screen. If it still fails, close the app fully, open it again, or refresh the page in Chrome. Check your internet connection too. If it keeps failing, the app's maker may be having trouble, so try again later."],
+      "question": "Show me",
+      "apps": ["AI Studio", "Chrome", "Drive", "Gmail", "Play Store", "Settings", "WhatsApp", "YouTube"],
+      "kind": "guide",
+      "all": [["retry", "reload", "refresh"]],
+      "none": ["wi-fi", "wifi", "mobile data"]
+    },
+    {
+      "name": "13 Nov: an app that will not load: Retry in that app first, never turning on Wi-Fi",
+      "history": [],
+      "question": "An app on my phone says Failed to load app and has a Retry button. How do I resolve this?",
+      "apps": ["AI Studio", "Chrome", "Drive", "Gmail", "Play Store", "Settings", "WhatsApp", "YouTube"],
+      "all": [["retry"]],
+      "none": ["turn on wi-fi", "turn on your wi-fi", "wi-fi settings", "turn on mobile data", "turn on your mobile data"]
     }
   ]
 }
