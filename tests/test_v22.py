@@ -42,7 +42,7 @@ main._feat.clear()
 main._claude_client = Client([Err(400, "image too large")])
 try: run(main._complete("s", "q", None, "ask", main.ASK_SCHEMA)); raise SystemExit("should fail")
 except Err: pass
-assert main._feats("claude-haiku-5-5") == {"schema": True, "effort": True, "thinking": True}
+assert main._feats("claude-haiku-5-5") == {"schema": True, "effort": True, "thinking": True, "cache": True}   # 0.96: and the cache
 print("ai settings ok")
 
 # 2. backup model when the main one fails or is slow, then skip the failing one for a while

@@ -32,7 +32,8 @@ def problems(case: dict, r: dict) -> list:
 
 async def one(case: dict):
     main._TALLY.set(None)
-    r = await main._answer(case["question"], "en", [], case.get("history", []), apps=case.get("apps"))
+    # 0.96: as test phones get it (and everyone, 24 hours after an update): every chat answer thought through first
+    r = await main._answer(case["question"], "en", [], case.get("history", []), apps=case.get("apps"), tester=True)
     return r, problems(case, r)
 
 

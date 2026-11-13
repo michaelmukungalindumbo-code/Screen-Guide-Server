@@ -42,6 +42,20 @@ STRONG_PER_DAY = int(os.getenv("STRONG_PER_DAY", "100"))
 STRONG_CHATS_PER_DAY = int(os.getenv("STRONG_CHATS_PER_DAY", "300"))   # chat follow-ups answered by the stronger AI
 _strong_chat_day = defaultdict(int)
 _strong_day = defaultdict(int)
+# 0.96 (the owner, 13 Nov: "users are willing to wait for a few seconds for a valid, effective and accurate answer"; he
+# chose "careful where it matters"): the stronger AI thinks before it answers every chat question, a guide's first step,
+# the first step in each app, a step after one that pointed at nothing, and the hard moments (Help, going round in
+# circles). Routine taps stay with the fast AI. Staged as "careful". At most CAREFUL_PER_DAY such steps a day (chats:
+# STRONG_CHATS_PER_DAY); after that, the fast AI as before.
+CAREFUL_PER_DAY = int(os.getenv("CAREFUL_PER_DAY", "400"))
+CAREFUL_EFFORT = os.getenv("CAREFUL_EFFORT", "medium").strip() or "medium"   # how hard it thinks (Sonnet 5.5: low to max)
+CAREFUL_SECONDS = 15        # more time, to think
+CAREFUL_MAX_TOKENS = 4000   # its thinking counts toward the answer's length
+_careful_day = defaultdict(int)
+# 0.96: the long instructions (the same on every call) are kept by the AI service for 5 minutes and read back at a small
+# part of the price (writing them costs a quarter more, once). platform.claude.com/docs/en/build-with-claude/prompt-caching
+CACHE_WRITE = 1.25
+CACHE_READ = {"claude-sonnet-5-5": 0.05, "claude-opus-5-5": 0.05}   # other models: 0.1
 _known = KNOWN_PRICES.get(settings.ANTHROPIC_MODEL, (0.0, 0.0))
 PRICE_IN = float(os.getenv("PRICE_IN_PER_MILLION", "0") or 0) or _known[0]
 PRICE_OUT = float(os.getenv("PRICE_OUT_PER_MILLION", "0") or 0) or _known[1]
@@ -71,12 +85,15 @@ def _today() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 7200))   # Zambia time
 
 
-def _count(kind: str, tin: int, tout: int, provider: str = "claude", model: str = "", secs: float = 0.0) -> None:
-    tin, tout = int(tin or 0), int(tout or 0)
+def _count(kind: str, tin: int, tout: int, provider: str = "claude", model: str = "", secs: float = 0.0, cw: int = 0, cr: int = 0) -> None:
+    """tin: input not cached; cw, cr: input written to or read from the cache (0.96); tout: output, thinking included."""
+    tin, tout, cw, cr = int(tin or 0), int(tout or 0), int(cw or 0), int(cr or 0)
     pin, pout = (PRICE_IN, PRICE_OUT) if model in ("", settings.ANTHROPIC_MODEL) else KNOWN_PRICES.get(model, (PRICE_IN, PRICE_OUT))
-    cost = (tin * pin + tout * pout) / 1_000_000 if provider == "claude" else 0.0   # Gemini backup: free tier
+    cost = ((tin + cw * CACHE_WRITE + cr * CACHE_READ.get(model, 0.1)) * pin + tout * pout) / 1_000_000 if provider == "claude" else 0.0   # Gemini backup: free tier
     u = USAGE[kind]
-    u["calls"] += 1; u["in"] += tin; u["out"] += tout; u["cost"] += cost
+    u["calls"] += 1; u["in"] += tin + cw + cr; u["out"] += tout; u["cost"] += cost
+    if cr:
+        STATS["cached_tokens_read"] += cr
     day = _today()
     if SPEND["day"] != day:
         SPEND["day"], SPEND["today"] = day, 0.0
@@ -86,7 +103,7 @@ def _count(kind: str, tin: int, tout: int, provider: str = "claude", model: str 
             SPEND["alerted"].append(a)
             log.warning("SPEND ALERT: AI cost since the server started passed $%.2f", a)
     # One line per AI call: no question or answer text, only size, time and model.
-    log.info("AI kind=%s model=%s ms=%d in=%d out=%d cost=%.5f", kind, model, secs * 1000, tin, tout, cost)
+    log.info("AI kind=%s model=%s ms=%d in=%d cache_w=%d cache_r=%d out=%d cost=%.5f", kind, model, secs * 1000, tin, cw, cr, tout, cost)
 
 
 def _over_budget() -> bool:
@@ -140,7 +157,7 @@ SKIP_SECONDS = 30
 
 
 def _feats(model: str) -> dict:
-    return _feat.setdefault(model, {"schema": True, "effort": True, "thinking": True})
+    return _feat.setdefault(model, {"schema": True, "effort": True, "thinking": True, "cache": True})
 
 
 def _status(e: Exception):
@@ -167,7 +184,9 @@ def _chain() -> list:
 def _drop(msg: str, f: dict, has_schema: bool) -> bool:
     """The service refused a setting (400). Switch off the one it named. False if it named none of ours."""
     m = msg.lower()
-    if "effort" in m and f["effort"]:
+    if "cache_control" in m and f.get("cache"):   # 0.96: never a step lost to the cache: without it, as before
+        f["cache"] = False
+    elif "effort" in m and f["effort"]:
         f["effort"] = False
     elif "thinking" in m and f["thinking"]:
         # Sonnet 5.5 refuses "disabled" and names "between_tools" as its way to think nothing up front. Dropping the
@@ -191,16 +210,21 @@ async def _call_claude(model, system, question, images, kind, schema, max_tokens
     content = question
     if images:
         content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in images] + [{"type": "text", "text": question}]
-    args = dict(model=model, max_tokens=max_tokens, system=system, messages=[{"role": "user", "content": content}])
+    tally = _TALLY.get()
+    careful = bool(tally and tally.get("careful")) and model == STRONG_MODEL   # 0.96: think first (see CAREFUL_PER_DAY)
+    args = dict(model=model, max_tokens=max(max_tokens, CAREFUL_MAX_TOKENS) if careful else max_tokens, system=system,
+                messages=[{"role": "user", "content": content}])
     f = _feats(model)
     for _ in range(4):
         # No temperature: Claude 5.5 models take none. Short tasks need no thinking, which keeps answers fast,
-        # cheap and never cut off (thinking counts toward max_tokens).
-        body, oc = {}, {}
-        if f["thinking"]:
+        # cheap and never cut off (thinking counts toward max_tokens). A careful answer (0.96) thinks first: the
+        # model's own adaptive thinking (no "thinking" setting), as deep as CAREFUL_EFFORT.
+        # 0.96: the instructions as one block kept in the AI service's cache (the same text as "system" above).
+        body, oc = {"system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]} if f.get("cache") else {}, {}
+        if f["thinking"] and not careful:
             body["thinking"] = {"type": "disabled" if f["thinking"] is True else f["thinking"]}
         if f["effort"]:
-            oc["effort"] = "low"
+            oc["effort"] = CAREFUL_EFFORT if careful else "low"
         if schema and f["schema"]:   # structured outputs: the reply always matches the schema
             oc["format"] = {"type": "json_schema", "schema": schema}
         if oc:
@@ -209,7 +233,7 @@ async def _call_claude(model, system, question, images, kind, schema, max_tokens
             msg = await _claude_client.messages.create(**args, **({"extra_body": body} if body else {}))
             break
         except Exception as e:
-            if _status(e) != 400 or not body or not _drop(str(e), f, bool(schema)):
+            if _status(e) != 400 or not _drop(str(e), f, bool(schema)):
                 raise
             log.warning("AI service refused a setting for %s (%s); trying without it.", model, str(e)[:120])
     else:
@@ -217,7 +241,8 @@ async def _call_claude(model, system, question, images, kind, schema, max_tokens
     if getattr(msg, "stop_reason", "") == "max_tokens":
         STATS["ai_cut_off"] += 1
     u = getattr(msg, "usage", None)
-    _count(kind, getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0), "claude", model, time.time() - t0)
+    _count(kind + ("+careful" if careful else ""), getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0), "claude", model, time.time() - t0,
+           getattr(u, "cache_creation_input_tokens", 0) or 0, getattr(u, "cache_read_input_tokens", 0) or 0)
     return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
 
 
@@ -554,7 +579,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.95"
+SERVER_VERSION = "0.96"
 
 
 @app.get("/health")
@@ -597,7 +622,7 @@ def _valid_next(d) -> bool:
 async def _ai_json(system: str, prompt: str, images, kind: str, schema: dict, valid) -> tuple:
     """Ask, check the reply against the expected shape, and quietly ask again (up to JSON_RETRIES times)
     while there is time. Returns (text, data); data may still be bad, and callers rescue what they can."""
-    budget = settings.REQUEST_TIMEOUT_SECONDS + (15 if images else 0)
+    budget = settings.REQUEST_TIMEOUT_SECONDS + (15 if images else 0) + (CAREFUL_SECONDS if (_TALLY.get() or {}).get("careful") else 0)
     start, text, data = time.time(), "", None
     tries = []
     for attempt in range(1 + JSON_RETRIES):
@@ -631,6 +656,24 @@ async def _ai_json(system: str, prompt: str, images, kind: str, schema: dict, va
         text = max(tries, key=lambda t: ('"text"' in t or '"say"' in t, len(t)))
         data = _parse_json(text)
     return text, data
+
+
+def _careful_why(history: list, path: list, apps: list, loop: dict, stuck: bool, breaking: bool) -> str:
+    """0.96: why this step is one that matters ("help", "going round", "first step", "new app", "after no ring"), or ""
+    for a routine tap. A new app: the newest place in the guide's path is an app on this phone (the phone adds an app's
+    name to the path when it opens). After no ring: the last answer for this guide pointed at nothing."""
+    if stuck:
+        return "help"
+    if breaking:
+        return "going round"
+    if not [h for h in history if h and not h.startswith("User said:")]:
+        return "first step"
+    if path and apps and _key(path[-1]) and _key(path[-1]) in {_key(a) for a in apps}:
+        return "new app"
+    last = (loop or {}).get("last") or []
+    if last and last[-1].get("label") == 0 and not last[-1].get("done"):
+        return "after no ring"
+    return ""
 
 
 def _device(s: str) -> str:
@@ -714,11 +757,15 @@ async def _answer(question: str, lang: str, images: list[str], history: list[str
     hard = "" if past else _hard(question)
     if hard and not _staged("hard_first", tester):
         hard = ""
-    if (past or hard) and _strong_chat_day[_today()] < STRONG_CHATS_PER_DAY:
+    careful = _staged("careful", tester)   # 0.96: every chat answer, thought through first
+    if (careful or past or hard) and _strong_chat_day[_today()] < STRONG_CHATS_PER_DAY:
         _strong_chat_day[_today()] += 1
-        _TALLY.set({"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": 0, "strong": True})
+        _TALLY.set({"ai": 0, "timeouts": 0, "backup": False, "again": [], "up": 0, "strong": True, "careful": careful})
         STATS["strong_chats"] += 1
         STATS["chat_strong"] += 1
+        if careful:
+            STATS["chat_careful"] += 1
+            _fired("careful")
         if hard:
             STATS["chat_hard_first"] += 1
             STATS["chat_hard_" + hard.replace(" ", "_")] += 1
@@ -1829,6 +1876,14 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     known = None
     if not honest and known_on and not body.stuck and not body.note.strip() and not image and not breaking:
         known = _known_answer(kkey, labels, x_tester == "1")
+    # 0.96: the moments that matter get the stronger AI, thinking first (see CAREFUL_PER_DAY)
+    careful_why = _careful_why(history, body.path, apps, loop, body.stuck, breaking) if not honest and not known else ""
+    if careful_why and _staged("careful", x_tester == "1") and _careful_day[_today()] < CAREFUL_PER_DAY:
+        _careful_day[_today()] += 1
+        tally["strong"] = tally["careful"] = True
+        STATS["careful_steps"] += 1
+        STATS["careful_" + careful_why.replace(" ", "_")] += 1
+        _fired("careful")
     if honest:   # no AI this time: it already had its second chance
         text, data = "", {"label": None, "say": _NOT_SURE, "done": False, "x": None, "y": None, "look_for": None}
     elif known:   # v0.84: people followed this answer here before: no AI, instant and free. Every rule below still applies.
@@ -2883,6 +2938,7 @@ STAGED = {              # rule name -> the server version that brought it
     "ad_buttons": "0.85",          # on another app's ad that covers the screen, only its "Skip ad" or "Close ad" is rung
     "chosen_tab": "0.93",          # on a gallery, never "Tap Video" when Video is already the chosen tab: they pick their video
     "switch_state": "0.95",        # never "turn on" a switch the phone says is on (or "off" one that is off): asked again, told so
+    "careful": "0.96",             # every chat answer and the steps that matter: the stronger AI, thinking first
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
