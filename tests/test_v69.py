@@ -1,6 +1,8 @@
 import os, asyncio, json, time as _time
 os.environ.update(ADMIN_KEY="k")
 import main
+# 0.96: these checks are for the fast AI at these moments; with "careful" on, test_v96_careful checks the stronger one
+main._launch["paused"]["careful"] = "Paused in this test"
 run = asyncio.run
 
 # A pretend clock: each AI answer takes 8 seconds, without the test waiting for them

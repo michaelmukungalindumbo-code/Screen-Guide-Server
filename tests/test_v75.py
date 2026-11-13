@@ -1,6 +1,8 @@
 import os, asyncio, json
 os.environ.update(ADMIN_KEY="k")
 import main
+# 0.96: these checks are for the fast AI at these moments; with "careful" on, test_v96_careful checks the stronger one
+main._launch["paused"]["careful"] = "Paused in this test"
 run = asyncio.run
 class Msgs:
     def __init__(self, out): self.out = list(out); self.calls = []
