@@ -281,8 +281,10 @@ async def _complete(system: str, question: str, images: list[str] | None = None,
         chain = [("claude", STRONG_MODEL)] + chain   # a hard moment: the stronger AI first, the usual ones as backups
     now = time.time()
     live = [p for p in chain if _down.get(p, 0) <= now] or chain[:1]
-    start, last = time.time(), None
+    start, last, broke = time.time(), None, ""
     for i, (prov, model) in enumerate(live):
+        if prov == broke:   # 0.98: that account has no credit: its other models would fail the same way
+            continue
         left = budget - (time.time() - start)
         if left < 3:
             break
@@ -309,10 +311,67 @@ async def _complete(system: str, question: str, images: list[str] | None = None,
             code = _status(e)
             STATS["ai_error_" + ("timeout" if isinstance(e, asyncio.TimeoutError) else str(code or "network"))] += 1
             _log_ai_error(e)
+            if _no_credit(e):   # 0.98: the account's credit ran out. Not this question's fault: a backup may still answer
+                STATS["ai_no_credit"] += 1
+                for p in chain + [("claude", STRONG_MODEL)]:
+                    if p[0] == prov:
+                        _down[p] = time.time() + NO_CREDIT_SKIP   # every model of that account; tried again later
+                _credit_alert(prov)
+                broke = prov
+                continue
             if code in (400, 413):   # the request itself is wrong: a backup would fail the same way
                 raise
             _down[(prov, model)] = time.time() + SKIP_SECONDS
     raise last or asyncio.TimeoutError()
+
+
+# ---- 0.98 (the owner's phone, 19 Nov: "The helper isn't available at the moment", twice): the Anthropic account's
+# credit had run out ("Your credit balance is too low", seen in the real-AI check). Every question failed at once, as a
+# "wrong request", without trying the backup, and nobody was told. Now the backup AI is tried (when there is one), the
+# account is tried again every NO_CREDIT_SKIP seconds, and the owner gets one GitHub issue a day saying what to do.
+NO_CREDIT_SKIP = 600
+_credit_said = {"day": ""}
+
+
+def _no_credit(e: Exception) -> bool:
+    m = str(getattr(e, "message", "") or e).lower()
+    return "credit balance" in m or "billing" in m and "credit" in m
+
+
+def _credit_issue(prov: str, day: str) -> dict:
+    """The owner's issue: plain words, what to do, and nothing secret."""
+    where = "console.anthropic.com" if prov == "claude" else "the AI service's website"
+    return {"title": "ScreenGuide's AI credit has run out",
+            "body": ("ScreenGuide's helper could not answer: the AI account's credit has run out (the AI service said: "
+                     "\u201cYour credit balance is too low\u201d). Chat answers and Smart guides stop until it is topped up. "
+                     "Built-in guides, taught tasks and opening apps still work.\n\n"
+                     "**What to do:**\n1. Open %s and sign in.\n2. Go to Plans & Billing (Billing).\n3. Buy credits.\n\n"
+                     "Nothing else is needed: the server tries again every %d minutes by itself. Never paste the API key "
+                     "anywhere (not here, not in a chat).\n\n"
+                     "<!-- no-credit: %s -->" % (where, NO_CREDIT_SKIP // 60, day))}
+
+
+def _credit_alert(prov: str) -> None:
+    """At most one issue a day, in the background: the person's question never waits for GitHub."""
+    if not GITHUB_TOKEN or _credit_said["day"] == _today():
+        return
+    _credit_said["day"] = _today()
+    try:
+        t = asyncio.get_running_loop().create_task(_credit_issue_send(prov, _today()))
+        _bg.add(t); t.add_done_callback(_bg.discard)
+    except RuntimeError:
+        pass
+
+
+async def _credit_issue_send(prov: str, day: str):
+    try:
+        marker = "<!-- no-credit: %s -->" % day
+        recent = await _github("GET", "/repos/%s/issues?state=all&per_page=30&sort=created&direction=desc" % AI_FIX_REPO, None)
+        if not any(marker in (i.get("body") or "") for i in recent or []):   # GitHub is the memory: never twice a day
+            await _github("POST", "/repos/%s/issues" % AI_FIX_REPO, _credit_issue(prov, day))
+            STATS["no_credit_issue"] += 1
+    except Exception as e:
+        log.warning("No-credit issue not sent: %s", str(e)[:160])
 
 
 LANGS = {"en": "English", "ny": "Chinyanja (Nyanja)", "bem": "Icibemba (Bemba)"}
@@ -579,7 +638,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.97"
+SERVER_VERSION = "0.98"
 
 
 @app.get("/health")
@@ -1112,12 +1171,16 @@ def _label_from_say(say: str, labels: list, apps: bool = False):
     so "Phone Master" wins only if the instruction says "Phone Master". apps: never "WhatsApp" in "Tap WhatsApp Business"."""
     # Never a tab that is already chosen ("[selected]"): 3 Nov, "Tap the video you want" became YouTube's "Video" tab.
     names = sorted({_plain(l) for l in labels if not _TAG.search(l) or not l.rstrip().lower().endswith(("[text]", "[selected]"))},
-                   key=len, reverse=True)
+                   key=lambda n: (-len(n), n))
+    # 0.98: the first button the words name; at the same place, the longer name. Before, two names of the same length
+    # ("Tap “Add Network”, or tap Navigate up") came out in a different order on each server start.
+    best = None
     for n in names:
-        if len(n) >= 2 and re.search(r"\b(tap|press|open|choose|select|dinani|kandeni)\s+(the\s+)?[\"\u201c']?" + re.escape(n) + r"(?![\w])"
-                                     + (r"(?!\s+(?:business|kids|music|studio)\b)" if apps else ""), say, re.I):
-            return n
-    return None
+        m = re.search(r"\b(tap|press|open|choose|select|dinani|kandeni)\s+(the\s+)?[\"\u201c']?" + re.escape(n) + r"(?![\w])"
+                      + (r"(?!\s+(?:business|kids|music|studio)\b)" if apps else ""), say, re.I) if len(n) >= 2 else None
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), n)
+    return best[1] if best else None
 
 
 # 0.95 (the owner's phone, 13 Nov, Infinix): "Tap the switch next to Wi-Fi to turn it on." on step after step, with Wi-Fi
