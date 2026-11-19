@@ -579,7 +579,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.96"
+SERVER_VERSION = "0.97"
 
 
 @app.get("/health")
@@ -658,6 +658,14 @@ async def _ai_json(system: str, prompt: str, images, kind: str, schema: dict, va
     return text, data
 
 
+def _path_app(path: list, apps: list) -> str:
+    """The app the guide is in now, when the newest place in its path is an app on this phone (the phone adds an app's name
+    to the path when it opens); else "". 0.97: many phones (Infinix) never report taps, so the path often stops at the
+    app's name, and every step there looked like the first in a new app: careful (slower, dearer) for routine taps."""
+    k = _key(path[-1]) if path else ""
+    return k if k and apps and k in {_key(a) for a in apps} else ""
+
+
 def _careful_why(history: list, path: list, apps: list, loop: dict, stuck: bool, breaking: bool) -> str:
     """0.96: why this step is one that matters ("help", "going round", "first step", "new app", "after no ring"), or ""
     for a routine tap. A new app: the newest place in the guide's path is an app on this phone (the phone adds an app's
@@ -668,7 +676,8 @@ def _careful_why(history: list, path: list, apps: list, loop: dict, stuck: bool,
         return "going round"
     if not [h for h in history if h and not h.startswith("User said:")]:
         return "first step"
-    if path and apps and _key(path[-1]) and _key(path[-1]) in {_key(a) for a in apps}:
+    app = _path_app(path, apps)
+    if app and app != (loop or {}).get("app"):   # 0.97: only when it changed since the last step of this guide
         return "new app"
     last = (loop or {}).get("last") or []
     if last and last[-1].get("label") == 0 and not last[-1].get("done"):
@@ -1136,6 +1145,15 @@ def _already_switched(label, say: str, goal: str, labels: list):
         return None
     m = _TURN.search(say) or _TURN.search(goal)
     return (name, state) if m and m.group(1).lower() == state else None
+
+
+def _already_chosen(label, say: str, labels: list) -> str:
+    """0.97: the step asks to tap an option or tab the phone says is already chosen ("30 seconds [selected]", "Chats
+    [selected]"): its name; else "". Not on a gallery of the person's photos or videos (its own rule, chosen_tab)."""
+    name = _match_label(label, labels)
+    if not name or not _POINT_ACTION.search(_NEGATED.sub("", say)) or _gallery(labels)[0]:
+        return ""
+    return name if any(_key(l) == _key(name) and l.rstrip().lower().endswith("[selected]") for l in labels) else ""
 
 
 def _only_switch(goal: str, name: str) -> bool:
@@ -1884,6 +1902,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["careful_steps"] += 1
         STATS["careful_" + careful_why.replace(" ", "_")] += 1
         _fired("careful")
+    if _path_app(body.path, apps):
+        loop["app"] = _path_app(body.path, apps)   # 0.97: the app of this step, so the next one in it is not "new"
     if honest:   # no AI this time: it already had its second chance
         text, data = "", {"label": None, "say": _NOT_SURE, "done": False, "x": None, "y": None, "look_for": None}
     elif known:   # v0.84: people followed this answer here before: no AI, instant and free. Every rule below still applies.
@@ -1984,6 +2004,26 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         else:
             data = {"label": None, "say": "\u201c%s\u201d is already %s." % (name, state), "done": _only_switch(goal, name),
                     "x": None, "y": None, "look_for": None}
+    # 0.97: the same for an option or tab that is already chosen (#79 was one, on a gallery; Settings lists have them too)
+    chosen = _already_chosen(data.get("label"), str(data.get("say") or ""), labels) if isinstance(data, dict) and not data.get("done") else ""
+    if chosen and _staged("already_chosen", x_tester == "1"):
+        STATS["already_chosen_asked"] += 1
+        tally["again"].append("what it named was already chosen")
+        _fired("already_chosen")
+        try:   # only a better answer is taken
+            _, again = await _ai_json(system, user + "\n\u201c%s\u201d is already chosen: it is the one in use now. Never ask them to "
+                                      "tap it. Give the next step of the goal, or set done true if this was the whole goal." % _safe(chosen, 40),
+                                      [image] if image and not image_blocked else None, "step+picture" if image and not image_blocked else "step",
+                                      NEXT_SCHEMA, _valid_next)
+        except HTTPException:
+            again = None; STATS["second_try_failed"] += 1
+        if isinstance(again, dict) and again and (again.get("done") or not _already_chosen(again.get("label"), str(again.get("say") or ""), labels)):
+            STATS["already_chosen_fixed"] += 1
+            data = again
+        else:
+            k = _key(chosen)
+            data = {"label": None, "say": "\u201c%s\u201d is already chosen." % chosen, "done": len(k) >= 3 and k in _key(goal),
+                    "x": None, "y": None, "look_for": None}
     ai_empty = not isinstance(data, dict) or not data
     data = data if isinstance(data, dict) else {}
     apps_rule = _staged("longer_app_name", x_tester == "1")
@@ -1993,6 +2033,14 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         label = _label_from_say(say, labels, apps=apps_rule)   # the AI named the button in its words but did not mark it
         if label:
             STATS["label_from_words"] += 1
+    # 0.97 (the owner's phone, 13 Nov, step 4): "Tap the Navigate up arrow to go back." with the ring on "Wi-Fi": the words
+    # named one button and the AI's label another. The person reads the words, so the ring follows them. Not when the
+    # words offer a choice or a second action ("or", "then"): those have their own rules.
+    named = _label_from_say(say, labels, apps=apps_rule) if label and not re.search(r"\b(or|then)\b", say, re.I) else None
+    if named and _key(named) != _key(label) and _staged("label_follows_words", x_tester == "1"):
+        STATS["label_follows_words"] += 1
+        _fired("label_follows_words")
+        label = named
     typed = _type_step(goal, labels, label, say) if _staged("type_in_open_box", x_tester == "1") else None
     if typed:   # an open box: what to type, never another tap (and not cut to "Tap the search box" below)
         STATS["type_in_open_box"] += 1
@@ -2939,6 +2987,8 @@ STAGED = {              # rule name -> the server version that brought it
     "chosen_tab": "0.93",          # on a gallery, never "Tap Video" when Video is already the chosen tab: they pick their video
     "switch_state": "0.95",        # never "turn on" a switch the phone says is on (or "off" one that is off): asked again, told so
     "careful": "0.96",             # every chat answer and the steps that matter: the stronger AI, thinking first
+    "label_follows_words": "0.97", # the ring goes on the button the words name, when the AI's label is another one
+    "already_chosen": "0.97",      # never "tap" an option or tab that is already chosen: asked again, told so
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
