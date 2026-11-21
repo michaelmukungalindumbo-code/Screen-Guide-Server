@@ -12,4 +12,16 @@ with TestClient(main.app) as c:   # runs the startup and shutdown hooks too
     assert r.status_code == 200 and r.json() == {"ok": True}, r.text
     assert main._counts[main._today()]["guides"]["start"] == 1
     assert c.get("/privacy").status_code == 200
+    # 0.99 Status: post, list, look, get, report and remove, through the real web framework
+    h, v = {"x-app-token": "ci", "x-install-id": "ci-maker"}, {"x-app-token": "ci", "x-install-id": "ci-viewer"}
+    r = c.post("/status", json={"title": "Turn on the torch", "steps": [{"m": ["Torch"], "s": {"en": "Tap “Torch”."}}]}, headers=h)
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    assert c.get("/status", headers=v).json()["items"][0]["id"] == sid
+    assert c.get("/status/" + sid, headers=v).json()["says"] == ["Tap “Torch”."]
+    assert c.post("/status/%s/get" % sid, headers=v).json()["steps"][0]["m"] == ["Torch"]
+    assert c.post("/status/%s/report" % sid, json={"why": "test"}, headers=v).json() == {"ok": True}
+    assert c.post("/status/%s/remove" % sid, headers=v).status_code == 403
+    assert c.post("/status/%s/remove" % sid, headers=h).json() == {"ok": True}
+    assert c.post("/status", json={"title": "Send money", "steps": [{"m": ["Send money"], "s": {"en": "x"}}]}, headers=h).status_code == 400
 print("the server starts with the real libraries")
