@@ -638,7 +638,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.98"
+SERVER_VERSION = "0.99"
 
 
 @app.get("/health")
@@ -3908,6 +3908,222 @@ async def live_page(lid: str):
                             "<p>Ask them to start it again in ScreenGuide and send you a new link.</p></main></body></html>", status_code=404)
     return HTMLResponse(_LIVE_PAGE.replace("__ID__", lid))
 
+
+
+# ---- 0.99 Status (the owner, 21 Nov: "someone can put it on the app as a status just like WhatsApp, where someone can
+# view, and if they like the guide, they can then request for it"). He chose: everyone sees a posted task, after an
+# automatic check; "Get it" puts it on their phone at once; it stays until its maker removes it. A task that people
+# report (STATUS_HIDE_REPORTS different phones) is hidden until the owner looks at it (/admin/status).
+STATUS_HIDE_REPORTS = max(1, int(os.getenv("STATUS_HIDE_REPORTS", "3")))
+STATUS_PER_DAY, STATUS_PER_PHONE = 5, 30
+_status_day = defaultdict(deque)
+_status_global = deque()
+# Steps that lower a phone's safety are never posted for everyone: the ways scams take over phones (apps from outside the
+# Play Store, screen control, another app's access to the screen), and wiping or rooting it.
+_STATUS_UNSAFE = re.compile(r"\b(unknown (apps|sources)|install unknown|allow from this source|device admin\w*|accessibility|"
+                            r"display over other apps|appear on top|draw over|remote (control|access|support|desktop)|anydesk|"
+                            r"teamviewer|quick ?support|screen shar\w*|factory (data )?reset|developer options|usb debugging|root\w*)\b", re.I)
+_LINK = re.compile(r"https?://|www\.|\b[\w-]+\.(com|net|org|zm|io|app|xyz|info|biz|link|ly)\b", re.I)
+_MONEY_PKG = re.compile(r"momo|airtel|mtn|bank|zanaco|fnb|stanbic|absa|finance|wallet|pay|money|binance|paypal|credit|loan|cash|"
+                        r"kwacha|natsave|investrust|lupiya|mukuru|worldremit|remit", re.I)   # the app's Match.moneyApps
+_PKG = re.compile(r"^(home|[A-Za-z][\w]*(\.[A-Za-z_][\w]*)+)$")
+
+
+class StatusIn(BaseModel):
+    title: str
+    steps: list = []
+    sw: bool = False
+    shade: bool = False
+    lang: str = "en"
+    device: str = ""
+    name: str = ""        # the maker's first name, or "" for "A ScreenGuide user"
+
+
+class ReportIn(BaseModel):
+    why: str = ""
+
+
+def _status_name(name: str) -> str:
+    """A first name to show, or "": letters only, never numbers, emails or a whole name."""
+    w = re.sub(r"[^A-Za-zÀ-ɏ' -]", " ", str(name or "")).split()
+    return w[0][:20].capitalize() if w and len(w[0]) >= 2 else ""
+
+
+def _status_check(title: str, steps: list) -> tuple:
+    """The automatic check before a taught task is shown to everyone: (clean title, clean steps), or HTTPException(400) in
+    plain words. Never money apps or payments, passwords or personal numbers (as for shared guides), never a step that
+    lowers the phone's safety, never a link."""
+    t = re.sub(r"\s+", " ", str(title or "")).strip()[:60]
+    if len(t) < 3:
+        raise HTTPException(400, "Please give the task a name, for example: Scan a document with Drive.")
+    if _PERSONAL.search(t) or _LINK.search(t) or RISKY.search(t) or MONEY.search(t) or _STATUS_UNSAFE.search(t):
+        raise HTTPException(400, "The name has a number, a link, or a word about money, passwords or phone safety. "
+                                 "Please change the name.")
+    raw = steps if isinstance(steps, list) else []
+    clean = _clean_steps(raw, strict=True)
+    if not clean:
+        raise HTTPException(400, "This task has a step about payments, passwords or personal numbers, so it cannot be posted.")
+    for st in raw[:25]:
+        if not isinstance(st, dict):
+            continue
+        words = " ".join([str(w) for w in (st.get("m") or [])] + [str(v) for v in (st.get("s") or {}).values()])
+        if _STATUS_UNSAFE.search(words) or _LINK.search(words):
+            raise HTTPException(400, "This task changes how safe the phone is (apps from outside the Play Store, screen access "
+                                     "or control) or has a link, so it cannot be posted for everyone. You can still share it "
+                                     "with someone you know.")
+        a = str(st.get("a") or "")
+        if a and _MONEY_PKG.search(a):
+            raise HTTPException(400, "This task is in a money app, so it cannot be posted.")
+    # Where each step was taught (0.99: kept, so it is only looked for there) and whether it is an icon
+    by_words = {}
+    for st in raw[:25]:
+        if isinstance(st, dict) and st.get("m"):
+            k = tuple(re.sub(r"\s+", " ", str(w)).strip()[:60] for w in st["m"][:4] if str(w).strip())
+            a = str(st.get("a") or "")
+            by_words.setdefault(k, {"a": a if _PKG.match(a) and len(a) <= 100 else "", "i": bool(st.get("i"))})
+    for st in clean:
+        extra = by_words.get(tuple(st["m"]), {})
+        if extra.get("a"):
+            st["a"] = extra["a"]
+        if extra.get("i"):
+            st["i"] = True
+    return t, clean
+
+
+def _status_item(sid: str, d: dict, me: str) -> dict:
+    return {"id": sid, "title": d["title"], "steps": len(d.get("steps", [])), "by": d.get("name") or "",
+            "device": d.get("device", ""), "gets": int(d.get("gets", 0)), "created": int(d.get("created", 0)),
+            "mine": d.get("by") == me}
+
+
+@app.post("/status")
+async def status_post(body: StatusIn, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    install_id = _check(x_app_token, x_install_id)
+    title, steps = _status_check(body.title, body.steps)
+    me = _hash(install_id)
+    if _take(deque(), _status_day[install_id], _status_global, 10**6, STATUS_PER_DAY, 2000):
+        raise HTTPException(429, "You have posted many tasks today. Please try again tomorrow.")
+    mine = [x for x in await _gdb(_store.kv_list, "status", 1000) if x[1].get("by") == me]
+    if len(mine) >= STATUS_PER_PHONE:
+        raise HTTPException(429, "You have %d tasks posted. Remove one first." % len(mine))
+    same = next((sid for sid, d in mine if d.get("title", "").lower() == title.lower()), None)
+    sid = same
+    if not sid:
+        for _ in range(8):
+            sid = "".join(secrets.choice(_CODE_ABC) for _ in range(6))
+            if not await _gdb(_store.kv_get, "status", sid):
+                break
+    old = dict(mine)[same] if same else {}
+    data = {"title": title, "steps": steps, "sw": bool(body.sw), "shade": bool(body.shade), "lang": body.lang if body.lang in LANGS else "en",
+            "device": _device_key(body.device), "by": me, "name": _status_name(body.name), "created": int(time.time()),
+            "gets": int(old.get("gets", 0)), "got": old.get("got", []), "hidden": False}
+    await _gdb(_store.kv_put, "status", sid, data)
+    STATS["status_posted"] += 1
+    return {"id": sid, "updated": bool(same)}
+
+
+@app.get("/status")
+async def status_list(x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    """Everyone's posted tasks, newest or most recently got first (hidden ones left out), and this phone's own."""
+    install_id = _check(x_app_token, x_install_id)
+    me = _hash(install_id)
+    rows = await _gdb(_store.kv_list, "status", 300)
+    items = [_status_item(sid, d, me) for sid, d in rows if not d.get("hidden")]
+    STATS["status_listed"] += 1
+    return {"items": [i for i in items if not i["mine"]][:80], "mine": [i for i in items if i["mine"]][:STATUS_PER_PHONE]}
+
+
+@app.get("/status/{sid}")
+async def status_view(sid: str, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    """One posted task, to look at before getting it: what each step says."""
+    install_id = _check(x_app_token, x_install_id)
+    d = await _gdb(_store.kv_get, "status", _norm_code(sid))
+    if not d or d.get("hidden"):
+        raise HTTPException(404, "This task is no longer posted.")
+    item = _status_item(_norm_code(sid), d, _hash(install_id))
+    item["says"] = [st["s"].get("en", "") for st in d.get("steps", [])]
+    return item
+
+
+@app.post("/status/{sid}/get")
+async def status_get(sid: str, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    """Get it: the steps, to keep on this phone. Each phone counts once."""
+    install_id = _check(x_app_token, x_install_id)
+    sid = _norm_code(sid)
+    d = await _gdb(_store.kv_get, "status", sid)
+    if not d or d.get("hidden"):
+        raise HTTPException(404, "This task is no longer posted.")
+    me = _hash(install_id)
+    if me != d.get("by") and me not in d.get("got", []):
+        d["got"] = (d.get("got", []) + [me])[-1000:]
+        d["gets"] = int(d.get("gets", 0)) + 1
+        try:
+            await _gdb(_store.kv_put, "status", sid, d)
+        except HTTPException:
+            pass   # the count can wait; the person still gets the task
+    STATS["status_got"] += 1
+    return {"id": sid, "title": d["title"], "steps": d["steps"], "sw": d.get("sw", False), "shade": d.get("shade", False)}
+
+
+@app.post("/status/{sid}/report")
+async def status_report(sid: str, body: ReportIn, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    install_id = _check(x_app_token, x_install_id)
+    sid = _norm_code(sid)
+    d = await _gdb(_store.kv_get, "status", sid)
+    if not d:
+        return {"ok": True}
+    me = _hash(install_id)
+    r = await _gdb(_store.kv_get, "statusr", sid) or {"by": [], "why": []}
+    if me != d.get("by") and me not in r["by"]:
+        r["by"].append(me)
+        r["why"] = (r["why"] + [re.sub(r"\s+", " ", _scrub(body.why, 120)).strip()])[-20:]
+        await _gdb(_store.kv_put, "statusr", sid, r)
+        STATS["status_reported"] += 1
+        if len(r["by"]) >= STATUS_HIDE_REPORTS and not d.get("hidden"):
+            d["hidden"] = True
+            await _gdb(_store.kv_put, "status", sid, d)
+            STATS["status_hidden"] += 1
+    return {"ok": True}
+
+
+@app.post("/status/{sid}/remove")
+async def status_remove(sid: str, x_app_token: str = Header(default=""), x_install_id: str = Header(default="")):
+    install_id = _check(x_app_token, x_install_id)
+    sid = _norm_code(sid)
+    d = await _gdb(_store.kv_get, "status", sid)
+    if d and d.get("by") != _hash(install_id):
+        raise HTTPException(403, "Only the person who posted it can remove it.")
+    if d:
+        await _gdb(_store.kv_delete, "status", sid)
+        await _gdb(_store.kv_delete, "statusr", sid)
+        STATS["status_removed"] += 1
+    return {"ok": True}
+
+
+@app.get("/admin/status", response_class=HTMLResponse)
+async def admin_status(key: str = "", hide: str = "", show: str = ""):
+    """Posted tasks, with their reports. Hide one, or show a hidden one again."""
+    _admin(key)
+    msg = ""
+    for sid, on in ((hide, True), (show, False)):
+        if sid:
+            d = await _gdb(_store.kv_get, "status", _norm_code(sid))
+            if d:
+                d["hidden"] = on
+                await _gdb(_store.kv_put, "status", _norm_code(sid), d)
+                msg = "%s is %s." % (_norm_code(sid), "hidden" if on else "shown again")
+    k = html.escape(key, quote=True)
+    rows = ""
+    for sid, d in await _gdb(_store.kv_list, "status", 300):
+        r = await _gdb(_store.kv_get, "statusr", sid) or {"by": [], "why": []}
+        act = "show" if d.get("hidden") else "hide"
+        rows += ("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%d %s</td><td><a href='?key=%s&%s=%s'>%s</a></td></tr>"
+                 % (sid, html.escape(d.get("title", "")), html.escape(" | ".join(st["s"].get("en", "") for st in d.get("steps", []))[:300]),
+                    int(d.get("gets", 0)), len(r["by"]), html.escape("; ".join(r["why"])[:200]), k, act, sid,
+                    "Show again" if d.get("hidden") else "Hide"))
+    return HTMLResponse("<html><body style='font:15px system-ui;padding:12px'><h2>Status: posted tasks</h2><p>%s</p>"
+                        "<table border=1 cellpadding=4><tr><th>Id</th><th>Name</th><th>Steps</th><th>Got it</th><th>Reports</th><th></th></tr>%s</table>"
+                        "</body></html>" % (html.escape(msg), rows))
 
 
 # ---- Real voices: the owner records the fixed instructions ("Kandeni", "Well done!") once, in a Zambian voice, and
