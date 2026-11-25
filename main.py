@@ -639,7 +639,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.03"
+SERVER_VERSION = "1.04"
 
 
 @app.get("/health")
@@ -1260,6 +1260,20 @@ _SCAN_GOAL = re.compile(r"\bscan", re.I)
 _BACKUP_GOAL = re.compile(r"\bback(?:ing)?[\s-]*up\b|\bbackup\b|\bsync", re.I)
 _PROFILE_PIC = re.compile(r"\bprofile (?:picture|photo|pic)\b|\baccount (?:picture|photo)\b", re.I)
 _BACKED_UP = re.compile(r"^backup complete\b|\b[\d,.]+\s*(?:photos?|videos?|items?)\s+backed up\b|^all (?:photos|items) backed up\b", re.I)
+# 1.04 (#97, the owner's idea; seen again 25 Nov: "Tap "Navigate up" to go back."): Android's names for common icons, in plain
+# words for a first-time user. The ring stays on the button. English only. Staged: "plain_icons".
+_ICON_WORDS = {"navigate up": "the back arrow", "more options": "the three dots", "open navigation drawer": "the three lines",
+               "show navigation drawer": "the three lines"}
+
+
+def _plain_icons(say: str, label) -> str:
+    plain = _ICON_WORDS.get(_plain(label or "").lower())
+    if not plain:
+        return say
+    rx = re.compile(r"(?:\bthe\s+)?[\"\u201c]?%s[\"\u201d]?(?:\s+(?:arrow|button|icon))?" % re.escape(_plain(label)), re.I)
+    return rx.sub(plain, say)
+
+
 _BACKED_UP_SAY = "Your photos are backed up."   # English only: other languages get their usual "Done" sentence
 _UPLOADING_SAY = re.compile(r"\buploading\b", re.I)
 # "The screen is black right now": what the AI says when the app blocked the screen picture
@@ -2285,6 +2299,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     y = _fraction(data.get("y")) if image and not label else None
     if x is None or y is None:
         x = y = None
+    if lang == "en" and label and _staged("plain_icons", x_tester == "1"):   # 1.04: "Tap the back arrow."
+        plainer = _plain_icons(say, label)
+        if plainer != say:
+            STATS["plain_icons"] += 1
+            _fired("plain_icons")
+            say = plainer
     repeated = (breaking and not honest and label is not None
                 and any(_fp(label) == a["label"] and _fp(say) == a["say"] for a in loop["last"][-2:]))
     if honest or repeated:
@@ -3140,6 +3160,7 @@ STAGED = {              # rule name -> the server version that brought it
     "unseen_name": "1.00",         # a screen with no words: a button is named in quotes only if the AI can read it in the picture
     "unseen_done": "1.01",         # a screen with no words never ends a guide: asked again for the step it can see (Upload)
     "backup_goal": "1.02",         # backing up photos is not choosing one; done when the screen says the backup is complete
+    "plain_icons": "1.04",         # "Navigate up" is said as "the back arrow", "More options" as "the three dots" (English)
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
