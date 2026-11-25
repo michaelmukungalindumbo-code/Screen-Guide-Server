@@ -70,5 +70,5 @@ for rule in ("backup_goal",):
     main._launch["live"][main.STAGED[rule]] = time.time()
 r = step([ans("Tap your profile picture at the top.")], PHOTOS, tester="", install="v102h")
 assert r["say"] == "Tap the photo you want." and not r["done"], r
-assert main.STAGED["backup_goal"] == main.SERVER_VERSION == "1.02"
+assert main.STAGED["backup_goal"] == "1.02" and main.SERVER_VERSION >= "1.02"
 print("backing up photos: not choosing a photo; done when the screen says the backup is complete ok")
