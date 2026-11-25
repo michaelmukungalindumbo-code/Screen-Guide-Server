@@ -143,6 +143,14 @@
       "apps": ["AI Studio", "Chrome", "Drive", "Gmail", "Play Store", "Settings", "WhatsApp", "YouTube"],
       "all": [["retry"]],
       "none": ["turn on wi-fi", "turn on your wi-fi", "wi-fi settings", "turn on mobile data", "turn on your mobile data"]
+    },
+    {
+      "name": "25 Nov: selling on Facebook Marketplace, Facebook not on the phone: Show me installs it",
+      "history": [],
+      "question": "How do I sell something on Facebook Marketplace?",
+      "apps": ["Chrome", "Drive", "Gemini", "Messages", "Phone", "Photos", "Play Store", "Settings", "WhatsApp", "YouTube"],
+      "kind": "guide",
+      "all": [["facebook"], ["install", "play store"]]
     }
   ]
 }
