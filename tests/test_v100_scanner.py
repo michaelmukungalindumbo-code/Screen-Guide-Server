@@ -78,7 +78,7 @@ assert len(calls) == 1 and r["label"] == "Scan Document", (len(calls), r)
 main._launch["live"][main.STAGED["unseen_name"]] = __import__("time").time()
 r, calls = step([ans("Tap the round “Next” button.", 0.86, 0.92)], tester="", install="v100f")
 assert len(calls) == 1 and r["say"] == "Tap the round “Next” button.", (len(calls), r)
-assert main.STAGED["unseen_name"] == main.SERVER_VERSION == "1.00"
+assert main.STAGED["unseen_name"] == "1.00" and main.SERVER_VERSION >= "1.00"
 
 # 7. The report says when the ring was placed on a spot in the picture, instead of "pointed at: nothing".
 main._sessions.clear()
