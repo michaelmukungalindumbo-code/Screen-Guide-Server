@@ -58,7 +58,7 @@ assert r["say"] == "Tap the photo you want.", r
 r = step([ans("Tap the photo you want.")], BACKED, install="v102d")
 assert r["done"] is True and r["say"] == main._BACKED_UP_SAY and r["label"] is None, r
 r = step([ans("Tap your profile picture.", label="Account and settings")], PHOTOS, install="v102e")
-assert r["done"] is True and r["say"] == "Your photos are backed up.", r
+assert r["done"] is True and r["say"] == "Backup is on. Your photos are backed up.", r
 # ...but not for another goal on the same screen, and never when the screen says the backup is off
 r = step([ans("Tap the photo you want to send.")], BACKED, goal="Send a photo on WhatsApp", install="v102f")
 assert r["done"] is False, r

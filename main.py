@@ -639,7 +639,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.04"
+SERVER_VERSION = "1.05"
 
 
 @app.get("/health")
@@ -1274,7 +1274,7 @@ def _plain_icons(say: str, label) -> str:
     return rx.sub(plain, say)
 
 
-_BACKED_UP_SAY = "Your photos are backed up."   # English only: other languages get their usual "Done" sentence
+_BACKED_UP_SAY = "Backup is on. Your photos are backed up."   # English only: other languages get their usual "Done" sentence
 _UPLOADING_SAY = re.compile(r"\buploading\b", re.I)
 # "The screen is black right now": what the AI says when the app blocked the screen picture
 _BLACK_SAY = re.compile(r"\b(screen|picture|display|phone)\b[^.]{0,40}\b(is|looks|appears|seems|was|went)\b[^.]{0,20}\b(black|dark|blank|empty)\b"
@@ -2220,17 +2220,20 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     done = bool(data.get("done"))
     plain_all = [_plain(l) for l in labels]
     low_words = [p.lower() for p in plain_all]
+    ended_by = ""   # 1.05: why a rule ended the guide, for the watcher's review
     # The screen says it is finished: done, whatever the AI planned next.
     for goal_rx, done_rx in _FINISHED:
         if goal_rx.search(goal.lower()) and any(done_rx.search(w) for w in low_words) and not (done_rx.pattern == "^uninstall$" and "open" not in low_words):
             STATS["finished_seen"] += 1
             done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
+            ended_by = "the screen said it is finished"
             break
     if (not done and _BACKUP_GOAL.search(goal) and any(_BACKED_UP.search(w) for w in low_words)
             and _staged("backup_goal", x_tester == "1")):   # 1.02: "Backup complete", "1,310 photos backed up"
         STATS["backup_done_seen"] += 1
         _fired("backup_goal")
         done, label, say = True, None, _BACKED_UP_SAY if lang == "en" else _DONE_SAY.get(lang, _DONE_SAY["en"])
+        ended_by = "the screen said the backup is complete"
     # Back on Drive's file list after the Upload screen: the scan is saved. Seen, the guide kept saying "uploading, wait".
     if (not done and _SCAN_GOAL.search(goal) and any(_UPLOADING_SAY.search(h) for h in history) and "my drive" in low_words
             and any(w in low_words for w in ("scan document", "create new")) and "upload" not in low_words and "cancel" not in low_words):
@@ -2338,7 +2341,7 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     if need_picture:
         STATS["picture_wanted"] += 1
     watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, label, say, x, look, done,
-                        need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped, tally)
+                        need_picture, is_gallery, time.time() - t0, ai_empty, lang, dev, image, body.tapped, tally, ended_by)
     ws = _sessions.get(install_id) if x_tester == "1" else None
     if breaking and ws and ws["steps"]:
         _add_problem(ws, "circles", len(ws["steps"]), note=why_round,
@@ -4446,6 +4449,9 @@ async def _ask_ai_fix(cid: str, rec: dict):
 # public app repository, so nothing personal may reach them.
 AI_WATCH_PER_DAY = int(os.getenv("AI_WATCH_PER_DAY", "3"))   # guide problems sent to the AI fixer per day
 _UI_WORDS = {
+    # 1.05 (25 Nov): a backup guide ended on "Backup complete", which the review never saw (shown as "…")
+    "backup complete", "backup is off", "backup is on", "backup", "back up", "backed up", "turn on backup", "backup settings",
+    "account and settings", "photos settings", "google photos settings", "collections",
     # ScreenGuide's own name and menus, and app names that are not anyone's name (6 Nov: the watcher showed "…" for them)
     "screenguide", "screen guide", "business", "wa business", "customize screenguide", "chat background", "settings and permissions",
     "your account", "learn your phone", "incognito", "your plan", "stay safe from scams", "about screenguide", "teach a task",
@@ -4622,7 +4628,7 @@ def _add_problem(s: dict, kind: str, n: int, **kw):
 
 
 def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, say, x, look, done, need_picture, is_gallery,
-                secs, ai_empty, lang, dev, image, tapped=False, tally=None) -> int:
+                secs, ai_empty, lang, dev, image, tapped=False, tally=None, ended_by="") -> int:
     """Each guide step on a developer phone: kept (cleaned), checked by the rules. Returns how many problems so far,
     so the phone can flash red when the number goes up."""
     if not tester:
@@ -4644,6 +4650,8 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
             "note": _clean_text(note, 100), "stuck": bool(stuck), "label": _clean_word(label) if label else None,
             "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1), "tapped": bool(tapped),
             "spot": x is not None}   # 1.00: the ring was put on a spot in the screen picture (#89: the report said "nothing")
+    if ended_by:
+        step["ended_by"] = ended_by   # 1.05: a rule ended the guide here; the review is told why
     if tally:
         step.update(ai_calls=tally["ai"], again=tally["again"][:3], timeouts=tally["timeouts"], backup=tally["backup"],
                     up=int(tally["up"]), strong=bool(tally.get("strong")))
@@ -4866,7 +4874,8 @@ def _watch_issue(s: dict, c: dict) -> tuple:
             "**→** " if st["n"] == c["step"] else "", st["n"], st["say"],
             st["label"] or ("a spot in the screen picture" if st.get("spot") else "nothing"),
             " | (answer after Help)" if st["stuck"] else "", "%s%s" % (st["secs"], _step_time(st)), " | with a screen picture" if st["picture"] else "",
-            (" | **then the person pressed Help: “%s”**" % st["help_after"]) if st.get("help_after") else ""))
+            (" | **then the person pressed Help: “%s”**" % st["help_after"]) if st.get("help_after") else "")
+            + (" | ended because %s" % st["ended_by"] if st.get("ended_by") else ""))
         lines.append("   screen: " + _short_screen(st["screen"]))
     shown = next((st for st in s["steps"] if st["n"] == c["step"]), s["steps"][-1] if s["steps"] else None)
     body = ("Noticed by the watcher on a developer's test phone; the developer tapped **Allow** to send it.\n\n"
