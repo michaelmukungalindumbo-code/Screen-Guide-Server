@@ -14,6 +14,7 @@ class Client:
     def __init__(self, out): self.messages = Msgs(out)
 def J(label, say, done=False): return json.dumps({"label": label, "say": say, "done": done, "x": None, "y": None, "look_for": None})
 main.settings.ANTHROPIC_API_KEY = main.settings.ANTHROPIC_API_KEY or "test"
+main.PAUSED_RULES.add("plain_icons")   # 1.04 says "the back arrow"; these checks are about the ring, on the AI's own words
 APPS = ["Chrome", "Drive", "Settings", "WhatsApp", "AI Studio"]
 def step(labels, hist, out, goal, path=(), i="dev97", tester=True):
     main._claude_client = Client(out)
