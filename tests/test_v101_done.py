@@ -74,7 +74,7 @@ assert len(calls) == 1 and r["done"] is False and r["x"] == 0.5, (len(calls), r)
 main._launch["live"][main.STAGED["unseen_done"]] = time.time()
 r, calls = step([ans(SAVED, done=True)], tester="", install="v101f")
 assert len(calls) == 1 and r["done"] is True, (len(calls), r)
-assert main.STAGED["unseen_done"] == main.SERVER_VERSION == "1.01"
+assert main.STAGED["unseen_done"] == "1.01" and main.SERVER_VERSION >= "1.01"
 
 # 7. The AI knows Drive's scan is saved only after Upload on its "Upload to Drive" page.
 assert "Upload to Drive" in main.NEXT_SYSTEM and main.PROMPT_VERSION >= "68"
