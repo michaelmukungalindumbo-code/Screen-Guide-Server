@@ -66,7 +66,7 @@ JSON_RETRIES = max(0, min(2, int(os.getenv("JSON_RETRIES", "2"))))
 LOG_SAMPLES = os.getenv("LOG_SAMPLES", "0") == "1"                  # keep the last 100 questions in memory (numbers removed)
 IP_PER_MINUTE = int(os.getenv("IP_PER_MINUTE", "120"))
 NEW_IDS_PER_IP_HOUR = int(os.getenv("NEW_IDS_PER_IP_HOUR", "30"))
-PROMPT_VERSION = "66"   # change when the prompts change, so ratings can be compared
+PROMPT_VERSION = "67"   # change when the prompts change, so ratings can be compared
 STARTED = time.time()
 # Where one guide step's time goes: how often the AI was asked and why, timeouts, backups (#20: nobody could tell)
 _TALLY = contextvars.ContextVar("tally", default=None)
@@ -638,7 +638,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "0.99"
+SERVER_VERSION = "1.00"
 
 
 @app.get("/health")
@@ -1087,7 +1087,7 @@ Rules:
 
 SHOT_NOTE = """
 
-A picture of the user's screen is attached. Use it to understand the screen. If the thing to tap has a word in the list, use that word as label and leave x and y null. If it is not in the list (an icon such as +, a pencil, a switch or a picture, or a button whose word the app hides from the list, like "Next" in a camera or scanner), set label null and give its centre as x and y: fractions of the picture's width and height, from 0 to 1, measured from the top-left corner. Only give x and y when you can clearly see the thing. Ignore the round grey buttons ScreenGuide draws at the side. Never describe or repeat personal details you see in the picture."""
+A picture of the user's screen is attached. Use it to understand the screen. If the thing to tap has a word in the list, use that word as label and leave x and y null. If it is not in the list (an icon such as +, a pencil, a switch or a picture, or a button whose word the app hides from the list, as cameras and scanners often do), set label null and give its centre as x and y: fractions of the picture's width and height, from 0 to 1, measured from the top-left corner. Only give x and y when you can clearly see the thing. In say, put a button's name in quotes only if you can read that word on the screen; if it shows an icon or no word, say what it looks like and where it is instead (for example: the blue round button at the bottom right). In a camera or scanner, the button that takes the picture is the big round button in the middle at the bottom: call it that. Ignore the round grey buttons ScreenGuide draws at the side. Never describe or repeat personal details you see in the picture."""
 
 _s_minute = defaultdict(deque)
 _s_day = defaultdict(deque)
@@ -1264,6 +1264,20 @@ _GESTURE_FIRST = re.compile(r"^\W*(swipe|scroll|pull)\b", re.I)   # the instruct
 _POINT_ACTION = re.compile(r"\b(tap|press|choose|select|type|open|turn|pick|slide|dinani|kandeni|sankhani|lembani)\b", re.I)
 # "Tap the video you want": the person chooses; ScreenGuide never points at one of their own items for them
 _YOUR_CHOICE = re.compile(r"\b(you want|you need|of your choice|your own)\b", re.I)
+# 1.00: a button named in quotes on a screen that shares no words (Google's scanner, a camera), which nothing can check
+_QUOTED = re.compile(r"[“\"]([^”\"\n]{1,40})[”\"]")
+_UNSEEN_ASK = "ScreenGuide cannot read any words on this screen, so it cannot check “%s”."
+_UNSEEN_HOW = (" In say, put a button's name in quotes only if you can read that exact word on it in the picture. If it shows "
+               "an icon or no word, give it no name: say what it looks like and where it is (for example: the blue round "
+               "button at the bottom right).")
+
+
+def _unseen_name(data, labels: list) -> str:
+    """The first name in quotes in the answer, when the screen shares no words at all (so nothing can check it)."""
+    if labels or not isinstance(data, dict) or data.get("done"):
+        return ""
+    m = _QUOTED.search(str(data.get("say") or ""))
+    return m.group(1).strip() if m else ""
 _NEGATED = re.compile(r"\b(do not|don['’]?t|never|without)\s+(\w+\s+)?\w+", re.I)
 _DONE_SAY = {"en": "Done! It worked. You did it yourself.", "ny": "Zabwino! Zatheka. Mwachita nokha.", "bem": "Nawamya! Capwa. Mwacita nemwe bene."}
 _TAP_WORD = {"en": "Tap \u201c%s\u201d.", "ny": "Dinani \u201c%s\u201d.", "bem": "Kandeni \u201c%s\u201d."}
@@ -2020,6 +2034,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         tally["again"].append("to find the button in the screen picture")
         ask = (("\u201c%s\u201d is not in <screen_words>: this app hides its words." % _safe(named, 40)) if named
                else "Nothing in <screen_words> is the thing to tap: this app hides its words.")
+        if not labels and _staged("unseen_name", x_tester == "1"):   # 1.00: and name only what can be read (below)
+            ask += _UNSEEN_HOW
         try:   # only a better answer is taken; a failed try keeps the first one
             _, again = await _ai_json(system, user + "\n" + ask + " If you can see it in the picture, set label null and give its centre as x and y.",
                                       [image], "step+picture", NEXT_SCHEMA, _valid_next)
@@ -2027,6 +2043,27 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             again = None; STATS["second_try_failed"] += 1
         if isinstance(again, dict) and _fraction(again.get("x")) is not None and _fraction(again.get("y")) is not None:
             STATS["point_from_picture"] += 1
+            data = dict(again, label=None)
+    # 1.00 (#90, 25 Nov, the owner's phone): Google's scanner shares no words, and the page after the photo got "Tap the
+    # round \u201cNext\u201d button" where the picture showed a round button with an icon and no word on it. On a screen with no
+    # words nothing can check a name in quotes, so the AI is asked once more: name only a word it can read in the
+    # picture, otherwise say how the button looks and where it is. The spot it gave is kept if the new answer has none.
+    unseen = _unseen_name(data, labels) if image and not image_blocked else ""
+    if (unseen and "to find the button in the screen picture" not in tally["again"]
+            and _staged("unseen_name", x_tester == "1")):
+        STATS["unseen_name_asked"] += 1
+        tally["again"].append("it named a word it could not read on the screen")
+        _fired("unseen_name")
+        try:   # a failed try keeps the first answer
+            _, again = await _ai_json(system, user + "\n" + (_UNSEEN_ASK % _safe(unseen, 40)) + _UNSEEN_HOW
+                                      + " If you can see it in the picture, set label null and give its centre as x and y.",
+                                      [image], "step+picture", NEXT_SCHEMA, _valid_next)
+        except HTTPException:
+            again = None; STATS["second_try_failed"] += 1
+        if isinstance(again, dict) and not again.get("done") and str(again.get("say") or "").strip():
+            if _fraction(again.get("x")) is None or _fraction(again.get("y")) is None:
+                again = dict(again, x=data.get("x"), y=data.get("y"))
+            STATS["unseen_name_fixed"] += 1
             data = dict(again, label=None)
     # 3 Nov: "Tap Next" on YouTube's Add details screen, which has "Upload Short" and no Next. Ask once more.
     named = str(data.get("label") or "").strip() if isinstance(data, dict) else ""
@@ -3052,6 +3089,7 @@ STAGED = {              # rule name -> the server version that brought it
     "careful": "0.96",             # every chat answer and the steps that matter: the stronger AI, thinking first
     "label_follows_words": "0.97", # the ring goes on the button the words name, when the AI's label is another one
     "already_chosen": "0.97",      # never "tap" an option or tab that is already chosen: asked again, told so
+    "unseen_name": "1.00",         # a screen with no words: a button is named in quotes only if the AI can read it in the picture
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
@@ -4533,7 +4571,8 @@ def _watch_step(install_id, tester, goal, labels, history, note, stuck, label, s
     _learn_words(install_id, labels)
     step = {"n": n, "screen": [_clean_label(l) for l in labels[:60]], "told_before": _clean_text(told, 140, ours=True),
             "note": _clean_text(note, 100), "stuck": bool(stuck), "label": _clean_word(label) if label else None,
-            "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1), "tapped": bool(tapped)}
+            "say": _clean_text(say, 220, ours=True), "picture": bool(image), "secs": round(secs, 1), "tapped": bool(tapped),
+            "spot": x is not None}   # 1.00: the ring was put on a spot in the screen picture (#89: the report said "nothing")
     if tally:
         step.update(ai_calls=tally["ai"], again=tally["again"][:3], timeouts=tally["timeouts"], backup=tally["backup"],
                     up=int(tally["up"]), strong=bool(tally.get("strong")))
@@ -4753,7 +4792,8 @@ def _watch_issue(s: dict, c: dict) -> tuple:
     lines = []
     for st in s["steps"]:
         lines.append("%s%d. said: %s | pointed at: %s%s | %s%s%s" % (
-            "**→** " if st["n"] == c["step"] else "", st["n"], st["say"], st["label"] or "nothing",
+            "**→** " if st["n"] == c["step"] else "", st["n"], st["say"],
+            st["label"] or ("a spot in the screen picture" if st.get("spot") else "nothing"),
             " | (answer after Help)" if st["stuck"] else "", "%s%s" % (st["secs"], _step_time(st)), " | with a screen picture" if st["picture"] else "",
             (" | **then the person pressed Help: “%s”**" % st["help_after"]) if st.get("help_after") else ""))
         lines.append("   screen: " + _short_screen(st["screen"]))
