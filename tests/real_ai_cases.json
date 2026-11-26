@@ -151,6 +151,14 @@
       "apps": ["Chrome", "Drive", "Gemini", "Messages", "Phone", "Photos", "Play Store", "Settings", "WhatsApp", "YouTube"],
       "kind": "guide",
       "all": [["facebook"], ["install", "play store"]]
+    },
+    {
+      "name": "26 Nov: Google Forms is a website: Chrome, never an app to install from the Play Store (#103)",
+      "history": [],
+      "question": "How do I make a quiz with Google Forms?",
+      "apps": ["Chrome", "Drive", "Gmail", "Google", "Messages", "Phone", "Photos", "Play Store", "Settings", "WhatsApp", "YouTube"],
+      "all": [["chrome", "forms.google.com", "browser"]],
+      "none": ["play store", "install"]
     }
   ]
 }
