@@ -639,7 +639,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.05"
+SERVER_VERSION = "1.06"
 
 
 @app.get("/health")
@@ -1622,6 +1622,53 @@ def _type_step(goal: str, labels: list, label, say: str):
 
 _MONEY_WORDS = re.compile(r"\b(money|momo|bank|wallet|loan|cash|pay|kwacha|airtel|mtn|zamtel)\b", re.I)
 
+# ---- 1.06 (#99, #100, the owner's phone, 26 Nov, applying for a job in Chrome) ----
+# ring_open_box: "Chrome is open. Tap the box ..., then type ..." or "Type ..." with nothing pointed at, while the box was
+# already open ([typing]). The open box gets the ring, and the step says only what to type.
+_TYPE_PART = re.compile(r"\btype\b[^.!?]*[.!?]?", re.I)
+
+
+def _ring_open_box(labels: list, label, say: str):
+    box = next((_plain(l) for l in labels if _TYPING.search(l)), None)
+    if not box or label or not re.search(r"\btype\b", say, re.I) or _CLEAR_SAY.search(say):
+        return None
+    rest = re.sub(re.escape(box), " ", say, flags=re.I)   # "Search Google or type URL" is the box's name, not what to type
+    if not re.search(r"\btype\b", rest, re.I):
+        return None
+    m = _TYPE_PART.search(rest)
+    part = re.sub(r"\s+", " ", m.group(0)).strip() if m else say
+    part = part[0].upper() + part[1:]
+    return box, (part if part.endswith((".", "!", "?")) else part + ".")
+
+
+# keep_typing: told to type, and while typing (Chrome filled in the rest of a remembered address), "Tap Clear input to erase
+# them". The words in the box change with every key: keep typing, then choose from the list.
+_CLEAR_SAY = re.compile(r"\b(clear|erase|delete|remove)\b", re.I)
+_TOLD_TYPE = re.compile(r"^\W*type\b", re.I)
+_KEEP_TYPING_SAY = "Keep typing. Then tap the line that fits in the list."
+
+# page_unread: on a web page, only the browser's own buttons were read (the page's words were not): the AI, given nothing
+# else, sent them to the home page. Without a picture: no AI, ask for a picture, and wait. With one: told why, and never
+# sent away from the page.
+_BROWSER_BAR = re.compile(r"^(open the home page|home|new tab|switch or close tabs|tab switcher|\d+ (open )?tabs?\b.*|"
+                          r"customi[sz]e and control google chrome|more options|refresh|reload( this page)?|stop loading|"
+                          r"bookmark this (page|tab)|share|close tab|back|forward)$", re.I)
+_URLISH = re.compile(r"^(https?://)?([\w-]+\.)+[a-z]{2,}(/\S*)?$", re.I)
+_LEAVE_PAGE = re.compile(r"^(open the home page|home|new tab|switch or close tabs|tab switcher|\d+ (open )?tabs?\b.*|close tab|back)$", re.I)
+_PAGE_WAIT_SAY = "Wait a moment for the page to show. I will carry on when it does."
+_PAGE_UNREAD_NOTE = ("\nScreenGuide could not read the words of this web page: <screen_words> has only the browser's own buttons. "
+                     "Use the picture to find the part of the page that fits the goal. Never send them away from this page "
+                     "(home page, new tab, back) because of that.")
+
+
+def _page_unread(labels: list) -> bool:
+    if any(_TYPING.search(l) for l in labels):
+        return False
+    plain = [(_plain(l), str(l).rstrip().lower()) for l in labels]
+    bar = [p for p, _ in plain if _BROWSER_BAR.match(p)]
+    rest = [(p, l) for p, l in plain if not _BROWSER_BAR.match(p)]
+    return len(bar) >= 2 and len(rest) <= 2 and all(l.endswith("[text]") or _URLISH.match(p) for p, l in rest)
+
 
 # ---- An app that is not on the screen (#40, 6 Nov): "Swipe up to see all your apps" while the phone's own Search box
 # was right there, and the person pressed Help: "why didn't you just tell me to search". Typing one short app name is
@@ -2019,6 +2066,17 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         _fired("careful")
     if _path_app(body.path, apps):
         loop["app"] = _path_app(body.path, apps)   # 0.97: the app of this step, so the next one in it is not "new"
+    unread = bool(labels) and not honest and _page_unread(labels) and _staged("page_unread", x_tester == "1")   # 1.06
+    if unread and not image:
+        STATS["page_unread_wait"] += 1
+        _fired("page_unread")
+        watch = _watch_step(install_id, x_tester == "1", goal, labels, history, body.note, body.stuck, None, _PAGE_WAIT_SAY, None,
+                            None, False, True, False, time.time() - t0, False, lang, _device(body.device), image, body.tapped, tally)
+        return {"label": None, "say": _PAGE_WAIT_SAY, "done": False, "x": None, "y": None, "look_for": None, "need_picture": True,
+                "watch": watch, "watch_step": len((_sessions.get(install_id) or {}).get("steps", [])) if x_tester == "1" else 0,
+                "strong": False}
+    if unread:
+        user += _PAGE_UNREAD_NOTE
     if honest:   # no AI this time: it already had its second chance
         text, data = "", {"label": None, "say": _NOT_SURE, "done": False, "x": None, "y": None, "look_for": None}
     elif known:   # v0.84: people followed this answer here before: no AI, instant and free. Every rule below still applies.
@@ -2203,6 +2261,22 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         STATS["type_in_open_box"] += 1
         _fired("type_in_open_box")
         label, say = typed
+    told_now = _last_told(history)
+    box_now = next((_plain(l) for l in labels if _TYPING.search(l)), None)
+    if (box_now and lang == "en" and _TOLD_TYPE.match(told_now) and _CLEAR_SAY.search(say) and not data.get("done")
+            and _staged("keep_typing", x_tester == "1")):   # 1.06: never "erase it" while they type
+        STATS["keep_typing"] += 1
+        _fired("keep_typing")
+        label, say = None, _KEEP_TYPING_SAY   # no ring: they are already typing in the box
+    ringed = _ring_open_box(labels, label, say) if lang == "en" and not data.get("done") and _staged("ring_open_box", x_tester == "1") else None
+    if ringed:   # 1.06: the open box gets the ring; the step says only what to type
+        STATS["ring_open_box"] += 1
+        _fired("ring_open_box")
+        label, say = ringed
+    if unread and label and _LEAVE_PAGE.match(_plain(label)):   # 1.06: never sent away from a page whose words were not read
+        STATS["page_unread_kept"] += 1
+        _fired("page_unread")
+        label, say = None, _PAGE_WAIT_SAY
     asked = body.stuck and bool(body.note.strip())   # they told us in Help why they are stuck: explain, do not repeat
     if not asked:
         say = _one_action(say, bool(label))
@@ -3164,6 +3238,9 @@ STAGED = {              # rule name -> the server version that brought it
     "unseen_done": "1.01",         # a screen with no words never ends a guide: asked again for the step it can see (Upload)
     "backup_goal": "1.02",         # backing up photos is not choosing one; done when the screen says the backup is complete
     "plain_icons": "1.04",         # "Navigate up" is said as "the back arrow", "More options" as "the three dots" (English)
+    "ring_open_box": "1.06",       # an open text box gets the ring, and the step says only what to type
+    "keep_typing": "1.06",         # told to type: never "erase it" while they type; keep typing, then choose from the list
+    "page_unread": "1.06",         # a web page whose words were not read: a picture is asked for; never sent away from the page
 }
 STAGE_HOURS = 24
 PAUSED_RULES = {r.strip() for r in os.getenv("PAUSED_RULES", "").split(",") if r.strip()}
