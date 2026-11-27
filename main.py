@@ -640,7 +640,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.08"
+SERVER_VERSION = "1.09"
 
 
 @app.get("/health")
@@ -1447,7 +1447,7 @@ def _last_told(history: list) -> str:
 
 
 def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = "",
-                 video_first: bool = False, back=None, tab_rule: bool = False, backup_rule: bool = False):
+                 video_first: bool = False, back=None, tab_rule: bool = False, backup_rule: bool = False, video_app: bool = False):
     """On a picker of the person's own videos or photos, in any app, they choose; the AI only says how. Seen on a
     phone: it pointed at YouTube's "Videos" album menu twice, then at "0:14", and never mentioned the "+" that adds
     videos YouTube cannot see yet. One shows: ring it. No video shows: ring the "+". Several: no ring.
@@ -1455,7 +1455,7 @@ def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: b
     explanation instead of the sentence they already heard: the AI's own words when safe, else a plain one.
     video_first: the staged rule "video_before_plus" (see _plus_second). back: the staged rule "after_plus".
     tab_rule: the staged rule "chosen_tab" (see _chosen_tab)."""
-    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang, video_first, back, tab_rule, backup_rule)
+    lbl, tmpl, kind, plus, items = _gallery_pick(goal, labels, label, say, lang, video_first, back, tab_rule, backup_rule, video_app)
     if tmpl is None:
         return label, say
     if not explain:
@@ -1491,8 +1491,27 @@ def _chosen_tab(label, labels: list, kind: str, items: list) -> bool:
     return bool(_MODE_TAB.match(label) and label.lower() == kind and items)
 
 
+# 1.09 (the owner's phone, 27 Nov, "How do I upload content on YouTube?"): on the picker YouTube's "+" opens, "Tap the photo
+# you want." He asked in Help: "it's YouTube, why have you asked me to tap photo?" The goal did not say "video" and the picker
+# did not name its videos. An upload to YouTube, TikTok, Reels or Shorts is a video. Staged: video_app_goal.
+_VIDEO_APP_GOAL = re.compile(r"\b(?:youtube|tiktok|reels?|shorts?|vlogs?)\b", re.I)
+
+
+def _media_kind(goal: str, videos: list, video_app: bool = False) -> str:
+    """"video" or "photo": what the person is choosing. The goal's own word first, then (1.09) the app, then the screen."""
+    if re.search(r"video|vidiyo", goal, re.I):
+        return "video"
+    if re.search(r"photo|picture|image|selfie|chithunzi|cikope", goal, re.I):
+        return "photo"
+    if video_app and _VIDEO_APP_GOAL.search(goal):
+        if not videos:
+            _fired("video_app_goal")
+        return "video"
+    return "video" if videos else "photo"
+
+
 def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_first: bool = False, back=None,
-                  tab_rule: bool = False, backup_rule: bool = False):
+                  tab_rule: bool = False, backup_rule: bool = False, video_app: bool = False):
     """(label, sentence, kind, plus, items), or a None sentence when this is not a choosing moment in a gallery.
     back: the staged rule "after_plus" (see _plus_back): fingerprints of the items there before they went to the "+"."""
     is_gallery, videos, photos, more = _gallery(labels)
@@ -1505,8 +1524,7 @@ def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_fir
         return label, None, "", "", []
     leaving = bool(label and _LEAVE.match(label)) or bool(not label and _LEAVE_SAY.search(say))
     if tab_rule and not leaving:
-        k = "video" if re.search(r"video|vidiyo", goal, re.I) else "photo" if re.search(r"photo|picture|image|selfie|chithunzi|cikope", goal, re.I) \
-            else ("video" if videos else "photo")
+        k = _media_kind(goal, videos, video_app)
         if _chosen_tab(label, labels, k, videos if k == "video" else photos):
             STATS["chosen_tab_skipped"] += 1
             _fired("chosen_tab")
@@ -1518,12 +1536,7 @@ def _gallery_pick(goal: str, labels: list, label, say: str, lang: str, video_fir
         return label, None, "", "", []   # Next, Done, Gallery, the "+" itself...: the AI is past choosing
     if not label and not leaving and not (_CHOOSING.search(say) and _MEDIA_WORDS.search(say)):
         return label, None, "", "", []
-    if re.search(r"video|vidiyo", goal, re.I):
-        kind = "video"
-    elif re.search(r"photo|picture|image|selfie|chithunzi|cikope", goal, re.I):
-        kind = "photo"
-    else:
-        kind = "video" if videos else "photo"
+    kind = _media_kind(goal, videos, video_app)
     items = videos if kind == "video" else photos
     t = _PICK[kind].get(lang, _PICK[kind]["en"])
     plus = "+" if more and (re.search(r"more media", more, re.I) or more.strip() == "+") else "“%s”" % more if more else ""
@@ -2350,7 +2363,8 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
     label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last,
                               video_first=not asked and _staged("video_before_plus", x_tester == "1"),
                               back=back if not asked and _staged("after_plus", x_tester == "1") else None,
-                              tab_rule=_staged("chosen_tab", x_tester == "1"), backup_rule=_staged("backup_goal", x_tester == "1"))
+                              tab_rule=_staged("chosen_tab", x_tester == "1"), backup_rule=_staged("backup_goal", x_tester == "1"),
+                              video_app=_staged("video_app_goal", x_tester == "1"))
     found = _search_for_app(goal, labels, label, say) if lang == "en" and not data.get("done") else None
     if found and _staged("search_for_app", x_tester == "1"):
         STATS["search_for_app"] += 1
@@ -3324,7 +3338,8 @@ STAGED = {              # rule name -> the server version that brought it
     "page_unread": "1.06",         # a web page whose words were not read: a picture is asked for; never sent away from the page
     "store_ads": "1.07",
     "backup_on": "1.08",           # "Turn on backup": its switch on, or "backup is complete" read in a picture: done, it says so
-    "done_not_back": "1.08",       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
+    "done_not_back": "1.08",
+    "video_app_goal": "1.09",      # YouTube, TikTok, Reels, Shorts: the gallery asks for a video, never "Tap the photo you want"       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
     "no_box_typing": "1.07",       # "keep typing" with no text box open: asked again
 }
 STAGE_HOURS = 24
