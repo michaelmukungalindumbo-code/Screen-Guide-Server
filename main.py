@@ -640,7 +640,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.09"
+SERVER_VERSION = "1.10"
 
 
 @app.get("/health")
@@ -1285,6 +1285,14 @@ _BACKUP_SAID = re.compile(r"\bback(?:ing)?[\s-]*up\b[^.!?]{0,40}?\b(?:is (?:alre
 _BACKUP_NOT = re.compile(r"\b(?:not|n['’]t|off|paused|waiting|failed|stopped)\b", re.I)
 _OFF_GOAL = re.compile(r"\b(?:off|stop|disable|pause|delete|remove|cancel)\b", re.I)
 _BACK_SAY = re.compile(r"\bback (?:arrow|button)\b", re.I)   # "Tap the back arrow" (1.04's words for Navigate up)
+
+
+# 1.10 (the owner's phone, 27 Nov): "Update this app in the Play Store" (from ScreenGuide's error card) rang "Update all":
+# 27 apps, a lot of data. Only when the goal asks for every app. Staged: update_all_asked.
+_UPDATE_ALL = re.compile(r"^update all$", re.I)
+_ALL_APPS_GOAL = re.compile(r"\b(?:all|every|each)\b[^.]{0,20}\bapps?\b|\ball\b\s*$|\bupdate all\b", re.I)
+_UPDATE_APP_GOAL = re.compile(r"^\s*update\s+(?!this\b|the\b|my\b|an?\b|it\b|all\b)(.{2,40}?)\s+(?:in|from|on|with)\s+(?:the\s+)?play\s*store\b", re.I)
+_ONE_UPDATE_SAY = "Find %s in this list, then tap Update beside it. Do not tap \u201cUpdate all\u201d: it updates every app and uses a lot of data."
 
 
 def _backup_said(say: str) -> bool:
@@ -2470,6 +2478,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             STATS["plain_icons"] += 1
             _fired("plain_icons")
             say = plainer
+    if (lang == "en" and label and _UPDATE_ALL.match(_plain(label)) and not _ALL_APPS_GOAL.search(goal)
+            and _staged("update_all_asked", x_tester == "1")):   # 1.10: one app, never every app
+        STATS["update_all_kept_off"] += 1
+        _fired("update_all_asked")
+        m = _UPDATE_APP_GOAL.search(goal)
+        label, say, x, y, look = None, _ONE_UPDATE_SAY % ("\u201c%s\u201d" % m.group(1).strip() if m else "the app"), None, None, None
     # 1.08 (#110): a finished guide never sends them back ("✔ Tap the back arrow to go back."): it says it is done
     if (done and lang == "en" and (_LEAVE_SAY.search(say) or _BACK_SAY.search(say) or (label and _LEAVE.match(_plain(label))))
             and _staged("done_not_back", x_tester == "1")):
@@ -3339,7 +3353,8 @@ STAGED = {              # rule name -> the server version that brought it
     "store_ads": "1.07",
     "backup_on": "1.08",           # "Turn on backup": its switch on, or "backup is complete" read in a picture: done, it says so
     "done_not_back": "1.08",
-    "video_app_goal": "1.09",      # YouTube, TikTok, Reels, Shorts: the gallery asks for a video, never "Tap the photo you want"       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
+    "video_app_goal": "1.09",
+    "update_all_asked": "1.10",    # Play Store's "Update all" is rung only when the goal asks for every app (data costs money)      # YouTube, TikTok, Reels, Shorts: the gallery asks for a video, never "Tap the photo you want"       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
     "no_box_typing": "1.07",       # "keep typing" with no text box open: asked again
 }
 STAGE_HOURS = 24
