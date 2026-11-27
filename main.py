@@ -640,7 +640,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.07"
+SERVER_VERSION = "1.08"
 
 
 @app.get("/health")
@@ -1275,7 +1275,24 @@ def _plain_icons(say: str, label) -> str:
     return rx.sub(plain, say)
 
 
-_BACKED_UP_SAY = "Backup is on. Your photos are backed up."   # English only: other languages get their usual "Done" sentence
+_BACKED_UP_SAY = "Backup is on. Your photos are backed up."
+# 1.08 (#109, #110, the owner's phone, 27 Nov): Google Photos' account menu shares no words; the AI read "Backup complete" in
+# the picture ("Backup already shows complete. To check it, tap Photos settings") and the guide went round the menus to
+# check. On the Backup page ("Backup is on", its switch on) it ended with "Tap the back arrow to go back." Staged: backup_on.
+_BACKUP_ON = re.compile(r"^back(?:ing)?[\s-]*up(?: is on)?\s*\[switch on\]$", re.I)
+_BACKUP_SAID = re.compile(r"\bback(?:ing)?[\s-]*up\b[^.!?]{0,40}?\b(?:is (?:already |now )?(?:on|complete|done|finished)"
+                          r"|already (?:shows? |says? )?(?:on|complete|done)|shows? complete)\b", re.I)
+_BACKUP_NOT = re.compile(r"\b(?:not|n['’]t|off|paused|waiting|failed|stopped)\b", re.I)
+_OFF_GOAL = re.compile(r"\b(?:off|stop|disable|pause|delete|remove|cancel)\b", re.I)
+_BACK_SAY = re.compile(r"\bback (?:arrow|button)\b", re.I)   # "Tap the back arrow" (1.04's words for Navigate up)
+
+
+def _backup_said(say: str) -> bool:
+    """1.08: the AI's own words say the backup is on or complete ("Backup already shows complete."), never negated."""
+    for sentence in re.split(r"(?<=[.!?])\s+", say or ""):
+        if _BACKUP_SAID.search(sentence) and not _BACKUP_NOT.search(sentence):
+            return True
+    return False   # English only: other languages get their usual "Done" sentence
 _UPLOADING_SAY = re.compile(r"\buploading\b", re.I)
 # "The screen is black right now": what the AI says when the app blocked the screen picture
 _BLACK_SAY = re.compile(r"\b(screen|picture|display|phone)\b[^.]{0,40}\b(is|looks|appears|seems|was|went)\b[^.]{0,20}\b(black|dark|blank|empty)\b"
@@ -2356,6 +2373,15 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         _fired("backup_goal")
         done, label, say = True, None, _BACKED_UP_SAY if lang == "en" else _DONE_SAY.get(lang, _DONE_SAY["en"])
         ended_by = "the screen said the backup is complete"
+    if (_BACKUP_GOAL.search(goal) and not _OFF_GOAL.search(goal) and say != _BACKED_UP_SAY
+            and (any(_BACKUP_ON.search(l.strip()) for l in labels) or "backup is on" in low_words
+                 or (done and any(_BACKED_UP.search(w) for w in low_words)) or _backup_said(str(data.get("say") or "")))
+            and _staged("backup_on", x_tester == "1")):   # 1.08: "Backup is on", or read in a picture
+        STATS["backup_on_seen"] += 1
+        _fired("backup_on")
+        done, label, say = True, None, _BACKED_UP_SAY if lang == "en" else _DONE_SAY.get(lang, _DONE_SAY["en"])
+        data = dict(data, x=None, y=None)
+        ended_by = "the backup is on"
     # Back on Drive's file list after the Upload screen: the scan is saved. Seen, the guide kept saying "uploading, wait".
     if (not done and _SCAN_GOAL.search(goal) and any(_UPLOADING_SAY.search(h) for h in history) and "my drive" in low_words
             and any(w in low_words for w in ("scan document", "create new")) and "upload" not in low_words and "cancel" not in low_words):
@@ -2430,6 +2456,13 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             STATS["plain_icons"] += 1
             _fired("plain_icons")
             say = plainer
+    # 1.08 (#110): a finished guide never sends them back ("✔ Tap the back arrow to go back."): it says it is done
+    if (done and lang == "en" and (_LEAVE_SAY.search(say) or _BACK_SAY.search(say) or (label and _LEAVE.match(_plain(label))))
+            and _staged("done_not_back", x_tester == "1")):
+        STATS["done_not_back"] += 1
+        _fired("done_not_back")
+        label, say, x, y, look = None, _DONE_SAY["en"], None, None, None
+        ended_by = ended_by or "a finished step that said go back"
     repeated = (breaking and not honest and label is not None
                 and any(_fp(label) == a["label"] and _fp(say) == a["say"] for a in loop["last"][-2:]))
     if honest or repeated:
@@ -3289,7 +3322,9 @@ STAGED = {              # rule name -> the server version that brought it
     "ring_open_box": "1.06",       # an open text box gets the ring, and the step says only what to type
     "keep_typing": "1.06",         # told to type: never "erase it" while they type; keep typing, then choose from the list
     "page_unread": "1.06",         # a web page whose words were not read: a picture is asked for; never sent away from the page
-    "store_ads": "1.07",           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
+    "store_ads": "1.07",
+    "backup_on": "1.08",           # "Turn on backup": its switch on, or "backup is complete" read in a picture: done, it says so
+    "done_not_back": "1.08",       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
     "no_box_typing": "1.07",       # "keep typing" with no text box open: asked again
 }
 STAGE_HOURS = 24
