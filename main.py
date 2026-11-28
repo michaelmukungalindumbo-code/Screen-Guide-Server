@@ -640,7 +640,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.10"
+SERVER_VERSION = "1.11"
 
 
 @app.get("/health")
@@ -1452,6 +1452,25 @@ def _last_told(history: list) -> str:
             continue
         return h[len("Told:"):].strip() if h.startswith("Told:") else h
     return ""
+
+
+# 1.11 (#115, #117, the owner's phone, 28 Nov): YouTube opened on a playing video; its page lists other people's videos with
+# their lengths ("44:49"), and the picker rule said "Tap the video you want." three times. He opened someone else's video.
+# Only lengths, with a feed's own buttons (Share, More actions, Subscribe, Comments), is a feed, not the person's picker.
+_FEED_WORD = re.compile(r"^(?:share|more actions|subscribe|subscribed|like|dislike|comments?|remix|save to playlist|join)$", re.I)
+
+
+def _feed_screen(labels: list) -> bool:
+    is_gallery, videos, photos, more = _gallery(labels)
+    plain = [_plain(l) for l in labels]
+    low = " | ".join(p.lower() for p in plain)
+    return bool(is_gallery and videos and not photos and not more and all(_DUR.match(v) for v in videos)
+                and not any(w in low for w in _GALLERY_WORDS) and any(_FEED_WORD.match(p) for p in plain))
+
+
+# 1.11 (#116): after "Upload Short", YouTube's page said "Uploading" and "Processing will begin shortly"; the guide went on
+# ("Tap You to check"). The upload goes on by itself. Staged: upload_started.
+_UPLOAD_STARTED = re.compile(r"^uploading\b(?!.*\b(?:paused|failed|stopped|error|waiting))|\bprocessing will begin shortly\b", re.I)
 
 
 def _gallery_fix(goal: str, labels: list, label, say: str, lang: str, explain: bool = False, told: str = "",
@@ -2368,7 +2387,11 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
         say = _one_action(say, bool(label))
     told_last = _last_told(history)
     back = _plus_back(loop, labels, sig)
-    label, say = _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last,
+    feed = _feed_screen(labels) and _staged("feed_not_gallery", x_tester == "1")
+    if feed and _CHOOSING.search(say) and _MEDIA_WORDS.search(say):
+        _fired("feed_not_gallery")
+        STATS["feed_not_gallery"] += 1
+    label, say = (label, say) if feed else _gallery_fix(goal, labels, label, say, lang, explain=body.stuck, told=told_last,
                               video_first=not asked and _staged("video_before_plus", x_tester == "1"),
                               back=back if not asked and _staged("after_plus", x_tester == "1") else None,
                               tab_rule=_staged("chosen_tab", x_tester == "1"), backup_rule=_staged("backup_goal", x_tester == "1"),
@@ -2389,6 +2412,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
             ended_by = "the screen said it is finished"
             break
+    if (not done and re.search(r"\bupload", goal, re.I) and any(_UPLOAD_STARTED.search(w) for w in low_words)
+            and _staged("upload_started", x_tester == "1")):   # 1.11: YouTube's "Uploading", "Processing will begin shortly"
+        STATS["upload_started_seen"] += 1
+        _fired("upload_started")
+        done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
+        ended_by = "the screen said the upload has started"
     if (not done and _BACKUP_GOAL.search(goal) and any(_BACKED_UP.search(w) for w in low_words)
             and _staged("backup_goal", x_tester == "1")):   # 1.02: "Backup complete", "1,310 photos backed up"
         STATS["backup_done_seen"] += 1
@@ -3354,7 +3383,9 @@ STAGED = {              # rule name -> the server version that brought it
     "backup_on": "1.08",           # "Turn on backup": its switch on, or "backup is complete" read in a picture: done, it says so
     "done_not_back": "1.08",
     "video_app_goal": "1.09",
-    "update_all_asked": "1.10",    # Play Store's "Update all" is rung only when the goal asks for every app (data costs money)      # YouTube, TikTok, Reels, Shorts: the gallery asks for a video, never "Tap the photo you want"       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
+    "update_all_asked": "1.10",
+    "feed_not_gallery": "1.11",    # a feed of other people's videos (Share, More actions...) is never a picker of their own
+    "upload_started": "1.11",      # "Uploading", "Processing will begin shortly" after the upload button: done    # Play Store's "Update all" is rung only when the goal asks for every app (data costs money)      # YouTube, TikTok, Reels, Shorts: the gallery asks for a video, never "Tap the photo you want"       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
     "no_box_typing": "1.07",       # "keep typing" with no text box open: asked again
 }
 STAGE_HOURS = 24
