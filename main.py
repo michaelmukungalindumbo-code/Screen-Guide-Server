@@ -640,7 +640,7 @@ async def _size_limit(request, call_next):
     return await call_next(request)
 
 
-SERVER_VERSION = "1.11"
+SERVER_VERSION = "1.12"
 
 
 @app.get("/health")
@@ -1470,6 +1470,10 @@ def _feed_screen(labels: list) -> bool:
 
 # 1.11 (#116): after "Upload Short", YouTube's page said "Uploading" and "Processing will begin shortly"; the guide went on
 # ("Tap You to check"). The upload goes on by itself. Staged: upload_started.
+# 1.12 (the owner's phone, 28 Nov): after "Tap Upload to send your video.", YouTube's channel page opened and the guide said
+# "Tap Create to start a new video.": the whole task again. Staged: no_restart.
+_RESTART_SAY = re.compile(r"\b(?:start|make|upload|record|create|post)\s+(?:a\s+)?(?:new|another)\b|\banother (?:video|short|post|photo)\b", re.I)
+_FINAL_TOLD = re.compile(r"\btap\s+[\"\u201c]?(?:upload|upload short|upload video|post|publish|send|share now)[\"\u201d]?(?=[\s.,!]|$)", re.I)
 _UPLOAD_STARTED = re.compile(r"^uploading\b(?!.*\b(?:paused|failed|stopped|error|waiting))|\bprocessing will begin shortly\b", re.I)
 
 
@@ -2412,6 +2416,12 @@ async def next_step(body: Next, x_app_token: str = Header(default=""), x_install
             done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
             ended_by = "the screen said it is finished"
             break
+    if (not done and _MAKING.search(goal) and _RESTART_SAY.search(say) and any(_FINAL_TOLD.search(h) for h in history)
+            and _staged("no_restart", x_tester == "1")):   # 1.12: after Upload, never the task again
+        STATS["no_restart"] += 1
+        _fired("no_restart")
+        done, label, say = True, None, _DONE_SAY.get(lang, _DONE_SAY["en"])
+        ended_by = "after the upload button it said to start a new one"
     if (not done and re.search(r"\bupload", goal, re.I) and any(_UPLOAD_STARTED.search(w) for w in low_words)
             and _staged("upload_started", x_tester == "1")):   # 1.11: YouTube's "Uploading", "Processing will begin shortly"
         STATS["upload_started_seen"] += 1
@@ -3385,7 +3395,8 @@ STAGED = {              # rule name -> the server version that brought it
     "video_app_goal": "1.09",
     "update_all_asked": "1.10",
     "feed_not_gallery": "1.11",    # a feed of other people's videos (Share, More actions...) is never a picker of their own
-    "upload_started": "1.11",      # "Uploading", "Processing will begin shortly" after the upload button: done    # Play Store's "Update all" is rung only when the goal asks for every app (data costs money)      # YouTube, TikTok, Reels, Shorts: the gallery asks for a video, never "Tap the photo you want"       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
+    "upload_started": "1.11",
+    "no_restart": "1.12",          # after the upload (post, send) button was tapped, "start a new ..." ends the guide      # "Uploading", "Processing will begin shortly" after the upload button: done    # Play Store's "Update all" is rung only when the goal asks for every app (data costs money)      # YouTube, TikTok, Reels, Shorts: the gallery asks for a video, never "Tap the photo you want"       # a finished guide never ends with "go back" or "tap the back arrow": it says it is done           # Play Store results: never the Install of a Sponsored app; the wanted app's name instead
     "no_box_typing": "1.07",       # "keep typing" with no text box open: asked again
 }
 STAGE_HOURS = 24
